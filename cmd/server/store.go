@@ -472,12 +472,20 @@ func (s *PacketStore) Load() error {
 	if s.db.hasObsRawHex {
 		obsRawHexCol = ", o.raw_hex"
 	}
-	whereClause := ""
+
+	// Build WHERE conditions: retention cutoff (mirrors Evict logic) + optional memory-cap limit.
+	var loadConditions []string
 	if s.retentionHours > 0 {
-		whereClause = fmt.Sprintf("\n\t\t\tWHERE t.first_seen >= datetime('now', '-%.0f hours')", s.retentionHours)
-	} else if maxPackets > 0 {
-		whereClause = fmt.Sprintf(
-			"\n\t\t\tWHERE t.id IN (SELECT id FROM transmissions ORDER BY first_seen DESC LIMIT %d)", maxPackets)
+		cutoff := time.Now().UTC().Add(-time.Duration(s.retentionHours*3600) * time.Second).Format(time.RFC3339)
+		loadConditions = append(loadConditions, fmt.Sprintf("t.first_seen >= '%s'", cutoff))
+	}
+	if maxPackets > 0 {
+		loadConditions = append(loadConditions, fmt.Sprintf(
+			"t.id IN (SELECT id FROM transmissions ORDER BY first_seen DESC LIMIT %d)", maxPackets))
+	}
+	filterClause := ""
+	if len(loadConditions) > 0 {
+		filterClause = "\n\t\t\tWHERE " + strings.Join(loadConditions, "\n\t\t\t  AND ")
 	}
 	if s.db.isV3 {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
@@ -486,7 +494,7 @@ func (s *PacketStore) Load() error {
 				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + whereClause + `
+			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	} else {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
@@ -494,7 +502,7 @@ func (s *PacketStore) Load() error {
 				o.id, o.observer_id, o.observer_name, o.direction,
 				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + `
 			FROM transmissions t
-			LEFT JOIN observations o ON o.transmission_id = t.id` + whereClause + `
+			LEFT JOIN observations o ON o.transmission_id = t.id` + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	}
 
