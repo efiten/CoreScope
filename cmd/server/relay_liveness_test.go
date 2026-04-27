@@ -192,7 +192,7 @@ func TestGetBulkHealthRepeaterRelayFields(t *testing.T) {
 	srv.store.relayTimes[pk] = []int64{recentMs}
 	srv.store.mu.Unlock()
 
-	results := srv.store.GetBulkHealth(200, "")
+	results := srv.store.GetBulkHealth(200, "", "")
 
 	var found map[string]interface{}
 	for _, r := range results {
@@ -235,7 +235,7 @@ func TestGetBulkHealthCompanionNoRelayFields(t *testing.T) {
 	srv.store.relayTimes[pk] = []int64{time.Now().UnixMilli() - 5*60*1000}
 	srv.store.mu.Unlock()
 
-	results := srv.store.GetBulkHealth(200, "")
+	results := srv.store.GetBulkHealth(200, "", "")
 	for _, r := range results {
 		if r["public_key"] == pk {
 			stats, _ := r["stats"].(map[string]interface{})
@@ -257,7 +257,7 @@ func TestGetBulkHealthRepeaterNoRelayActivity(t *testing.T) {
 		t.Fatalf("insert test node: %v", err)
 	}
 
-	results := srv.store.GetBulkHealth(200, "")
+	results := srv.store.GetBulkHealth(200, "", "")
 	for _, r := range results {
 		if r["public_key"] == "relay662idle001" {
 			stats, _ := r["stats"].(map[string]interface{})

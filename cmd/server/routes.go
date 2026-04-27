@@ -1136,6 +1136,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.store != nil {
 		hashInfo := s.store.GetNodeHashSizeInfo()
+		mbCap := s.store.GetMultibyteCapMap()
 		now := time.Now().UnixMilli()
 
 		// Snapshot relay times for repeater nodes under the read lock, then
@@ -1164,6 +1165,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			EnrichNodeWithHashSize(node, hashInfo[pk])
+			enrichNodeWithMultibyte(node, mbCap[pk])
 			role, _ := node["role"].(string)
 			if strings.ToLower(role) == "repeater" {
 				lk := strings.ToLower(pk)
@@ -1270,6 +1272,7 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil {
 		hashInfo := s.store.GetNodeHashSizeInfo()
 		EnrichNodeWithHashSize(node, hashInfo[pubkey])
+		enrichNodeWithMultibyte(node, s.store.GetMultibyteCapMap()[pubkey])
 	}
 
 	name := ""
@@ -2386,6 +2389,22 @@ func (s *Server) handleAudioLabBuckets(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Helpers ---
+
+// enrichNodeWithMultibyte sets multibyte_sup and multibyte_evidence on a node map
+// from the in-memory analytics cache (avoids the need for DB writes from a ro connection).
+func enrichNodeWithMultibyte(node map[string]interface{}, e MultiByteCapEntry) {
+	sup := 0
+	switch e.Status {
+	case "confirmed":
+		sup = 2
+	case "suspected":
+		sup = 1
+	}
+	if sup > 0 {
+		node["multibyte_sup"] = sup
+		node["multibyte_evidence"] = e.Evidence
+	}
+}
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
