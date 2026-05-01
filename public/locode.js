@@ -39,3 +39,66 @@ function locodeAttr(name) {
 
 window.parseLocodeName = parseLocodeName;
 window.locodeAttr = locodeAttr;
+
+let _locodeData = null;
+
+function _ensureData() {
+  if (_locodeData) return Promise.resolve();
+  return fetch('/locode.json').then(r => r.json()).then(d => { _locodeData = d; });
+}
+
+function _buildTooltipContent(name) {
+  if (!_locodeData) return null;
+  const parsed = parseLocodeName(name);
+  if (!parsed) return null;
+  const { cc, loc, type } = parsed;
+  const countryName = _locodeData.countries[cc];
+  if (!countryName) return null;
+  const cityName = (_locodeData.locations[cc] || {})[loc];
+  if (!cityName) return null;
+  let html = `<div class="lc-line1">${countryName} · ${cityName}</div>`;
+  const typeLabel = type && _locodeData.types && _locodeData.types[type];
+  if (typeLabel) {
+    html += `<div class="lc-line2">${typeLabel}</div>`;
+  }
+  return html;
+}
+
+function initLocodeTooltips() {
+  const tip = document.createElement('div');
+  tip.id = 'locode-tooltip';
+  tip.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(tip);
+
+  let _active = null;
+
+  document.addEventListener('mouseover', function(e) {
+    const el = e.target.closest('[data-locode]');
+    if (!el) { tip.style.display = 'none'; _active = null; return; }
+    if (el === _active) return;
+    _active = el;
+    const name = el.getAttribute('data-locode');
+    _ensureData().then(function() {
+      const content = _buildTooltipContent(name);
+      if (!content) { tip.style.display = 'none'; return; }
+      tip.innerHTML = content;
+      tip.style.display = 'block';
+    });
+  });
+
+  document.addEventListener('mouseout', function(e) {
+    if (e.target.closest('[data-locode]')) {
+      tip.style.display = 'none';
+      _active = null;
+    }
+  });
+
+  document.addEventListener('mousemove', function(e) {
+    if (tip.style.display !== 'block') return;
+    tip.style.left = (e.clientX + 14) + 'px';
+    tip.style.top  = (e.clientY + 14) + 'px';
+  });
+}
+
+window.initLocodeTooltips = initLocodeTooltips;
+initLocodeTooltips();

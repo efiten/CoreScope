@@ -4381,3 +4381,28 @@ body { touch-action: pan-y; }
   }
   .mc-route-edge { stroke: CanvasText !important; }
 }
+
+/* LOCODE hover tooltip */
+#locode-tooltip {
+  display: none;
+  position: fixed;
+  z-index: 9999;
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  pointer-events: none;
+  font-size: 13px;
+  line-height: 1.4;
+  max-width: 240px;
+}
+.lc-line1 {
+  color: var(--text);
+  font-weight: 600;
+}
+.lc-line2 {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
