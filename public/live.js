@@ -2033,7 +2033,7 @@
         <div style="padding:16px;">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
             <span class="${statusDot}" style="font-size:18px" aria-hidden="true">●</span>
-            <h3 style="margin:0;font-size:16px;font-weight:700;">${escapeHtml(n.name || 'Unknown')}</h3>
+            <h3 style="margin:0;font-size:16px;font-weight:700;" ${locodeAttr(n.name)}>${escapeHtml(n.name || 'Unknown')}</h3>
           </div>
           <div style="margin-bottom:12px;">
             <span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600;background:${roleColor};color:#fff;">${roleLabel.toUpperCase()}</span>

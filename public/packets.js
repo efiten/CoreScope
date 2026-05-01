@@ -2592,7 +2592,7 @@
     // Advertisements — show node name and role
     if (decoded.type === 'ADVERT' && decoded.name) {
       const role = decoded.flags?.repeater ? '📡' : decoded.flags?.room ? '🏠' : decoded.flags?.sensor ? '🌡' : '📻';
-      return `${role} <a href="#/nodes/${encodeURIComponent(decoded.pubKey)}" class="hop-link hop-named" data-hop-link="true">${escapeHtml(decoded.name)}</a>`;
+      return `${role} <a href="#/nodes/${encodeURIComponent(decoded.pubKey)}" class="hop-link hop-named" data-hop-link="true" ${locodeAttr(decoded.name)}>${escapeHtml(decoded.name)}</a>`;
     }
     // Undecrypted channel messages — show channel hash and decryption status
     if (decoded.type === 'GRP_TXT' && decoded.channelHash != null) {
