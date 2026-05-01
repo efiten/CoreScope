@@ -8,7 +8,7 @@ const TYPE_CODES = ['COR', 'DIS', 'EDG', 'MOB', 'EBP', 'ESP', 'EMP', 'RP'];
 function parseLocodeName(name) {
   if (!name || typeof name !== 'string') return null;
   const stripped = name.split(' | ')[0].trim();
-  const m = stripped.match(/^([A-Z]{2})-([A-Z0-9]{2,3})-/);
+  const m = stripped.match(/^([A-Z]{2})-([A-Z]{3})-/);
   if (!m) return null;
   const cc = m[1];
   const loc = m[2];
@@ -29,7 +29,12 @@ function parseLocodeName(name) {
 
 function locodeAttr(name) {
   if (!parseLocodeName(name)) return '';
-  return `data-locode="${name.replace(/"/g, '&quot;')}"`;
+  const safe = name
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+  return `data-locode="${safe}"`;
 }
 
 window.parseLocodeName = parseLocodeName;

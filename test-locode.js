@@ -71,6 +71,12 @@ test('invalid name produces empty string', () => {
   assert.strictEqual(locodeAttr('SomeRandomName'), '');
   assert.strictEqual(locodeAttr(null), '');
 });
+test('locodeAttr escapes HTML special chars in name', () => {
+  // Construct a name that parses but has special chars in callsign suffix
+  const a = locodeAttr('BE-BLZ-Test-EDG-01 | <ON8AR>');
+  assert.ok(!a.includes('<ON8AR>'), 'raw < not allowed in attribute');
+  assert.ok(a.includes('&lt;ON8AR&gt;') || !a.includes('<'), 'must be escaped');
+});
 
 console.log(`\nTotal: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
