@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repeater Naming Convention — CoreScope</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    body { max-width: 800px; margin: 40px auto; padding: 0 24px; font-family: var(--font); color: var(--text); background: var(--content-bg); }
+    h1 { font-size: 24px; margin-bottom: 4px; }
+    h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+    th, td { text-align: left; padding: 6px 10px; border: 1px solid var(--border); }
+    th { background: var(--surface-2); font-weight: 600; }
+    code { font-family: var(--mono); background: var(--surface-2); padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+    .format-box { background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 16px 20px; font-family: var(--mono); font-size: 14px; margin: 12px 0; }
+    .field { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 6px; border-radius: 3px; background: var(--accent); color: #fff; font-size: 12px; }
+    a { color: var(--accent); }
+    .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <h1>Repeater Naming Convention</h1>
+  <p class="subtitle">Standardized format for MeshCore repeater names, as used on the Belgian <a href="https://nodenet.be/instellingen/naam-repeater/" target="_blank">nodenet.be</a> network.</p>
+
+  <h2>Format</h2>
+  <div class="format-box">
+    <span class="field">CC</span>-<span class="field">LOC</span>-<span class="field">NAME</span>-<span class="field">TYPE</span>-<span class="field">NUM</span>
+  </div>
+  <table>
+    <thead><tr><th>Field</th><th>Length</th><th>Description</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>CC</code></td><td>2</td><td>ISO country code</td><td><code>BE</code>, <code>NL</code>, <code>DE</code></td></tr>
+      <tr><td><code>LOC</code></td><td>3</td><td>UN/LOCODE city code</td><td><code>BRE</code>, <code>ANT</code>, <code>BLZ</code></td></tr>
+      <tr><td><code>NAME</code></td><td>≤9</td><td>Free name (letters, digits, spaces, underscores)</td><td><code>Tabaart</code>, <code>MT Zolder</code></td></tr>
+      <tr><td><code>TYPE</code></td><td>3</td><td>Repeater type code (see table below)</td><td><code>EBP</code>, <code>DIS</code></td></tr>
+      <tr><td><code>NUM</code></td><td>2</td><td>Sequence number</td><td><code>01</code>, <code>02</code></td></tr>
+    </tbody>
+  </table>
+  <p>Maximum total length: <strong>23 characters</strong>.</p>
+
+  <h2>Repeater Type Codes</h2>
+  <table>
+    <thead><tr><th>Code</th><th>Full name</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>COR</code></td><td>Core Repeater</td><td>Long backbone links connecting smaller distribution areas. High altitude, autonomous with battery backup.</td></tr>
+      <tr><td><code>DIS</code></td><td>Distribution</td><td>Medium to long range, reliable connection to at least one core node. Urban high points, autonomous with battery backup.</td></tr>
+      <tr><td><code>EDG</code></td><td>Edge</td><td>Rooftop and residential nodes. Any height. Mains power allowed.</td></tr>
+      <tr><td><code>EBP</code></td><td>Edge · Battery Powered</td><td>Edge variant — battery powered.</td></tr>
+      <tr><td><code>ESP</code></td><td>Edge · Solar Powered</td><td>Edge variant — solar powered.</td></tr>
+      <tr><td><code>EMP</code></td><td>Edge · Mains Powered</td><td>Edge variant — mains powered.</td></tr>
+      <tr><td><code>MOB</code></td><td>Mobile</td><td>Vehicle-mounted, carried, or temporarily deployed. Free category.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>LOCODE City Code Lookup</h2>
+  <p>The 3-letter city code is taken from the UN/LOCODE standard. Look up codes for your country:</p>
+  <ul>
+    <li><a href="https://service.unece.org/trade/locode/be.htm" target="_blank">Belgium (BE)</a></li>
+    <li><a href="https://service.unece.org/trade/locode/nl.htm" target="_blank">Netherlands (NL)</a></li>
+    <li><a href="https://service.unece.org/trade/locode/de.htm" target="_blank">Germany (DE)</a></li>
+    <li><a href="https://service.unece.org/trade/locode/gb.htm" target="_blank">United Kingdom (GB)</a></li>
+    <li><a href="https://service.unece.org/trade/locode/fr.htm" target="_blank">France (FR)</a></li>
+    <li><a href="https://unece.org/trade/cefact/unlocode-code-list-country-and-territory" target="_blank">All other countries</a></li>
+  </ul>
+
+  <h2>Examples</h2>
+  <table>
+    <thead><tr><th>Name</th><th>Decoded</th></tr></thead>
+    <tbody>
+      <tr><td><code>BE-BLZ-Tabaart-EBP-01</code></td><td>Belgium · Blankenberge · Edge Battery Powered · unit 01</td></tr>
+      <tr><td><code>BE-ZOD-MT Zolder-DIS-01</code></td><td>Belgium · Zonhoven · Distribution · unit 01</td></tr>
+      <tr><td><code>NL-RTM-Harbor-COR-01</code></td><td>Netherlands · Rotterdam · Core Repeater · unit 01</td></tr>
+      <tr><td><code>DE-BER-Tempelhof-EDG-02</code></td><td>Germany · Berlin · Edge · unit 02</td></tr>
+    </tbody>
+  </table>
+
+  <p style="margin-top:40px;color:var(--text-muted);font-size:12px;">
+    Convention defined by <a href="https://nodenet.be/instellingen/naam-repeater/" target="_blank">nodenet.be</a>. CoreScope displays decoded location and type on hover for conforming names.
+  </p>
+</body>
+</html>
