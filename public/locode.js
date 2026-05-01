@@ -41,10 +41,12 @@ window.parseLocodeName = parseLocodeName;
 window.locodeAttr = locodeAttr;
 
 let _locodeData = null;
+let _locodePromise = null;
 
 function _ensureData() {
   if (_locodeData) return Promise.resolve();
-  return fetch('/locode.json').then(r => r.json()).then(d => { _locodeData = d; });
+  if (!_locodePromise) _locodePromise = fetch('/locode.json').then(r => r.json()).then(d => { _locodeData = d; });
+  return _locodePromise;
 }
 
 function _buildTooltipContent(name) {
@@ -95,8 +97,12 @@ function initLocodeTooltips() {
 
   document.addEventListener('mousemove', function(e) {
     if (tip.style.display !== 'block') return;
-    tip.style.left = (e.clientX + 14) + 'px';
-    tip.style.top  = (e.clientY + 14) + 'px';
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    let x = e.clientX + 14, y = e.clientY + 14;
+    if (x + w > window.innerWidth) x = e.clientX - w - 14;
+    if (y + h > window.innerHeight) y = e.clientY - h - 14;
+    tip.style.left = x + 'px';
+    tip.style.top  = y + 'px';
   });
 }
 
