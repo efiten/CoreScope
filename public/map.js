@@ -57,7 +57,11 @@
 
   function makeMarkerIcon(role, isStale, isAlsoObserver, colorOverride) {
     const s = ROLE_STYLE[role] || ROLE_STYLE.companion;
-    const fillColor = colorOverride || s.color;
+    // #1438: default fill resolves through the live CSS var so existing
+    // mounted SVG markers recolor when cb-preset switches or the
+    // operator picks a per-role override. colorOverride (MultiByte
+    // status tint) wins when provided.
+    const fillColor = colorOverride || ('var(--mc-role-' + (role || 'companion') + ')');
     const size = s.radius * 2 + 4;
     const c = size / 2;
     let path;
@@ -112,7 +116,7 @@
         starPts += `${scx + so * Math.cos(aO)},${scy + so * Math.sin(aO)} `;
         starPts += `${scx + si * Math.cos(aI)},${scy + si * Math.sin(aI)} `;
       }
-      obsOverlay = `<g transform="translate(${sx},${sy})"><polygon points="${starPts.trim()}" fill="${ROLE_COLORS.observer || '#f1c40f'}" stroke="#fff" stroke-width="0.8"/></g>`;
+      obsOverlay = `<g transform="translate(${sx},${sy})"><polygon points="${starPts.trim()}" fill="var(--mc-role-observer)" stroke="#fff" stroke-width="0.8"/></g>`;
     }
     const svg = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">${path}${obsOverlay}</svg>`;
     return L.divIcon({
@@ -256,16 +260,60 @@
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    const tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, {
-      attribution: '© OpenStreetMap © CartoDB',
+    // #1420 — multi-provider dark-tile picker. Light mode unchanged.
+    let _darkRefLayer = null;  // Esri-only: labels overlay
+    function _resolveTileUrl(dark) {
+      if (!dark) return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
+      const reg = window.MC_TILE_PROVIDERS || {};
+      const id  = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
+      const p   = reg[id] || reg['carto-dark'] || {};
+      return {
+        url: p.url || p.baseUrl || TILE_DARK,
+        attribution: p.attribution || '© OpenStreetMap © CartoDB',
+        refUrl: p.refUrl || null
+      };
+    }
+    function _syncDarkTiles(dark) {
+      const r = _resolveTileUrl(dark);
+      tileLayer.setUrl(r.url);
+      if (tileLayer.options) tileLayer.options.attribution = r.attribution;
+      // Esri reference (labels) overlay: add when needed, remove otherwise.
+      if (dark && r.refUrl) {
+        if (!_darkRefLayer) {
+          _darkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(map);
+        } else {
+          _darkRefLayer.setUrl(r.refUrl);
+        }
+      } else if (_darkRefLayer) {
+        map.removeLayer(_darkRefLayer);
+        _darkRefLayer = null;
+      }
+      if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
+      if (map.attributionControl) {
+        try { map.attributionControl._update && map.attributionControl._update(); } catch (_) {}
+      }
+    }
+    const _initTile = _resolveTileUrl(isDark);
+    const tileLayer = L.tileLayer(_initTile.url, {
+      attribution: _initTile.attribution,
       maxZoom: 19,
     }).addTo(map);
+    if (isDark && _initTile.refUrl) {
+      _darkRefLayer = L.tileLayer(_initTile.refUrl, { maxZoom: 19, attribution: _initTile.attribution }).addTo(map);
+    }
+    if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
     const _mapThemeObs = new MutationObserver(function () {
       const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
         (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
+      _syncDarkTiles(dark);
     });
     _mapThemeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    // #1420 — re-render when the user picks a different dark provider in the customizer.
+    window.addEventListener('mc-tile-provider-changed', function () {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      _syncDarkTiles(dark);
+    });
 
     // Save position on move
     map.on('moveend', () => {

@@ -150,6 +150,21 @@ func main() {
 		log.Printf("[prune] auto-prune enabled: packets older than %d days will be removed daily", packetDays)
 	}
 
+	// Hourly WAL checkpoint to prevent unbounded WAL growth.
+	// TRUNCATE resets the WAL file to zero bytes when all frames are flushed;
+	// if the server's read connection holds frames, remaining pages stay in the
+	// WAL until the next tick. Staggered 30s after startup to avoid competing
+	// with the initial burst of ingest writes.
+	walCheckpointTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		time.Sleep(30 * time.Second)
+		store.Checkpoint()
+		for range walCheckpointTicker.C {
+			store.Checkpoint()
+		}
+	}()
+	log.Printf("[db] WAL checkpoint scheduled every 1h")
+
 	// Daily neighbor_edges retention (#1287 — moved from cmd/server).
 	{
 		nDays := cfg.NeighborEdgesDaysOrDefault()
@@ -373,6 +388,7 @@ func main() {
 	}
 	statsTicker.Stop()
 	pruneQueueTicker.Stop()
+	walCheckpointTicker.Stop()
 	stopWatchdog()
 	store.LogStats() // final stats on shutdown
 	for _, c := range clients {
@@ -436,7 +452,9 @@ func buildMQTTOpts(source MQTTSource) *mqtt.ClientOptions {
 	}
 	if source.RejectUnauthorized != nil && !*source.RejectUnauthorized {
 		opts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
-	} else if strings.HasPrefix(source.Broker, "ssl://") {
+	} else if strings.HasPrefix(source.Broker, "ssl://") || strings.HasPrefix(source.Broker, "wss://") {
+		// TLS with system CA pool — valid for ssl:// MQTT brokers and
+		// wss:// WebSocket brokers behind a publicly-trusted certificate.
 		opts.SetTLSConfig(&tls.Config{})
 	}
 	return opts
@@ -487,7 +505,11 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		name, _ := msg["origin"].(string)
 		iata := parts[1]
 		meta := extractObserverMeta(msg)
-		if err := store.UpsertObserverAt(observerID, name, iata, meta, resolveRxTime(msg, tag)); err != nil {
+		// observer.last_seen is "when did the analyzer last hear from this
+		// observer" — fundamentally an ingest-time question. Passing "" makes
+		// UpsertObserverAt use time.Now(), independent of the envelope timestamp
+		// (which can be stale/skewed even when well-formed). See #1465.
+		if err := store.UpsertObserverAt(observerID, name, iata, meta, ""); err != nil {
 			log.Printf("MQTT [%s] observer status error: %v", tag, err)
 		}
 		// Insert metrics sample from status message
@@ -709,7 +731,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			if mqttMsg.Region != "" {
 				effectiveRegion = mqttMsg.Region
 			}
-			if err := store.UpsertObserverAt(observerID, origin, effectiveRegion, nil, mqttMsg.Timestamp); err != nil {
+			// Same as the status-path call above: observer.last_seen is ingest
+			// time, not envelope time. Per-packet rxTime (stored in observations
+			// via InsertTransmission) still uses envelope time. See #1465.
+			if err := store.UpsertObserverAt(observerID, origin, effectiveRegion, nil, ""); err != nil {
 				log.Printf("MQTT [%s] observer upsert error: %v", tag, err)
 			}
 		}
@@ -1086,7 +1111,7 @@ func resolveRxTime(msg map[string]interface{}, tag string) string {
 	if raw == "" {
 		return now.Format(time.RFC3339)
 	}
-	t, err := parseEnvelopeTime(raw)
+	t, naive, err := parseEnvelopeTime(raw)
 	if err != nil {
 		log.Printf("MQTT [%s] unparseable timestamp %q, using ingest time", tag, raw)
 		return now.Format(time.RFC3339)
@@ -1105,13 +1130,30 @@ func resolveRxTime(msg map[string]interface{}, tag string) string {
 		log.Printf("MQTT [%s] stale timestamp %q (>30d old), using ingest time", tag, raw)
 		return now.Format(time.RFC3339)
 	}
-	// Soft clamp: naive local-clock timestamps from UTC+N observers are parsed
-	// as-if UTC, making them appear N hours in the future. A UTC+2 observer's
-	// live packet looks 2h ahead, but it is NOT a buffered packet — the whole
-	// point of using rxTime is to preserve the past timestamp for packets that
-	// were buffered offline. If rxTime is ahead of now, the packet is live and
-	// ingest time is the correct value. This also prevents storing future
-	// timestamps that would show ⚠️ in the UI for every packet from UTC+N nodes.
+	// Symmetric naive-timestamp clamp (issue #1463). Naive (zone-less) ISO
+	// values from observers in non-UTC zones are parsed as-if UTC, leaving a
+	// residual offset equal to the observer's UTC offset:
+	//   - UTC+N observer → value appears N hours in the future
+	//   - UTC-N observer → value appears N hours in the past
+	// The past case was silently stored verbatim, poisoning last_seen and
+	// rendering UTC-N observers perpetually "Stale" in the UI. Collapse any
+	// naive value more than 15 min off server-now to now() — well-behaved
+	// observers (Z-suffixed or explicit offset) are untouched regardless of
+	// skew so legitimate buffered uploads remain accurate.
+	const naiveTolerance = 15 * time.Minute
+	if naive {
+		delta := t.Sub(now)
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta > naiveTolerance {
+			log.Printf("MQTT [%s] naive timestamp %q off by %s, using ingest time", tag, raw, delta.Round(time.Second))
+			return now.Format(time.RFC3339)
+		}
+	}
+	// Legacy soft clamp for zone-aware near-future values: any value ahead of
+	// now is from a slightly skewed observer clock — collapse to now so we
+	// don't render ⚠️ in the UI for live packets from those nodes.
 	if t.After(now) {
 		return now.Format(time.RFC3339)
 	}
@@ -1121,19 +1163,22 @@ func resolveRxTime(msg map[string]interface{}, tag string) string {
 // parseEnvelopeTime parses the MQTT envelope timestamp. Two on-wire forms
 // occur: zone-aware ISO8601 (RFC3339), and a naive local-clock ISO string
 // with no zone (python datetime.isoformat()). Zone-aware layouts are tried
-// first; naive layouts are assumed UTC, leaving a bounded residual offset
-// equal to the observer's UTC offset for naive-timestamp uploaders.
-func parseEnvelopeTime(s string) (time.Time, error) {
+// first; naive layouts are assumed UTC but the caller is informed via the
+// returned `naive` flag so it can apply a symmetric clamp (see issue #1463).
+func parseEnvelopeTime(s string) (time.Time, bool, error) {
+	// Zone-aware first — RFC3339 demands Z or ±HH:MM.
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, false, nil
+	}
 	for _, layout := range []string{
-		time.RFC3339,                 // 2026-05-16T10:00:00Z / +02:00
 		"2006-01-02T15:04:05.999999", // python isoformat w/ microseconds
 		"2006-01-02T15:04:05",        // naive ISO
 	} {
 		if t, err := time.Parse(layout, s); err == nil {
-			return t, nil
+			return t, true, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("unrecognized timestamp layout: %q", s)
+	return time.Time{}, false, fmt.Errorf("unrecognized timestamp layout: %q", s)
 }
 
 // deriveHashtagChannelKey derives an AES-128 key from a channel name.

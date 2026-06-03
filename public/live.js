@@ -1171,15 +1171,59 @@
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    let tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map);
+    // #1420 — multi-provider dark-tile picker. Light mode unchanged.
+    let _liveDarkRefLayer = null;
+    function _liveResolveTile(dark) {
+      if (!dark) return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
+      const reg = window.MC_TILE_PROVIDERS || {};
+      const id  = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
+      const p   = reg[id] || reg['carto-dark'] || {};
+      return {
+        url: p.url || p.baseUrl || TILE_DARK,
+        attribution: p.attribution || '© OpenStreetMap © CartoDB',
+        refUrl: p.refUrl || null
+      };
+    }
+    function _liveSyncDarkTiles(dark) {
+      const r = _liveResolveTile(dark);
+      tileLayer.setUrl(r.url);
+      if (tileLayer.options) tileLayer.options.attribution = r.attribution;
+      if (dark && r.refUrl) {
+        if (!_liveDarkRefLayer) {
+          _liveDarkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(map);
+        } else {
+          _liveDarkRefLayer.setUrl(r.refUrl);
+        }
+      } else if (_liveDarkRefLayer) {
+        map.removeLayer(_liveDarkRefLayer);
+        _liveDarkRefLayer = null;
+      }
+      if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
+      // #1420 parity with map.js — refresh visible attribution credit after provider swap.
+      if (map.attributionControl) {
+        try { map.attributionControl._update && map.attributionControl._update(); } catch (_) {}
+      }
+    }
+    const _liveInitTile = _liveResolveTile(isDark);
+    let tileLayer = L.tileLayer(_liveInitTile.url, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(map);
+    if (isDark && _liveInitTile.refUrl) {
+      _liveDarkRefLayer = L.tileLayer(_liveInitTile.refUrl, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(map);
+    }
+    if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
 
     // Swap tiles when theme changes
     const _themeObs = new MutationObserver(function () {
       const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
         (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
+      _liveSyncDarkTiles(dark);
     });
     _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    // #1420 — re-render on customizer change.
+    window.addEventListener('mc-tile-provider-changed', function () {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      _liveSyncDarkTiles(dark);
+    });
     L.control.zoom({ position: 'topright' }).addTo(map);
 
     nodesLayer = L.layerGroup().addTo(map);
@@ -2361,6 +2405,11 @@
   function addNodeMarker(n) {
     if (nodeMarkers[n.public_key]) return nodeMarkers[n.public_key];
     const color = ROLE_COLORS[n.role] || ROLE_COLORS.unknown;
+    // #1438: SVG fill expression — use the live CSS var so existing
+    // markers recolor when cb-preset switches or the operator overrides.
+    // `color` (hex from ROLE_COLORS) is still tracked as `_baseColor`
+    // for matrix mode / pulse animations that need an explicit value.
+    const fillExpr = 'var(--mc-role-' + (n.role || 'companion') + ')';
     const isRepeater = n.role === 'repeater';
     const zoom = map ? map.getZoom() : 11;
     const zoomScale = Math.max(0.4, (zoom - 8) / 6);
@@ -2370,10 +2419,10 @@
     const sizePx = Math.max(10, Math.round((isRepeater ? 18 : 14) * zoomScale));
 
     const svgHtml = (window.makeRoleMarkerSVG
-      ? window.makeRoleMarkerSVG(n.role, color, sizePx)
+      ? window.makeRoleMarkerSVG(n.role, null, sizePx)
       : '<svg width="' + sizePx + '" height="' + sizePx + '" viewBox="0 0 ' + sizePx + ' ' + sizePx +
         '"><circle cx="' + (sizePx/2) + '" cy="' + (sizePx/2) + '" r="' + (sizePx/2 - 2) +
-        '" fill="' + color + '" stroke="#fff" stroke-width="1"/></svg>');
+        '" fill="' + fillExpr + '" stroke="#fff" stroke-width="1"/></svg>');
 
     const icon = L.divIcon({
       html: svgHtml,

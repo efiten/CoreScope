@@ -88,10 +88,73 @@
   });
   // Per-key writes via Proxy not portable enough — expose helper for callers
   // that want to override at runtime (customizer "node colors" path).
+  // #1438: snapshot of the cb-preset (or initial) CSS-var value per role
+  // so that clearing an override restores the preset, not nothing.
+  // We write the override to BOTH documentElement and body inline styles
+  // because cb-presets ships stylesheet rules of the form
+  //   body[data-cb-preset="deut"] { --mc-role-X: #...; }
+  // which beats inheritance from :root. Body inline beats both.
+  var _presetCssSnapshot = {};
+  function _styleTargets() {
+    var t = [];
+    try { if (document.documentElement && document.documentElement.style) t.push(document.documentElement.style); } catch (e) {}
+    try { if (document.body && document.body.style) t.push(document.body.style); } catch (e) {}
+    return t.filter(function (s) { return s && typeof s.setProperty === 'function'; });
+  }
   window.setRoleColorOverride = function (role, hex) {
     if (!role) return;
-    if (hex == null || hex === '') delete _roleOverrides[role];
-    else _roleOverrides[role] = hex;
+    var targets = _styleTargets();
+    var varName = '--mc-role-' + role;
+
+    if (hex == null || hex === '') {
+      // Clear override → restore prior CSS var values captured at
+      // first-override time, so CSS-var consumers see the preset color
+      // again (matches JS getter behavior, preserves #1412 contract).
+      delete _roleOverrides[role];
+      if (Object.prototype.hasOwnProperty.call(_presetCssSnapshot, role)) {
+        var snap = _presetCssSnapshot[role] || {};
+        targets.forEach(function (s, i) {
+          var prior = snap[i];
+          if (prior && prior.length) s.setProperty(varName, prior);
+          else s.removeProperty(varName);
+        });
+        delete _presetCssSnapshot[role];
+      } else {
+        targets.forEach(function (s) { s.removeProperty(varName); });
+      }
+      return;
+    }
+    // Capture the current per-target CSS var values before overwriting,
+    // but only on the first override for this role so repeated picks
+    // don't lose the original preset value.
+    if (!Object.prototype.hasOwnProperty.call(_presetCssSnapshot, role)) {
+      _presetCssSnapshot[role] = targets.map(function (s) {
+        return s.getPropertyValue ? (s.getPropertyValue(varName) || '').trim() : '';
+      });
+    }
+    _roleOverrides[role] = hex;
+    // #1438: drive the CSS var so CSS-var consumers (cluster pills,
+    // route lines, all marker SVGs that use fill="var(--mc-role-X)")
+    // pick up the operator's hex without a page reload. Writing to
+    // body inline style is necessary because body[data-cb-preset="..."]
+    // selectors beat :root inheritance.
+    //
+    // #1446: write with !important so the inline body declaration also
+    // beats the body[data-cb-preset="X"] CSS rule on equal specificity.
+    // Without !important, the cascade order picks the later-defined
+    // stylesheet rule in some browser versions even though specificity
+    // (1,0,1) matches the inline body style — operator pick visibly
+    // loses to active preset (root cause of #1444).
+    targets.forEach(function (s) {
+      // documentElement gets the value without !important (used as the
+      // canonical readout for the JS getter); body gets !important so it
+      // wins the CSS cascade against body[data-cb-preset="X"].
+      if (s === (document.body && document.body.style)) {
+        s.setProperty(varName, hex, 'important');
+      } else {
+        s.setProperty(varName, hex);
+      }
+    });
   };
   // Back-compat: also export the writable override map so customize.js's
   // `window.ROLE_COLORS[key] = inp.value` style mutation works.
@@ -209,7 +272,12 @@
     var shape = (window.ROLE_SHAPES && window.ROLE_SHAPES[role]) || 'circle';
     size = size || 16;
     var c = size / 2;
-    var fill = color || (window.ROLE_COLORS && window.ROLE_COLORS[role]) || '#6b7280';
+    // #1438: default fill resolves through the live CSS var so existing
+    // mounted SVG markers recolor when cb-preset switches or the
+    // operator picks a per-role override via the customizer. Callers
+    // that need a fixed tint (matrix mode, stale dim) keep passing
+    // their explicit colour.
+    var fill = color || ('var(--mc-role-' + (role || 'companion') + ')');
     var path;
     switch (shape) {
       case 'square':
@@ -295,7 +363,35 @@
     var isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' &&
        window.matchMedia('(prefers-color-scheme: dark)').matches);
-    return isDark ? TILE_DARK : TILE_LIGHT;
+    if (!isDark) return TILE_LIGHT;
+    // #1461 followup: honor customizer's dark-tile-provider pick (#1420 / #1430)
+    // when the registry is loaded. Falls back to TILE_DARK if absent.
+    try {
+      if (window.MC_getDarkTileProvider && window.MC_TILE_PROVIDERS) {
+        var id = window.MC_getDarkTileProvider();
+        var p = window.MC_TILE_PROVIDERS[id];
+        if (p && (p.url || p.baseUrl)) {
+          return p.url || p.baseUrl;
+        }
+      }
+    } catch (_e) {}
+    return TILE_DARK;
+  };
+  /* Helper: get the full provider object (for callers that also need the
+   * invertFilter or refUrl/attribution). Returns null when no customizer
+   * provider applies (light mode, or registry not loaded). */
+  window.getActiveTileProvider = function () {
+    var isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (document.documentElement.getAttribute('data-theme') !== 'light' &&
+       window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (!isDark) return null;
+    try {
+      if (window.MC_getDarkTileProvider && window.MC_TILE_PROVIDERS) {
+        var id = window.MC_getDarkTileProvider();
+        return window.MC_TILE_PROVIDERS[id] || null;
+      }
+    } catch (_e) {}
+    return null;
   };
 
   // ─── SNR thresholds ───
@@ -356,6 +452,10 @@
     if (cfg.tiles) {
       if (cfg.tiles.dark) window.TILE_DARK = cfg.tiles.dark;
       if (cfg.tiles.light) window.TILE_LIGHT = cfg.tiles.light;
+    }
+    // #1420 — server default for dark-tile provider picker.
+    if (typeof cfg.mapDarkTileProvider === 'string' && typeof window.MC_setServerDefaultTileProvider === 'function') {
+      window.MC_setServerDefaultTileProvider(cfg.mapDarkTileProvider);
     }
     if (cfg.snrThresholds) Object.assign(SNR_THRESHOLDS, cfg.snrThresholds);
     if (cfg.distThresholds) Object.assign(DIST_THRESHOLDS, cfg.distThresholds);

@@ -346,6 +346,7 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		PropagationBufferMs: float64(s.cfg.PropagationBufferMs()),
 		Timestamps:          s.cfg.GetTimestampConfig(),
 		DebugAffinity:       s.cfg.DebugAffinity,
+		MapDarkTileProvider: s.cfg.MapDarkTileProvider,
 	})
 }
 
@@ -1223,7 +1224,15 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 					node["relay_active"] = info.RelayActive
 					node["relay_count_1h"] = info.RelayCount1h
 					node["relay_count_24h"] = info.RelayCount24h
-					node["usefulness_score"] = lookupUsefulnessScore(usefulMap, pk)
+					// usefulness_score retained for API compat; new
+					// consumers should read traffic_share_score
+					// (issue #1456). When the #672 composite ships
+					// usefulness_score will become the composite
+					// and traffic_share_score will keep the
+					// per-axis value.
+					us := lookupUsefulnessScore(usefulMap, pk)
+					node["usefulness_score"] = us
+					node["traffic_share_score"] = us
 					node["bridge_score"] = lookupUsefulnessScore(bridgeMap, pk)
 				}
 			}
@@ -1370,7 +1379,11 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 			node["relay_window_hours"] = info.WindowHours
 			node["relay_count_1h"] = info.RelayCount1h
 			node["relay_count_24h"] = info.RelayCount24h
-			node["usefulness_score"] = s.store.GetRepeaterUsefulnessScore(pubkey)
+			// usefulness_score retained for API compat; new
+			// consumers should read traffic_share_score (#1456).
+			us := s.store.GetRepeaterUsefulnessScore(pubkey)
+			node["usefulness_score"] = us
+			node["traffic_share_score"] = us
 			node["bridge_score"] = s.store.GetBridgeScore(pubkey)
 		}
 	}
@@ -1789,15 +1802,15 @@ func (s *Server) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	sort.Slice(paths, func(i, j int) bool {
-		if paths[i].Count == paths[j].Count {
-			li := ""
-			lj := ""
-			if paths[i].LastSeen != nil {
-				li = fmt.Sprintf("%v", paths[i].LastSeen)
-			}
-			if paths[j].LastSeen != nil {
-				lj = fmt.Sprintf("%v", paths[j].LastSeen)
-			}
+		li := ""
+		lj := ""
+		if paths[i].LastSeen != nil {
+			li = fmt.Sprintf("%v", paths[i].LastSeen)
+		}
+		if paths[j].LastSeen != nil {
+			lj = fmt.Sprintf("%v", paths[j].LastSeen)
+		}
+		if li != lj {
 			return li > lj
 		}
 		return paths[i].Count > paths[j].Count

@@ -74,8 +74,10 @@
       img.className = 'brand-logo';
       img.setAttribute('src', url);
       img.setAttribute('alt', alt || node.getAttribute('aria-label') || 'Brand');
-      img.setAttribute('width', '125');
-      img.setAttribute('height', '36');
+      // #1450 — DO NOT set width/height attrs. CSS img.brand-logo handles
+      // sizing (height:36px, width:auto, max-width cap) so the operator's
+      // natural image aspect ratio is preserved instead of being squished
+      // into the default SVG's 125x36 pill box.
       node.parentNode.replaceChild(img, node);
     } else {
       if (node.tagName.toLowerCase() !== 'img') {
@@ -554,8 +556,55 @@
     // overrides still flow through setRoleColorOverride() in customize.js.
     var nc = effectiveConfig.nodeColors;
     if (nc) {
+      // #1438 final: scope --mc-role-{role} writes to USER overrides only,
+      // UNLESS no CB preset is active (#1446). When a preset is active the
+      // server-config palette must stay out of --mc-role-* so the preset
+      // wins (preserves #1412). When NO preset is active, the cascade is:
+      //   user override > server config > built-in :root default.
+      // → server config gets to write --mc-role-{role} in that case.
+      var userNc = (userOverrides && userOverrides.nodeColors) || {};
+      var presetActive = false;
+      try {
+        var presetAttr = document.body && document.body.getAttribute && document.body.getAttribute('data-cb-preset');
+        presetActive = !!(presetAttr && presetAttr !== 'none');
+      } catch (e) {}
       for (var role in nc) {
         root.setProperty('--node-' + role, nc[role]);
+        if (Object.prototype.hasOwnProperty.call(userNc, role)) {
+          // Operator picked this color → drive --mc-role-{role} so marker
+          // SVGs (fill="var(--mc-role-X)") and other CSS-var consumers
+          // pick it up on every page load. Without this the user pick
+          // sits in localStorage but --mc-role-{role} falls back to the
+          // active preset on reload, reverting marker fills.
+          root.setProperty('--mc-role-' + role, nc[role]);
+          // #1446 — also write to body.style with !important so the user
+          // pick beats the body[data-cb-preset="X"] selector cascade when
+          // a CB preset is active. Without this, the root-level write is
+          // shadowed by the preset's body-scoped CSS rule (root cause of
+          // #1444). When no preset is active, the body write is harmless
+          // and still wins inheritance.
+          if (presetActive && document.body && document.body.style) {
+            document.body.style.setProperty('--mc-role-' + role, nc[role], 'important');
+          }
+        } else if (!presetActive) {
+          // #1446 — no preset is active; server config is the legitimate
+          // source of role colors. Write --mc-role-{role} so marker SVGs
+          // honor operator's config.json without forcing visitors to pick
+          // a CB preset to "unlock" their server palette.
+          root.setProperty('--mc-role-' + role, nc[role]);
+        } else if (presetActive && document.body && document.body.style) {
+          // Preset active AND this role has no user override:
+          // ensure any prior body inline !important is removed so the
+          // preset value (from body[data-cb-preset=X] CSS rule) takes over.
+          // Also remove the root-level --mc-role-{role} that a PREVIOUS
+          // setOverride call left behind (#1446 followup): without this,
+          // :root.style.--mc-role-{role} stays stuck at the old user-pick
+          // value even though body's cascaded preset rule now wins for
+          // descendant elements. The visible UI is correct but introspection
+          // (getComputedStyle on documentElement) reports stale color.
+          document.body.style.removeProperty('--mc-role-' + role);
+          root.removeProperty('--mc-role-' + role);
+        }
       }
     }
 
@@ -1133,7 +1182,9 @@
   function _renderColorblindPresetSelector() {
     var MCP = (typeof window !== 'undefined') && window.MeshCorePresets;
     if (!MCP || !Array.isArray(MCP.list)) return '';
-    var current = MCP.currentPreset ? MCP.currentPreset() : 'default';
+    // #1446 — currentPreset() now returns null when no preset is stored.
+    var current = MCP.currentPreset ? MCP.currentPreset() : null;
+    var clearOpt = _renderCbPresetClearOption(current);
     var options = MCP.list.map(function (p) {
       var checked = p.id === current ? ' checked' : '';
       return '<label class="cust-cb-preset-row" style="display:flex;gap:8px;align-items:flex-start;margin:6px 0;cursor:pointer">' +
@@ -1145,10 +1196,23 @@
         '</div>' +
       '</label>';
     }).join('');
-    return '<p class="cust-section-title">Colorblind Preset</p>' +
-      '<p class="cust-hint" style="margin-bottom:8px">Switch the role/status palette for color-vision variants. Achromatopsia uses a luminance-only ramp and relies on the shape/letter/glyph carriers from #1356/#1357.</p>' +
-      '<div class="cust-cb-presets" data-cv2-cb-preset-group>' + options + '</div>' +
+    return '<p class="cust-section-title">Optional: Colorblind-Safe Preset</p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">A CB preset is an end-user opt-in that swaps the role/status palette for color-vision variants. ' +
+      'Leave unset to use the operator\'s configured colors (or pick from above). ' +
+      'Achromatopsia uses a luminance-only ramp and relies on the shape/letter/glyph carriers from #1356/#1357.</p>' +
+      '<div class="cust-cb-presets" data-cv2-cb-preset-group>' + clearOpt + options + '</div>' +
       '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">';
+  }
+
+  function _renderCbPresetClearOption(current) {
+    var checked = !current ? ' checked' : '';
+    return '<label class="cust-cb-preset-row" style="display:flex;gap:8px;align-items:flex-start;margin:6px 0;cursor:pointer">' +
+      '<input type="radio" name="cv2-cb-preset" data-cv2-cb-preset value="" data-cv2-cb-preset-none' + checked + ' style="margin-top:3px">' +
+      '<div style="flex:1">' +
+        '<div style="font-weight:600">No preset (use operator / custom colors)</div>' +
+        '<div class="cust-hint" style="font-size:12px;color:var(--text-muted)">Default — server-configured colors apply, then any per-role overrides above.</div>' +
+      '</div>' +
+    '</label>';
   }
 
   function _renderCbPresetWarning(id) {
@@ -1199,9 +1263,11 @@
     var liveHeatPct = Math.round(liveHeatOpacity * 100);
 
     return '<div class="cust-panel' + (_activeTab === 'nodes' ? ' active' : '') + '" data-panel="nodes">' +
-      _renderColorblindPresetSelector() +
-      '<p class="cust-section-title">Node Role Colors</p>' + rows +
+      '<p class="cust-section-title">Node Role Colors</p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">These are the canonical role colors used across the app. They inherit from your server config (or built-in defaults), and can be optionally remapped by a colorblind-safe preset below.</p>' +
+      rows +
       '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
+      _renderColorblindPresetSelector() +
       '<p class="cust-section-title">Packet Type Colors</p>' + typeRows +
       '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
       '<p class="cust-section-title">Heatmap Opacity</p>' +
@@ -1256,7 +1322,48 @@
       '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Gesture Hints</p>' +
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Re-show first-visit gesture discoverability hints (swipe rows, swipe tabs, edge-swipe drawer, pull-to-refresh).</p>' +
       '<button type="button" class="cust-dl-btn" data-cv2-reset-hints data-reset-gesture-hints>↺ Reset gesture hints</button>' +
+      _renderChannelsShowEncryptedToggle() +
+      _renderDarkTileProviderSelector() +
     '</div>';
+  }
+
+  // ── #1454 Show-encrypted-channels toggle ──
+  // Writes localStorage["channels-show-encrypted"]. Default OFF: key is
+  // removed (not set to "false") so the read-gate in channels.js cleanly
+  // returns false. Fires `mc-channels-show-encrypted-changed`; channels.js
+  // re-fetches the list live without a page reload.
+  function _renderChannelsShowEncryptedToggle() {
+    var on = false;
+    try { on = localStorage.getItem('channels-show-encrypted') === 'true'; } catch (_e) {}
+    return '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Channels</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Encrypted channels appear as "Encrypted (0xAB)" with no name. Operators usually leave this off.</p>' +
+      '<div class="cust-field" style="display:flex;align-items:center;gap:8px">' +
+        '<input type="checkbox" id="cv2-channels-show-encrypted" data-cv2-channels-show-encrypted' +
+          (on ? ' checked' : '') +
+          ' style="width:16px;height:16px;cursor:pointer">' +
+        '<label for="cv2-channels-show-encrypted" style="cursor:pointer;margin:0">Show encrypted channels</label>' +
+      '</div>';
+  }
+
+  // ── #1420 Dark-tile provider selector ──
+  // Persists per-browser via MC_setDarkTileProvider; map.js / live.js
+  // listen for `mc-tile-provider-changed` and swap tiles live.
+  function _renderDarkTileProviderSelector() {
+    var reg = (typeof window !== 'undefined') && window.MC_TILE_PROVIDERS;
+    if (!reg) return '';
+    var active = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
+    var ids = ['carto-dark', 'esri-darkgray-labels', 'voyager-inverted', 'positron-inverted'];
+    var options = ids.filter(function (id) { return reg[id]; }).map(function (id) {
+      var label = reg[id].label || id;
+      var sel   = id === active ? ' selected' : '';
+      return '<option value="' + escAttr(id) + '"' + sel + '>' + esc(label) + '</option>';
+    }).join('');
+    return '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Dark Map Tiles</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Choose the dark-mode basemap. Light mode is unaffected. Inverted variants apply a CSS filter for higher contrast.</p>' +
+      '<div class="cust-field"><label for="cv2-dark-tile-provider">Provider</label>' +
+        '<select id="cv2-dark-tile-provider" data-cv2-dark-tile-provider style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text)">' +
+        options +
+        '</select></div>';
   }
 
   function _renderHome() {
@@ -1797,14 +1904,46 @@
     if (_activeTab === 'geofilter') _initGeoFilterTab(container);
 
     // #1361 Colorblind preset radio — switches preset via MeshCorePresets.applyPreset
+    // #1446 — empty-value radio = "no preset" → clearPreset(), then re-run
+    // the customizer pipeline so server-config colors take over.
     container.querySelectorAll('[data-cv2-cb-preset]').forEach(function (radio) {
       radio.addEventListener('change', function () {
         if (!radio.checked) return;
         var id = radio.value;
-        if (window.MeshCorePresets && typeof window.MeshCorePresets.applyPreset === 'function') {
-          window.MeshCorePresets.applyPreset(id);
-          _refreshPanel();
+        var MCP = window.MeshCorePresets;
+        if (!MCP) return;
+        if (!id) {
+          if (typeof MCP.clearPreset === 'function') MCP.clearPreset();
+          _runPipeline();
+        } else if (typeof MCP.applyPreset === 'function') {
+          MCP.applyPreset(id);
         }
+        _refreshPanel();
+      });
+    });
+
+    // #1420 Dark-tile provider dropdown — persists + fires mc-tile-provider-changed
+    container.querySelectorAll('[data-cv2-dark-tile-provider]').forEach(function (sel) {
+      sel.addEventListener('change', function () {
+        var id = sel.value;
+        if (typeof window.MC_setDarkTileProvider === 'function') {
+          window.MC_setDarkTileProvider(id);
+        }
+      });
+    });
+
+    // #1454 Show-encrypted-channels checkbox — persists + fires
+    // mc-channels-show-encrypted-changed; channels.js re-fetches live.
+    container.querySelectorAll('[data-cv2-channels-show-encrypted]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var on = !!cb.checked;
+        try {
+          if (on) localStorage.setItem('channels-show-encrypted', 'true');
+          else localStorage.removeItem('channels-show-encrypted');
+        } catch (_e) { /* private mode etc. */ }
+        window.dispatchEvent(new CustomEvent('mc-channels-show-encrypted-changed', {
+          detail: { value: on }
+        }));
       });
     });
 
@@ -2119,6 +2258,18 @@
 
   // 1. Migration check
   migrateOldKeys();
+
+  // #1446 — when a CB preset is cleared (or applied), re-run the customizer
+  // pipeline so server-config nodeColors take over the --mc-role-{role}
+  // CSS vars (the gating logic in applyCSS checks the body[data-cb-preset]
+  // attribute to decide whether to write them).
+  try {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('cb-preset-changed', function () {
+        if (_initDone) _runPipeline();
+      });
+    }
+  } catch (e) {}
 
   // 2. Read overrides and apply CSS immediately (before DOMContentLoaded)
   // Server defaults will be set later when /api/config/theme completes.

@@ -748,9 +748,11 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		err := s.stmtGetObserverRowid.QueryRow(data.ObserverID).Scan(&rowid)
 		if err == nil {
 			observerIdx = &rowid
-			// Update observer last_seen and last_packet_at on every packet to prevent
-			// low-traffic observers from appearing offline (#463)
-			_, _ = s.stmtUpdateObserverLastSeen.Exec(ingestNow, rxTime, ingestNow, rxTime, rowid)
+			// observer.last_seen and last_packet_at answer "when did the analyzer
+			// last hear from this observer" — both are ingest-time questions.
+			// Per-packet rxTime is stored separately on observations/transmissions
+			// using envelope time (see InsertTransmission above). See #1465.
+			_, _ = s.stmtUpdateObserverLastSeen.Exec(ingestNow, ingestNow, ingestNow, ingestNow, rowid)
 		}
 	}
 
@@ -1043,14 +1045,20 @@ func (s *Store) RunIncrementalVacuum(pages int) {
 	}
 }
 
-// Checkpoint forces a WAL checkpoint to release the WAL lock file,
-// preventing lock contention with a new process starting up.
-func (s *Store) Checkpoint() {
-	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+// Checkpoint runs a WAL checkpoint (TRUNCATE mode).
+// Returns the number of WAL frames checkpointed (0 if WAL was already empty).
+// TRUNCATE resets the WAL file to zero bytes when all frames are checkpointed;
+// if active readers hold frames, it checkpoints what it can and leaves the rest.
+func (s *Store) Checkpoint() int {
+	var busy, walFrames, checkpointed int
+	if err := s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &walFrames, &checkpointed); err != nil {
 		log.Printf("[db] WAL checkpoint error: %v", err)
-	} else {
-		log.Println("[db] WAL checkpoint complete")
+		return 0
 	}
+	if walFrames > 0 {
+		log.Printf("[db] WAL checkpoint: %d/%d frames checkpointed (blocked=%v)", checkpointed, walFrames, busy != 0)
+	}
+	return checkpointed
 }
 
 // BackfillPathJSONAsync launches the path_json backfill in a background goroutine.
