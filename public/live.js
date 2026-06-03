@@ -2302,7 +2302,7 @@
     const dl = document.getElementById('liveNodeFilterList');
     if (!dl) return;
     dl.innerHTML = Object.values(nodeData).map(n =>
-      `<option value="${n.public_key}">${n.name || n.public_key.slice(0, 8)}</option>`
+      `<option value="${escapeHtml(n.public_key)}">${escapeHtml(n.name || n.public_key.slice(0, 8))}</option>`
     ).join('');
   }
 
@@ -2448,7 +2448,7 @@
       interactive: false
     }).addTo(nodesLayer);
 
-    marker.bindTooltip(n.name || n.public_key.slice(0, 8), {
+    marker.bindTooltip(escapeHtml(n.name || n.public_key.slice(0, 8)), {
       permanent: false, direction: 'top', offset: [0, -sizePx / 2], className: 'live-tooltip'
     });
 

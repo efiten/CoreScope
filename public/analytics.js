@@ -2006,7 +2006,7 @@
           color: isEnd ? (i === 0 ? statusGreen() : statusRed()) : statusYellow(),
           fillColor: isEnd ? (i === 0 ? statusGreen() : statusRed()) : statusYellow(),
           fillOpacity: 0.9, weight: 2
-        }).bindTooltip(n.name, { permanent: false }).addTo(map);
+        }).bindTooltip(esc(n.name), { permanent: false }).addTo(map);
       });
 
       L.polyline(latlngs, { color: statusYellow(), weight: 3, dashArray: '8,6', opacity: 0.8 }).addTo(map);

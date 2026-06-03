@@ -6552,6 +6552,37 @@ console.log('\n=== app.js: formatChartAxisLabel ===');
   ctx.localStorage.removeItem('meshcore-timestamp-timezone');
 }
 
+// ===== app.js: escapeHtml (XSS / adv_name hardening, CVE-2026-45323 class) =====
+console.log('\n=== app.js: escapeHtml ===');
+{
+  const ctx = makeSandbox();
+  loadInCtx(ctx, 'public/roles.js');
+  loadInCtx(ctx, 'public/app.js');
+  const escapeHtml = ctx.escapeHtml;
+
+  test('escapeHtml is exposed globally', () => assert.strictEqual(typeof escapeHtml, 'function'));
+  test('null/undefined become empty string', () => {
+    assert.strictEqual(escapeHtml(null), '');
+    assert.strictEqual(escapeHtml(undefined), '');
+  });
+  test('benign node name is unchanged', () => {
+    assert.strictEqual(escapeHtml('NL-PEY-RP01'), 'NL-PEY-RP01');
+  });
+  test('img onerror payload is neutralised (no raw angle brackets)', () => {
+    const out = escapeHtml('<img src=x onerror=alert(1)>');
+    assert.ok(!/[<>]/.test(out), 'angle brackets must be escaped: ' + out);
+    assert.strictEqual(out, '&lt;img src=x onerror=alert(1)&gt;');
+  });
+  test('attribute-breakout payload escapes quotes and brackets', () => {
+    const out = escapeHtml('"><script>alert(document.domain)</script>');
+    assert.ok(!out.includes('<script>'), 'script tag must not survive: ' + out);
+    assert.ok(!out.includes('">'), 'quote+bracket breakout must not survive: ' + out);
+  });
+  test('ampersand is escaped first (no double-decoding)', () => {
+    assert.strictEqual(escapeHtml('a & b'), 'a &amp; b');
+  });
+}
+
 // ===== SUMMARY =====
 Promise.allSettled(pendingTests).then(() => {
   console.log(`\n${'═'.repeat(40)}`);
