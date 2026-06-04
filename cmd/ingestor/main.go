@@ -528,7 +528,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 				log.Printf("MQTT [%s] metrics insert error: %v", tag, err)
 			}
 		}
-		log.Printf("MQTT [%s] status: %s (%s)", tag, firstNonEmpty(name, observerID), iata)
+		log.Print(formatStatusLog(tag, firstNonEmpty(name, observerID), iata))
 		return
 	}
 
@@ -593,7 +593,14 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		}
 
 		mqttMsg := &MQTTPacketMessage{Raw: rawHex}
-		mqttMsg.Timestamp = resolveRxTime(msg, tag)
+		var naiveSkewSec int64
+		mqttMsg.Timestamp, naiveSkewSec = resolveRxTime(msg, tag)
+		if naiveSkewSec != 0 && observerID != "" {
+			// Issue #1478: record so /api/observers can surface ⚠️ chip.
+			if err := store.RecordNaiveSkew(observerID, naiveSkewSec, time.Now()); err != nil {
+				log.Printf("MQTT [%s] RecordNaiveSkew(%s): %v", tag, observerID, err)
+			}
+		}
 		// Parse optional region from JSON payload (#788)
 		if v, ok := msg["region"].(string); ok && v != "" {
 			mqttMsg.Region = v
@@ -650,7 +657,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					truncPK = truncPK[:16]
 				}
 				log.Printf("MQTT [%s] DROPPED invalid signature: hash=%s name=%s observer=%s pubkey=%s",
-					tag, hash, decoded.Payload.Name, firstNonEmpty(mqttMsg.Origin, observerID), truncPK)
+					tag, hash, sanitizeLogString(decoded.Payload.Name), sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)), truncPK)
 				store.InsertDroppedPacket(&DroppedPacket{
 					Hash:         hash,
 					RawHex:       rawHex,
@@ -680,7 +687,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					truncPK = truncPK[:16]
 				}
 				log.Printf("MQTT [%s] foreign advert: node=%s name=%s lat=%.4f lon=%.4f observer=%s",
-					tag, truncPK, decoded.Payload.Name, lat, lon, firstNonEmpty(mqttMsg.Origin, observerID))
+					tag, truncPK, sanitizeLogString(decoded.Payload.Name), lat, lon, sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)))
 			}
 			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionKeys)
 			pktData.Foreign = foreign
@@ -844,7 +851,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		// used for claiming/health lookups. The node will get a proper entry when it
 		// sends an advert. See issue #665.
 
-		log.Printf("MQTT [%s] channel message: ch%s from %s", tag, channelIdx, firstNonEmpty(sender, "unknown"))
+		log.Print(formatChannelMessageLog(tag, channelIdx, firstNonEmpty(sender, "unknown")))
 		return
 	}
 
@@ -930,7 +937,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			log.Printf("MQTT [%s] DM insert error: %v", tag, err)
 		}
 
-		log.Printf("MQTT [%s] direct message from %s", tag, firstNonEmpty(sender, "unknown"))
+		log.Print(formatDirectMessageLog(tag, firstNonEmpty(sender, "unknown")))
 		return
 	}
 }
@@ -1105,22 +1112,28 @@ func firstNonEmpty(vals ...string) string {
 // the frame, not when the MQTT message is published — so a buffered packet
 // uploaded hours late still carries its true receive time. Using ingest time
 // (time.Now()) here mis-dated such packets by the upload delay.
-func resolveRxTime(msg map[string]interface{}, tag string) string {
+//
+// The returned naiveSkewSec is 0 unless a naive (zone-less) timestamp had to
+// be clamped because it was off from server-now by >15min — in which case it
+// is the signed offset in seconds (negative = observer behind UTC, positive =
+// ahead). Caller records this via Store.RecordNaiveSkew so the UI can flag
+// the observer (#1478).
+func resolveRxTime(msg map[string]interface{}, tag string) (string, int64) {
 	now := time.Now().UTC()
 	raw, _ := msg["timestamp"].(string)
 	if raw == "" {
-		return now.Format(time.RFC3339)
+		return now.Format(time.RFC3339), 0
 	}
 	t, naive, err := parseEnvelopeTime(raw)
 	if err != nil {
 		log.Printf("MQTT [%s] unparseable timestamp %q, using ingest time", tag, raw)
-		return now.Format(time.RFC3339)
+		return now.Format(time.RFC3339), 0
 	}
 	// Hard reject: > 14h ahead is a genuine clock error (UTC+14 is the maximum
 	// standard offset, so nothing valid should be further ahead than that).
 	if t.After(now.Add(14 * time.Hour)) {
 		log.Printf("MQTT [%s] future timestamp %q, using ingest time", tag, raw)
-		return now.Format(time.RFC3339)
+		return now.Format(time.RFC3339), 0
 	}
 	// Hard reject: > 30 days in the past is an RTC-reset node reporting a
 	// factory date (e.g. 2020-01-01). Such a value would permanently drag
@@ -1128,7 +1141,7 @@ func resolveRxTime(msg map[string]interface{}, tag string) string {
 	// InsertTransmission. No legitimate buffered upload is that stale.
 	if t.Before(now.Add(-30 * 24 * time.Hour)) {
 		log.Printf("MQTT [%s] stale timestamp %q (>30d old), using ingest time", tag, raw)
-		return now.Format(time.RFC3339)
+		return now.Format(time.RFC3339), 0
 	}
 	// Symmetric naive-timestamp clamp (issue #1463). Naive (zone-less) ISO
 	// values from observers in non-UTC zones are parsed as-if UTC, leaving a
@@ -1142,22 +1155,26 @@ func resolveRxTime(msg map[string]interface{}, tag string) string {
 	// skew so legitimate buffered uploads remain accurate.
 	const naiveTolerance = 15 * time.Minute
 	if naive {
-		delta := t.Sub(now)
-		if delta < 0 {
-			delta = -delta
+		signed := t.Sub(now) // signed: positive = ahead, negative = behind
+		abs := signed
+		if abs < 0 {
+			abs = -abs
 		}
-		if delta > naiveTolerance {
-			log.Printf("MQTT [%s] naive timestamp %q off by %s, using ingest time", tag, raw, delta.Round(time.Second))
-			return now.Format(time.RFC3339)
+		if abs > naiveTolerance {
+			// Issue #1478: surface to UI via RecordNaiveSkew (called by handler).
+			// Per-message log was silenced in #1479 — chip + banner in the UI
+			// replace it.
+			deltaSec := int64(signed / time.Second)
+			return now.Format(time.RFC3339), deltaSec
 		}
 	}
 	// Legacy soft clamp for zone-aware near-future values: any value ahead of
 	// now is from a slightly skewed observer clock — collapse to now so we
 	// don't render ⚠️ in the UI for live packets from those nodes.
 	if t.After(now) {
-		return now.Format(time.RFC3339)
+		return now.Format(time.RFC3339), 0
 	}
-	return t.UTC().Format(time.RFC3339)
+	return t.UTC().Format(time.RFC3339), 0
 }
 
 // parseEnvelopeTime parses the MQTT envelope timestamp. Two on-wire forms
@@ -1188,12 +1205,29 @@ func deriveHashtagChannelKey(channelName string) string {
 	return hex.EncodeToString(h[:16])
 }
 
+// builtinChannelKeys returns channel keys that are part of the MeshCore firmware
+// defaults and should always be available, regardless of the rainbow file or config.
+// Adding new entries here is the right move when a key is part of the protocol spec
+// (not a community-named hashtag channel).
+func builtinChannelKeys() map[string]string {
+	return map[string]string{
+		// Default Public channel — well-known PSK from the MeshCore companion
+		// protocol spec. Channel-hash byte = 0x11.
+		"Public": "8b3387e9c5cdea6ac9e5edbaa115cd72",
+	}
+}
+
 // loadChannelKeys loads channel decryption keys from config and/or a JSON file.
-// Merge priority: rainbow (lowest) → derived from hashChannels → explicit config (highest).
+// Merge priority: builtin (lowest) → rainbow → derived from hashChannels → explicit config (highest).
 func loadChannelKeys(cfg *Config, configPath string) map[string]string {
 	keys := make(map[string]string)
 
-	// 1. Rainbow table keys (lowest priority)
+	// 0. Built-in firmware-default keys (lowest priority — overridable by everything else)
+	for k, v := range builtinChannelKeys() {
+		keys[k] = v
+	}
+
+	// 1. Rainbow table keys
 	keysPath := os.Getenv("CHANNEL_KEYS_PATH")
 	if keysPath == "" {
 		keysPath = cfg.ChannelKeysPath

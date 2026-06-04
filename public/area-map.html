@@ -222,10 +222,11 @@ function buildSidebar() {
   });
 }
 
-// Escape untrusted strings (e.g. mesh-advertised node names) before HTML interpolation. (#XSS adv_name)
+// Escape untrusted strings (e.g. mesh-advertised node names) before HTML interpolation. (#1536)
+// 5-char OWASP set — including ' for single-quoted attribute safety.
 function escapeHtml(s) {
   if (s == null) return '';
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 async function loadAreaNodes(areaKey, color, group) {
@@ -237,7 +238,7 @@ async function loadAreaNodes(areaKey, color, group) {
       if (!n.lat || !n.lon) return;
       const m = L.circleMarker([n.lat, n.lon], { radius: 7, color, fillColor: color, fillOpacity: 0.85, weight: 2 });
       m.bindPopup(`<div class="node-popup"><strong>${escapeHtml(n.name || n.public_key?.slice(0,8) || '?')}</strong><br>
-        ${n.public_key?.slice(0,16)}…<br>GPS: ${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}<br><em>${areaKey}</em></div>`);
+        ${escapeHtml(n.public_key?.slice(0,16) || '')}…<br>GPS: ${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}<br><em>${escapeHtml(areaKey)}</em></div>`);
       group.addLayer(m);
     });
   } catch(_) {}
@@ -251,7 +252,7 @@ function buildNodeLayer() {
     count++;
     const m = L.circleMarker([n.lat, n.lon], { radius: 4, color: '#999', fillColor: '#bbb', fillOpacity: 0.6, weight: 1 });
     m.bindPopup(`<div class="node-popup"><strong>${escapeHtml(n.name || n.public_key?.slice(0,8) || '?')}</strong><br>
-      ${n.public_key?.slice(0,16)}…<br>GPS: ${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}</div>`);
+      ${escapeHtml(n.public_key?.slice(0,16) || '')}…<br>GPS: ${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}</div>`);
     allNodeLayer.addLayer(m);
   });
   document.getElementById('node-count').textContent = count;

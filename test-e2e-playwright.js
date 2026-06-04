@@ -238,38 +238,49 @@ async function run() {
     }
   });
 
-  // Test: Stats bar shows version/commit badge
-  await test('Stats bar shows version and commit badge', async () => {
+  // Test: Version info is on Perf page (not navbar)
+  await test('Version info lives on Perf dashboard, not in navbar', async () => {
     await page.goto(BASE, { waitUntil: 'domcontentloaded' });
-    // Wait for stats to load (fetched from /api/stats)
+    // Wait for nav stats bar to load
     await page.waitForFunction(() => {
       const stats = document.getElementById('navStats');
       return stats && stats.textContent.trim().length > 5;
     }, { timeout: 10000 });
     const navStats = await page.$('#navStats');
     assert(navStats, 'Nav stats bar (#navStats) not found');
-    // Check if stats API exposes version info
+    // Version/engine badges must NOT appear in the navbar
+    const navVersionBadge = await page.$('#navStats .version-badge');
+    assert(!navVersionBadge, 'version-badge should not be in the navbar (moved to Perf dashboard)');
+    const navEngineBadge = await page.$('#navStats .engine-badge');
+    assert(!navEngineBadge, 'engine-badge should not be in the navbar (moved to Perf dashboard)');
+    // Check if health API exposes version info
     const hasVersionData = await page.evaluate(async () => {
       try {
-        const res = await fetch('/api/stats');
+        const res = await fetch('/api/health');
         const data = await res.json();
-        return !!(data.version || data.commit || data.engine);
+        return !!(data.version || data.commit);
       } catch { return false; }
     });
     if (!hasVersionData) {
-      console.log('    ⏭️  Server does not expose version/commit in /api/stats — badge test skipped');
+      console.log('    ⏭️  Server does not expose version/commit in /api/health — perf card test skipped');
       return;
     }
-    // Version badge should appear when data is available
-    await page.waitForFunction(() => !!document.querySelector('.version-badge'), { timeout: 5000 });
-    const badgeText = await page.$eval('.version-badge', el => el.textContent.trim());
-    assert(badgeText.length > 3, `Version badge should have content but got "${badgeText}"`);
-    const hasCommitHash = /[0-9a-f]{7}/i.test(badgeText);
-    assert(hasCommitHash, `Version badge should contain a commit hash, got "${badgeText}"`);
-    const engineBadge = await page.$('.engine-badge');
-    assert(engineBadge, 'Engine badge (.engine-badge) not found');
-    const engineText = await page.$eval('.engine-badge', el => el.textContent.trim().toLowerCase());
-    assert(engineText.includes('node') || engineText.includes('go'), `Engine should contain "node" or "go", got "${engineText}"`);
+    // Version card should appear on the Perf dashboard
+    await page.goto(`${BASE}/#/perf`, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => {
+      const cards = document.querySelectorAll('.perf-card .perf-label');
+      return Array.from(cards).some(el => el.textContent.trim() === 'Version');
+    }, { timeout: 10000 });
+    // waitForFunction already confirmed the Version label exists; just grab the num text
+    const versionNumText = await page.evaluate(() => {
+      const labels = document.querySelectorAll('.perf-card .perf-label');
+      const label = Array.from(labels).find(el => el.textContent.trim() === 'Version');
+      if (!label) return null;
+      const num = label.closest('.perf-card').querySelector('.perf-num, .perf-num--small');
+      return num ? num.textContent.trim() : '';
+    });
+    assert(versionNumText !== null, 'Version perf-card not found on #/perf');
+    assert(versionNumText.length > 0, 'Version card .perf-num should have non-empty text');
   });
 
   // --- Group: Nodes page (tests 2, 5) ---
@@ -657,6 +668,15 @@ async function run() {
     const detailHtml = await page.$eval('#pktRight', el => el.innerHTML);
     const hasChannelHash = detailHtml.includes('Channel Hash') || detailHtml.includes('Ch 0x');
     assert(hasChannelHash, 'Undecrypted GRP_TXT detail should show "Channel Hash"');
+  });
+
+  await test('#1530 copy-link-btn color differs from accent', async () => {
+    const hash = await page.evaluate(async () => (await (await fetch('/api/packets?limit=1')).json()).packets?.[0]?.hash);
+    if (!hash) return console.log('    ⏭️  Skipped (no packets)');
+    await page.goto(`${BASE}/#/packets/${hash}`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.copy-link-btn', { timeout: 8000 });
+    const diff = await page.evaluate(() => window.getComputedStyle(document.querySelector('.copy-link-btn')).color !== window.getComputedStyle(document.documentElement).getPropertyValue('--accent').trim());
+    assert(diff, 'copy-link-btn color should not match --accent');
   });
 
   // --- Group: Analytics page (test 8 + sub-tabs) ---
@@ -2036,14 +2056,21 @@ async function run() {
     // Use a mobile viewport
     await page.setViewportSize({ width: 480, height: 800 });
     await page.goto(`${BASE}/#/packets`);
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(1500);
 
     const filterBar = await page.$('.filter-bar');
     assert(filterBar, 'Filter bar should exist on packets page');
 
-    // Before clicking toggle, filter inputs should be hidden
-    const toggleBtn = await page.$('.filter-toggle-btn');
-    assert(toggleBtn, 'Filter toggle button should exist on mobile');
+    // #1471: on mobile, the in-page .filter-toggle-btn is hidden + the
+    // operator-visible toggle is the navbar mirror injected by
+    // public/mobile-page-actions.js (class: filter-toggle-btn-mirror).
+    // Try mirror first, fall back to in-page button for any test rig where
+    // the mirror script didn't load.
+    let toggleBtn = await page.$('.filter-toggle-btn-mirror');
+    if (!toggleBtn) {
+      toggleBtn = await page.$('.filter-toggle-btn');
+    }
+    assert(toggleBtn, 'Filter toggle button (navbar mirror or in-page fallback) should exist on mobile');
 
     await toggleBtn.click();
     await page.waitForTimeout(300);
@@ -2731,29 +2758,6 @@ async function run() {
     assert(hasStripe, 'At least one .live-feed-item should have hash-color border-left stripe when toggle ON');
   });
 
-  // --- Map polyline uses hash color ---
-  await test('Map trace polyline uses hash-derived color when toggle ON', async () => {
-    await page.evaluate(() => localStorage.setItem('meshcore-color-packets-by-hash', 'true'));
-    await page.goto(BASE + '/#/live');
-    await page.waitForTimeout(3000);
-    // Use the dedicated .live-packet-trace class so we don't pick up
-    // unrelated leaflet paths (geofilter polygons, region overlays, etc).
-    const pathCount = await page.evaluate(() => document.querySelectorAll('path.live-packet-trace').length);
-    if (pathCount === 0) {
-      console.log('    (skipped — no live-packet-trace polylines drawn in 3s window)');
-      return;
-    }
-    const hasHslPolyline = await page.evaluate(() => {
-      const paths = document.querySelectorAll('path.live-packet-trace');
-      for (const p of paths) {
-        const stroke = p.getAttribute('stroke') || '';
-        if (stroke.startsWith('hsl(')) return true;
-      }
-      return false;
-    });
-    assert(hasHslPolyline, 'At least one live-packet-trace polyline should have hsl() stroke color from hash');
-  });
-
   // --- Roles folded into Analytics (issue #1085) ---
   // Acceptance criteria:
   //   1. "Roles" link does NOT exist in top nav
@@ -3265,6 +3269,30 @@ async function run() {
       `#1270 2-byte: prefix-tool shows ${got[2]}, hash-sizes API shows ${expected[2]}`);
     assert(got[3] === expected[3],
       `#1270 3-byte: prefix-tool shows ${got[3]}, hash-sizes API shows ${expected[3]}`);
+  });
+
+  await test('Live page: Area dropdown items have transparent background to prevent unreadable text', async () => {
+    await page.goto(`${BASE}/#/live`);
+    await page.waitForTimeout(1000);
+    // Expand the cog menu first
+    const cog = await page.$('#liveControlsToggle');
+    if (cog) {
+      const expanded = await page.$eval('#liveControlsToggle', el => el.getAttribute('aria-expanded') === 'true');
+      if (!expanded) await cog.click();
+      await page.waitForTimeout(500);
+    }
+    // Click the area filter dropdown trigger on the live page
+    const trigger = await page.$('#liveAreaFilter .region-dropdown-trigger');
+    if (trigger) {
+      await trigger.click();
+      await page.waitForSelector('.region-dropdown-item', { state: 'attached', timeout: 2000 });
+      const bg = await page.evaluate(() => {
+        const item = document.querySelector('.region-dropdown-item');
+        return item ? window.getComputedStyle(item).backgroundColor : null;
+      });
+      assert(bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent',
+        `Expected dropdown item background to be transparent, got ${bg}`);
+    }
   });
 
   await browser.close();

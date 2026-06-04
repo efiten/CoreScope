@@ -10,7 +10,7 @@
     heroTitle: 'CoreScope',
     heroSubtitle: 'Real-time MeshCore LoRa mesh network analyzer',
     steps: [
-      { emoji: '🔵', title: 'Connect via Bluetooth', description: 'Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.co.uk/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair' },
+      { emoji: '🔵', title: 'Connect via Bluetooth', description: 'Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.io/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair' },
       { emoji: '📻', title: 'Set the right frequency preset', description: '**US Recommended:**\n`910.525 MHz · BW 62.5 kHz · SF 7 · CR 5`\nSelect **"US Recommended"** in the app or flasher.' },
       { emoji: '📡', title: 'Advertise yourself', description: 'Tap the signal icon → **Flood** to broadcast your node to the mesh. Companions only advert when you trigger it manually.' },
       { emoji: '🔁', title: 'Check "Heard N repeats"', description: '- **"Sent"** = transmitted, no confirmation\n- **"Heard 0 repeats"** = no repeater picked it up\n- **"Heard 1+ repeats"** = you\'re on the mesh!' }
@@ -33,8 +33,8 @@
     'meshcore-live-heatmap-opacity'
   ];
 
-  var VALID_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'heatmapOpacity', 'liveHeatmapOpacity', 'distanceUnit', 'favorites', 'myNodes'];
-  var OBJECT_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps'];
+  var VALID_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'heatmapOpacity', 'liveHeatmapOpacity', 'distanceUnit', 'favorites', 'myNodes', 'markerStroke'];
+  var OBJECT_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'markerStroke'];
   var SCALAR_SECTIONS = ['heatmapOpacity', 'liveHeatmapOpacity'];
   var DISTANCE_UNIT_VALUES = ['km', 'mi', 'auto'];
 
@@ -409,6 +409,32 @@
         } else {
           console.warn('[customizer-v2] Invalid opacity value rejected:', key, delta[key]);
         }
+      } else if (key === 'markerStroke' && typeof delta[key] === 'object' && delta[key] !== null) {
+        // #1488 — markerStroke { color, width, opacity }
+        var msIn = delta[key];
+        var msOut = {};
+        if (typeof msIn.color === 'string' && isValidColor(msIn.color)) {
+          msOut.color = msIn.color;
+        } else if (msIn.color != null) {
+          console.warn('[customizer-v2] Invalid markerStroke.color rejected:', msIn.color);
+        }
+        var msW = typeof msIn.width === 'string' ? parseFloat(msIn.width) : msIn.width;
+        if (msIn.width != null) {
+          if (isFinite(msW) && msW >= 0 && msW <= 10) {
+            msOut.width = msW;
+          } else {
+            console.warn('[customizer-v2] Invalid markerStroke.width rejected:', msIn.width);
+          }
+        }
+        var msO = typeof msIn.opacity === 'string' ? parseFloat(msIn.opacity) : msIn.opacity;
+        if (msIn.opacity != null) {
+          if (isValidOpacity(msO)) {
+            msOut.opacity = msO;
+          } else {
+            console.warn('[customizer-v2] Invalid markerStroke.opacity rejected:', msIn.opacity);
+          }
+        }
+        if (Object.keys(msOut).length) clean[key] = msOut;
       } else if (key === 'timestamps' && typeof delta[key] === 'object' && delta[key] !== null) {
         var ts = {};
         var tsrc = delta[key];
@@ -546,7 +572,7 @@
 
     // Derived vars
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
-    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface1);
+    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface2 || themeSection.surface1);
 
     // Node colors → --node-X CSS var only (legacy compat).
     // #1412: do NOT push server-config nodeColors into window.ROLE_COLORS —
@@ -635,6 +661,22 @@
     }
     if (typeof effectiveConfig.liveHeatmapOpacity === 'number') {
       localStorage.setItem('meshcore-live-heatmap-opacity', effectiveConfig.liveHeatmapOpacity);
+    }
+
+    // #1488 — marker stroke: drive CSS vars from effective config. SVG
+    // markers across map.js / live.js / roles.js all read these vars, so
+    // a single write here repaints every mounted marker without a reload.
+    var ms = effectiveConfig.markerStroke;
+    if (ms && typeof ms === 'object') {
+      if (typeof ms.color === 'string' && ms.color) {
+        root.setProperty('--mc-marker-stroke-color', ms.color);
+      }
+      if (ms.width != null && isFinite(ms.width)) {
+        root.setProperty('--mc-marker-stroke-width', String(ms.width));
+      }
+      if (ms.opacity != null && isFinite(ms.opacity)) {
+        root.setProperty('--mc-marker-stroke-opacity', String(ms.opacity));
+      }
     }
 
     // Distance unit → sync to localStorage for all pages
@@ -1262,6 +1304,15 @@
     var liveHeatOpacity = typeof eff.liveHeatmapOpacity === 'number' ? eff.liveHeatmapOpacity : 0.3;
     var liveHeatPct = Math.round(liveHeatOpacity * 100);
 
+    // #1488 — marker stroke controls. Defaults match the :root values in
+    // style.css; the UI shows the effective merged value (server config →
+    // local override) so the operator sees what's actually painted.
+    var ms = eff.markerStroke || {};
+    var msColor = typeof ms.color === 'string' && ms.color ? ms.color : '#ffffff';
+    var msWidth = ms.width != null && isFinite(ms.width) ? Number(ms.width) : 2;
+    var msOpacity = ms.opacity != null && isFinite(ms.opacity) ? Number(ms.opacity) : 1;
+    var msOpacityPct = Math.round(msOpacity * 100);
+
     return '<div class="cust-panel' + (_activeTab === 'nodes' ? ' active' : '') + '" data-panel="nodes">' +
       '<p class="cust-section-title">Node Role Colors</p>' +
       '<p class="cust-hint" style="margin-bottom:8px">These are the canonical role colors used across the app. They inherit from your server config (or built-in defaults), and can be optionally remapped by a colorblind-safe preset below.</p>' +
@@ -1279,6 +1330,22 @@
         '<div class="cust-hint">Heatmap overlay on the Live page (0–100%)</div></div>' +
         '<input type="range" data-cv2-slider="liveHeatmapOpacity" min="0" max="100" value="' + liveHeatPct + '" style="width:120px;cursor:pointer">' +
         '<span class="cust-hex" id="cv2LiveHeatPct">' + liveHeatPct + '%</span></div>' +
+      '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
+      '<p class="cust-section-title">Marker Stroke <span style="font-weight:normal;color:var(--text-muted);font-size:11px">(#1488)</span></p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">Outline around each map marker. Dial these down when hundreds of nodes make the default white border overwhelming. Changes are live on every mounted marker.</p>' +
+      '<div class="cust-color-row"><div><label>Color' + _overrideDot('markerStroke', 'color') + '</label>' +
+        '<div class="cust-hint">Marker outline color. Defaults to white for contrast on dark + light tiles.</div></div>' +
+        '<input type="color" data-cv2-field="markerStroke.color" value="' + esc(msColor) + '">' +
+        '<span class="cust-node-dot" style="background:' + esc(msColor) + '"></span>' +
+        '<span class="cust-hex">' + esc(msColor) + '</span></div>' +
+      '<div class="cust-color-row"><div><label>Width' + _overrideDot('markerStroke', 'width') + '</label>' +
+        '<div class="cust-hint">Stroke thickness in SVG units (0–4). Set to 0 to remove the outline entirely.</div></div>' +
+        '<input type="range" data-cv2-marker-stroke="width" min="0" max="4" step="0.1" value="' + msWidth + '" style="width:120px;cursor:pointer">' +
+        '<span class="cust-hex" id="cv2MarkerStrokeW">' + msWidth + '</span></div>' +
+      '<div class="cust-color-row"><div><label>Opacity' + _overrideDot('markerStroke', 'opacity') + '</label>' +
+        '<div class="cust-hint">Stroke alpha (0–100%). Drop this to ~30% for a softer outline.</div></div>' +
+        '<input type="range" data-cv2-marker-stroke="opacity" min="0" max="100" value="' + msOpacityPct + '" style="width:120px;cursor:pointer">' +
+        '<span class="cust-hex" id="cv2MarkerStrokeO">' + msOpacityPct + '%</span></div>' +
     '</div>';
   }
 
@@ -1995,6 +2062,11 @@
           // Mirror to logo brand vars so the wordmark recolors live too.
           if (key === 'accent') document.documentElement.style.setProperty('--logo-accent', inp.value);
           if (key === 'accentHover') document.documentElement.style.setProperty('--logo-accent-hi', inp.value);
+          // #1488 — marker stroke color also gets a live CSS-var write
+          // so the operator sees outlines repaint on drag.
+          if (section === 'markerStroke' && key === 'color') {
+            document.documentElement.style.setProperty('--mc-marker-stroke-color', inp.value);
+          }
           // Update hex display
           var hex = inp.parentElement.querySelector('.cust-hex');
           if (hex) hex.textContent = inp.value;
@@ -2071,6 +2143,40 @@
       });
       inp.addEventListener('change', function () {
         setOverride(null, key, parseInt(inp.value) / 100);
+      });
+    });
+
+    // #1488 — Marker stroke width/opacity sliders. Color picker uses the
+    // generic data-cv2-field handler (markerStroke.color) above.
+    container.querySelectorAll('[data-cv2-marker-stroke]').forEach(function (inp) {
+      var which = inp.dataset.cv2MarkerStroke; // 'width' | 'opacity'
+      inp.addEventListener('input', function () {
+        var raw = parseFloat(inp.value);
+        if (!isFinite(raw)) return;
+        if (which === 'opacity') {
+          var lbl = document.getElementById('cv2MarkerStrokeO');
+          if (lbl) lbl.textContent = Math.round(raw) + '%';
+          // Optimistic CSS write so the markers repaint on drag.
+          document.documentElement.style.setProperty('--mc-marker-stroke-opacity', String(raw / 100));
+        } else {
+          var lblW = document.getElementById('cv2MarkerStrokeW');
+          if (lblW) lblW.textContent = String(raw);
+          document.documentElement.style.setProperty('--mc-marker-stroke-width', String(raw));
+        }
+      });
+      inp.addEventListener('change', function () {
+        var raw = parseFloat(inp.value);
+        if (!isFinite(raw)) return;
+        var eff = _getEffective();
+        var current = JSON.parse(JSON.stringify(eff.markerStroke || {}));
+        if (which === 'opacity') current.opacity = raw / 100;
+        else current.width = raw;
+        // Persist the whole object so partial picks survive (color +
+        // width + opacity coexist in a single section).
+        var delta = JSON.parse(JSON.stringify(readOverrides()));
+        delta.markerStroke = Object.assign({}, delta.markerStroke || {}, current);
+        writeOverrides(delta);
+        _runPipeline();
       });
     });
 
@@ -2188,11 +2294,13 @@
       });
     }
 
-    // Reset All
+    // Reset All — #1496: clear every customizer-touched piece of state,
+    // not just STORAGE_KEY. Implementation lives in resetAll() on the
+    // public API so tests can drive it without a DOM button.
     var resetBtn = document.getElementById('cv2ResetAll');
     if (resetBtn) resetBtn.addEventListener('click', function () {
       if (!confirm('Reset all customizations to server defaults?')) return;
-      localStorage.removeItem(STORAGE_KEY);
+      _resetAll();
       _runPipeline();
       _renderPanel(container);
     });
@@ -2295,7 +2403,7 @@
     if (ovTheme.accent) root.setProperty('--logo-accent', ovTheme.accent);
     if (ovTheme.accentHover) root.setProperty('--logo-accent-hi', ovTheme.accentHover);
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
-    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface1);
+    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface2 || themeSection.surface1);
     // Apply node colors from overrides early — --node-X CSS var only.
     // #1412: do NOT write to window.ROLE_COLORS / ROLE_STYLE here.
     if (earlyOverrides.nodeColors) {
@@ -2343,6 +2451,124 @@
     }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   });
 
+  // ── Reset All (#1496) ──
+  //
+  // The original "Reset All" only cleared STORAGE_KEY (cs-theme-overrides),
+  // leaving CB-preset, encrypted-channel toggle, dark-tile pick, marker
+  // stroke vars and per-role body.style writes stuck — each subsequent
+  // customizer feature (PRs #1430, #1454, #1488, #1448) added its own
+  // out-of-band side effect and forgot to teach Reset about it.
+  //
+  // Single source of truth: this function. Adding a new customizer
+  // feature requires adding its teardown here. Each removal is wrapped
+  // in try/catch because we run before/after page lifecycle in tests
+  // and operators' browsers where any one surface (localStorage,
+  // document, body) could be missing.
+  function _resetAll() {
+    // 1. localStorage — customizer-owned keys ONLY. Theme / favorites /
+    //    gesture hints / channel selection state are explicitly preserved
+    //    (see issue #1496 "Out of scope").
+    var CUSTOMIZER_LS_KEYS = [
+      STORAGE_KEY,                 // 'cs-theme-overrides'
+      'meshcore-cb-preset',        // #1361 CB preset id
+      'channels-show-encrypted',   // #1454 encrypted-channel toggle
+      'mc-dark-tile-provider'      // #1430 dark-tile provider pick
+    ];
+    for (var i = 0; i < CUSTOMIZER_LS_KEYS.length; i++) {
+      try { localStorage.removeItem(CUSTOMIZER_LS_KEYS[i]); } catch (_e) { /* ignore */ }
+    }
+
+    // 2. CB preset — body[data-cb-preset] + CSS var teardown lives in
+    //    MeshCorePresets.clearPreset(). Prefer the canonical helper so
+    //    the dispatch (cb-preset-changed event) fires and downstream
+    //    consumers re-sync to server config without a reload.
+    try {
+      var MCP = (typeof window !== 'undefined') && window.MeshCorePresets;
+      if (MCP && typeof MCP.clearPreset === 'function') {
+        MCP.clearPreset();
+      } else if (typeof document !== 'undefined' && document.body) {
+        // Defensive fallback (e.g. cb-presets.js failed to load).
+        document.body.removeAttribute('data-cb-preset');
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 3. body.style — #1446/#1448 wrote --mc-role-{role} / -text with
+    //    !important so they trump :root.  Strip per role + text role.
+    try {
+      if (typeof document !== 'undefined' && document.body && document.body.style) {
+        ['repeater', 'companion', 'room', 'sensor', 'observer'].forEach(function (role) {
+          document.body.style.removeProperty('--mc-role-' + role);
+          document.body.style.removeProperty('--mc-role-' + role + '-text');
+        });
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 4. :root style — everything the customizer pipeline + cb-presets
+    //    + marker-stroke + tile providers ever wrote onto documentElement.
+    //    A fresh _runPipeline() will re-set whatever server config /
+    //    remaining (theme-only) preferences dictate.
+    try {
+      if (typeof document !== 'undefined' && document.documentElement && document.documentElement.style) {
+        var rs = document.documentElement.style;
+        ['repeater', 'companion', 'room', 'sensor', 'observer'].forEach(function (role) {
+          rs.removeProperty('--mc-role-' + role);
+          rs.removeProperty('--mc-role-' + role + '-text');
+          rs.removeProperty('--node-' + role);
+        });
+        // #1488 marker stroke vars.
+        rs.removeProperty('--mc-marker-stroke-color');
+        rs.removeProperty('--mc-marker-stroke-width');
+        rs.removeProperty('--mc-marker-stroke-opacity');
+        // CB-preset MB / RT-ramp vars (also cleared by clearPreset above
+        // but stripped here defensively in case clearPreset is absent).
+        ['confirmed', 'suspected', 'unknown'].forEach(function (k) {
+          rs.removeProperty('--mc-mb-' + k);
+        });
+        for (var ri = 0; ri < 5; ri++) rs.removeProperty('--mc-rt-ramp-' + ri);
+        // Theme vars the customizer might have stamped onto :root via
+        // applyCSS (logo accents + every entry in THEME_CSS_MAP).
+        rs.removeProperty('--logo-accent');
+        rs.removeProperty('--logo-accent-hi');
+        for (var tkey in THEME_CSS_MAP) {
+          if (Object.prototype.hasOwnProperty.call(THEME_CSS_MAP, tkey)) {
+            rs.removeProperty(THEME_CSS_MAP[tkey]);
+          }
+        }
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 5. Tile provider — clearing the localStorage key (step 1) takes
+    //    care of persistence, but a live consumer needs the
+    //    mc-tile-provider-changed event to swap back to the server
+    //    default. Re-applying the effective active id achieves that
+    //    without forcing a particular value (it falls through to the
+    //    server default / DEFAULT_ID inside getActiveId()).
+    try {
+      if (typeof window !== 'undefined' &&
+          typeof window.MC_setDarkTileProvider === 'function' &&
+          typeof window.MC_getDarkTileProvider === 'function') {
+        window.MC_setDarkTileProvider(window.MC_getDarkTileProvider());
+        // Re-clear so we don't re-persist the just-re-applied value.
+        try { localStorage.removeItem('mc-dark-tile-provider'); } catch (_e) {}
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 6. Encrypted-channel toggle — removing the LS key (step 1) fixes
+    //    persistence, but channels.js subscribes to
+    //    mc-channels-show-encrypted-changed for live re-render. Fire it
+    //    explicitly with on:false so the channels list reverts to "hide
+    //    encrypted" without a page reload.
+    try {
+      if (typeof window !== 'undefined' &&
+          typeof window.dispatchEvent === 'function' &&
+          typeof window.CustomEvent === 'function') {
+        window.dispatchEvent(new window.CustomEvent('mc-channels-show-encrypted-changed', {
+          detail: { on: false }
+        }));
+      }
+    } catch (_e) { /* ignore */ }
+  }
+
   // ── Public API for app.js integration ──
 
   /**
@@ -2368,6 +2594,8 @@
     applyCSS: applyCSS,
     isValidColor: isValidColor,
     isOverridden: _isOverridden,
+    // #1496 — full reset (not just STORAGE_KEY). See _resetAll() above.
+    resetAll: _resetAll,
     THEME_CSS_MAP: THEME_CSS_MAP
   };
 })();

@@ -10,6 +10,21 @@
   function statusGreen() { return cssVar('--status-green') || '#22c55e'; }
 
   let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, clickablePathsLayer;
+  // New animation canvas
+  let animCanvas, animCtx;
+  let _dprMedia = null;
+  let _dprChangeHandler = null;
+  let activeAnimations = [];
+  let activePulses = [];
+  let activeGhosts = [];
+  let isAnimating = false;
+  let activeFades = [];
+  let isFading = false;
+  let canvasTopLeft;
+  // #1514 S2 — scratch points reused per-frame in renderAnimations() to avoid
+  // 2 object allocations per anim per frame (50 anims × 60fps = ~6000/sec).
+  const _scratchFrom = { x: 0, y: 0 };
+  const _scratchTo = { x: 0, y: 0 };
   let clickablePaths = [];
   const CLICKABLE_PATH_TTL_MS = 30000;
   const CLICKABLE_PATH_MAX = 50;
@@ -71,7 +86,7 @@
     if (!iata) return '';
     var esc = (typeof escapeHtml === 'function')
       ? escapeHtml(iata)
-      : String(iata).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+      : String(iata).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     return '<span class="badge-iata" style="font-size:10px;margin-left:4px">' + esc + '</span>';
   }
 
@@ -539,7 +554,9 @@
     // tsMs is packet receive time — "ago" is relative to when the packet arrived, not when the animation ended
     const secsAgo = Math.round((Date.now() - tsMs) / 1000);
     const timeStr = secsAgo < 60 ? secsAgo + 's ago' : Math.round(secsAgo / 60) + 'm ago';
-    const chain = hopNames.join(' → ');
+    // hopNames originate from adv_name (~line 3199) — attacker-controlled. Escape
+    // each before joining into the popup HTML. (#1536)
+    const chain = (hopNames || []).map(escapeHtml).join(' → ');
     const link = hash ? `<a class="lc-path-link" href="#/packets/${hash}" style="color:${color}">full detail →</a>` : '';
     return `<div class="lc-path-popup">
       <span class="lc-path-badge" style="background:${color}">${typeName}</span>
@@ -636,13 +653,13 @@
     canvas.width = cw * dpr; canvas.height = ch * dpr;
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, cw, ch);
-    
+
     const digitW = Math.min(16, (cw - 10) / text.length);
     const digitH = ch - 4;
     const totalW = digitW * text.length;
     let x = (cw - totalW) / 2;
     const y = 2;
-    
+
     // Draw ghost segments (dim background) — hardcoded to match LCD green
     const ghostColor = 'rgba(74,222,128,0.07)';
     for (let i = 0; i < text.length; i++) {
@@ -666,6 +683,16 @@
       } else {
         drawSegDigit(ctx, x, y, digitW, digitH, bits, color);
         x += digitW + 1;
+      }
+    }
+  }
+
+  function wakeCanvasEngine() {
+    if (!isAnimating && activeAnimations.length > 0) {
+      const isPaused = VCR.mode === 'PAUSED' || VCR.speed === 0;
+      if (!isPaused) {
+        isAnimating = true;
+        requestAnimationFrame(renderAnimations);
       }
     }
   }
@@ -729,6 +756,9 @@
     }
     if (speedBtn) { speedBtn.textContent = speedLabel(VCR.speed); speedBtn.setAttribute('aria-label', 'Speed ' + speedLabel(VCR.speed)); }
     updateVCRLcd();
+
+    // WAKE THE ENGINE: If we unpaused or changed speed above 0, kickstart the canvas
+    wakeCanvasEngine();
   }
 
   function dbPacketToLive(pkt) {
@@ -855,11 +885,13 @@
         if (propagationBuffer.has(hash)) {
           propagationBuffer.get(hash).packets.push(pkt);
         } else {
-          const entry = { packets: [pkt], timer: setTimeout(() => {
+          const entry = {
+            packets: [pkt], timer: setTimeout(() => {
             const buffered = propagationBuffer.get(hash);
             propagationBuffer.delete(hash);
             if (buffered) renderPacketTree(buffered.packets);
-          }, PROPAGATION_BUFFER_MS) };
+            }, PROPAGATION_BUFFER_MS)
+          };
           propagationBuffer.set(hash, entry);
         }
       } else {
@@ -1032,8 +1064,8 @@
             <div class="live-toggles">
             <label><input type="checkbox" id="liveHeatToggle" checked aria-describedby="heatDesc"> Heat</label>
             <span id="heatDesc" class="sr-only">Overlay a density heat map on the mesh nodes</span>
-            <label><input type="checkbox" id="liveGhostToggle" checked aria-describedby="ghostDesc"> Ghosts</label>
-            <span id="ghostDesc" class="sr-only">Show interpolated ghost markers for unknown hops</span>
+            <label><input type="checkbox" id="liveGhostToggle" checked aria-describedby="ghostDesc"> Inferred Hops</label>
+            <span id="ghostDesc" class="sr-only">Show inferred hop markers for unknown hops</span>
             <label><input type="checkbox" id="liveRealisticToggle" aria-describedby="realisticDesc"> Realistic</label>
             <span id="realisticDesc" class="sr-only">Buffer packets by hash and animate all paths simultaneously</span>
             <label><input type="checkbox" id="liveColorHashToggle" aria-describedby="colorHashDesc"> Color by hash</label>
@@ -1046,22 +1078,22 @@
             <span id="audioDesc" class="sr-only">Sonify packets — turn raw bytes into generative music</span>
             <label><input type="checkbox" id="liveFavoritesToggle" aria-describedby="favDesc"> ⭐ Favorites</label>
             <span id="favDesc" class="sr-only">Show only favorited and claimed nodes</span>
+            <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
+            </div>
             <div class="live-node-filter-wrap" style="position:relative">
               <input type="text" id="liveNodeFilterInput" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input" role="combobox" aria-expanded="false" aria-owns="liveNodeFilterDropdown" aria-autocomplete="list" aria-activedescendant="">
               <div id="liveNodeFilterDropdown" class="live-node-filter-dropdown hidden" role="listbox"></div>
               <button id="liveNodeFilterClear" class="vcr-btn" title="Clear node filter" style="display:none">×</button>
             </div>
             <div id="liveNodeFilterCount" class="live-filter-count hidden"></div>
-            <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
             <div id="liveRegionFilter" class="region-filter-container live-region-filter-container" aria-label="Filter live packets by IATA region"></div>
-            </div>
+            <div id="liveAreaFilter" class="live-area-filter-container"></div>
             <div class="audio-controls hidden" id="audioControls">
               <label class="audio-slider-label">Voice <select id="audioVoiceSelect" class="audio-voice-select"></select></label>
               <label class="audio-slider-label">BPM <input type="range" id="audioBpmSlider" min="40" max="300" value="120" class="audio-slider"><span id="audioBpmVal">120</span></label>
               <label class="audio-slider-label">Vol <input type="range" id="audioVolSlider" min="0" max="100" value="30" class="audio-slider"><span id="audioVolVal">30</span></label>
             </div>
           </div>
-          <div id="liveAreaFilter"></div>
           <button class="live-controls-toggle" data-live-controls-toggle id="liveControlsToggle"
                   aria-expanded="false" aria-controls="liveControlsBody"
                   aria-label="Show live controls">⚙</button>
@@ -1162,12 +1194,137 @@
       const mapCfg = await (await fetch('/api/config/map')).json();
       if (Array.isArray(mapCfg.center) && mapCfg.center.length === 2) mapCenter = mapCfg.center;
       if (typeof mapCfg.zoom === 'number') mapZoom = mapCfg.zoom;
-    } catch {}
+    } catch { }
 
     map = L.map('liveMap', {
-      zoomControl: false, attributionControl: false,
-      zoomAnimation: true, markerZoomAnimation: true
+      zoomControl: false,
+      attributionControl: false,
+      zoomAnimation: true,
+      markerZoomAnimation: true,
+      preferCanvas: true
     }).setView(mapCenter, mapZoom);
+
+    // 1. Create a custom pane for high-performance canvas animations
+    map.createPane('animationsPane');
+
+    // ARCHITECTURE NOTE - dual animation panes (#1514 S7):
+    // Leaflet's default pane z-indexes:
+    //   overlayPane: 400 (vector paths)
+    //   markerPane:  600 (static node dots)
+    //   tooltipPane: 650 (hover labels)
+    //   popupPane:   700 (click details)
+    //
+    // We sandwich TWO panes between markerPane and tooltipPane on purpose:
+    //   - 'animationsPane' (z=625): the canvas engine for in-flight packet
+    //     animations and the post-flight fading polylines (#1514 M2). Sits
+    //     ABOVE static node markers (so packets visibly fly over nodes) but
+    //     UNDER tooltips/popups so hover/click affordances always win.
+    //   - 'liveAnimPane' (z=650, created below): legacy SVG layer used by
+    //     drawMatrixLine/animatePath/pulseNode/ghostMarkers (everything that
+    //     hasn't been ported to the canvas engine yet). Kept just above
+    //     animationsPane so SVG-based effects stack on top of canvas trails.
+    //
+    // Future work (#1514 out-of-scope): port the remaining SVG paths to the
+    // canvas engine and collapse to a single pane.
+    map.getPane('animationsPane').style.zIndex = 625;
+
+    // Ensure mouse events pass through to the markers/map below
+    map.getPane('animationsPane').style.pointerEvents = 'none';
+
+    // 2. Create the canvas and inject into the pane
+    animCanvas = document.createElement('canvas');
+    // Leaflet uses translate3d for positioning, so we use absolute positioning but rely on L.DomUtil
+    animCanvas.style.cssText = 'position:absolute; pointer-events:none;';
+
+    map.getPane('animationsPane').appendChild(animCanvas);
+    animCtx = animCanvas.getContext('2d');
+
+    // 3. The Leaflet-native positioning function
+    function updateAnimCanvas() {
+      if (!animCanvas || !map) return;
+
+      // Add a 20% buffer around the visible screen to prevent clipping during short pans
+      const size = map.getSize();
+      const padX = Math.round(size.x * 0.2);
+      const padY = Math.round(size.y * 0.2);
+
+      const w = size.x + padX * 2;
+      const h = size.y + padY * 2;
+
+    const dpr = window.devicePixelRatio || 1;
+
+      // Updating width/height automatically clears the canvas
+      animCanvas.width = w * dpr;
+      animCanvas.height = h * dpr;
+      animCanvas.style.width = w + 'px';
+      animCanvas.style.height = h + 'px';
+
+      animCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      // Find the absolute pixel bounds of the current viewport
+      const pixelBounds = map.getPixelBounds();
+      // Pad the bounds by 20% on all sides
+      const min = pixelBounds.min.subtract([padX, padY]);
+
+      // Convert absolute pixel coordinates to Layer points (relative to the pane)
+      canvasTopLeft = min.subtract(map.getPixelOrigin());
+
+      // Let Leaflet position the canvas inside the pane using CSS transforms
+      L.DomUtil.setPosition(animCanvas, canvasTopLeft);
+    }
+
+    let _cullRAF = null;
+    function cullMarkers() {
+      if (!map || !nodesLayer) return;
+      if (_cullRAF) return; // Skip if a cull is already queued for this frame
+
+      _cullRAF = requestAnimationFrame(() => {
+        _cullRAF = null;
+        if (!map || !nodesLayer) return;
+
+        let bounds;
+        try { bounds = map.getBounds().pad(0.5); } catch (e) { return; }
+
+        for (const key in nodeMarkers) {
+          const marker = nodeMarkers[key];
+          const isVisible = bounds.contains(marker.getLatLng());
+          const hasLayer = nodesLayer.hasLayer(marker);
+
+          if (isVisible && !hasLayer) nodesLayer.addLayer(marker);
+          else if (!isVisible && hasLayer) nodesLayer.removeLayer(marker);
+        }
+      });
+    }
+
+    // 4. Hook into Leaflet's transition-end events
+    map.on('moveend zoomend resize', () => {
+      updateAnimCanvas();
+      cullMarkers();
+    });
+    updateAnimCanvas();
+    cullMarkers();
+
+    // #1514 M1+S10 — DPR change handling.
+    //
+    // matchMedia(`(resolution: ${dpr}dppx)`) is a STRICT-MATCH query: it only
+    // fires when the current DPR stops matching. After it fires, we must rebind
+    // a new MQL keyed to the new DPR. Older code did remove → re-add inside a
+    // try/finally which was fragile (a throw in updateAnimCanvas would still
+    // re-bind, and a synchronous re-entry between remove and add could lose
+    // the handler). The {once: true} pattern below removes the listener
+    // atomically before our handler runs, so re-binding is race-free.
+    function _rebindDPRListener() {
+      if (_dprMedia && _dprChangeHandler) {
+        try { _dprMedia.removeEventListener('change', _dprChangeHandler); } catch (_) {}
+      }
+      _dprMedia = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      _dprChangeHandler = () => {
+        updateAnimCanvas();
+        _rebindDPRListener();
+      };
+      _dprMedia.addEventListener('change', _dprChangeHandler, { once: true });
+    }
+    _rebindDPRListener();
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -1226,9 +1383,21 @@
     });
     L.control.zoom({ position: 'topright' }).addTo(map);
 
+    // #1485 — animations + trails need their own pane above markerPane.
+    // PR #1334 moved node markers from L.circleMarker (overlayPane @ 400)
+    // to L.marker+divIcon (markerPane @ 600); animations stayed in the
+    // default overlayPane and were occluded by every node marker. Custom
+    // pane @ 650 puts them strictly above all nodes. (tooltipPane shares
+    // 650 — tooltips are user-triggered, harmless to share.)
+    map.createPane('liveAnimPane');
+    map.getPane('liveAnimPane').style.zIndex = 650;
+    // Pointer-events default to none so the pane doesn't steal clicks
+    // from the marker pane underneath (clickablePathsLayer handles that).
+    map.getPane('liveAnimPane').style.pointerEvents = 'none';
+
     nodesLayer = L.layerGroup().addTo(map);
-    pathsLayer = L.layerGroup().addTo(map);
-    animLayer = L.layerGroup().addTo(map);
+    pathsLayer = L.layerGroup({ pane: 'liveAnimPane' }).addTo(map);
+    animLayer = L.layerGroup({ pane: 'liveAnimPane' }).addTo(map);
     clickablePathsLayer = L.layerGroup().addTo(map);
 
     injectSVGFilters();
@@ -1250,7 +1419,7 @@
         const packets = Array.isArray(parsed) ? parsed : [parsed];
         vcrPause(); // suppress live packets
         setTimeout(() => renderPacketTree(packets, true), 1500);
-      } catch {}
+      } catch { }
     } else {
       // replayRecent(); // disabled — live page starts empty, fills from WS
     }
@@ -1309,7 +1478,32 @@
         setObserverIataMap(buildObserverIataMap(data));
       }).catch(function() { /* leave map empty; filter will hide all when active */ });
       RegionFilter.init(rfEl, { dropdown: true });
-      regionFilterChangeHandler = RegionFilter.onChange(function() { /* selection persisted by RegionFilter; future packets reflect it */ });
+      regionFilterChangeHandler = RegionFilter.onChange(function() {
+        // #1108 — when the region selection changes, reload visible map
+        // nodes so non-region nodes disappear (or reappear) immediately.
+        // The packet feed already filters live via packetMatchesRegion.
+        try { loadNodes(); } catch (e) { /* loadNodes not yet defined during init order edge cases */ }
+      });
+      // #1108 — "Show all nodes (faded)" sub-toggle, sibling to the region
+      // dropdown. Off by default = hide non-region nodes; on = legacy
+      // show-everything behavior.
+      (function initShowAllNodesToggle() {
+        if (!window.RegionShowAll) return;
+        var wrap = document.createElement('label');
+        wrap.className = 'live-show-all-region-nodes';
+        wrap.title = 'When a region is selected, show every node on the map (legacy behavior). Off = hide non-region nodes.';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.id = 'liveShowAllRegionNodes';
+        cb.checked = RegionShowAll.get();
+        wrap.appendChild(cb);
+        wrap.appendChild(document.createTextNode(' Show all nodes'));
+        rfEl.parentNode.insertBefore(wrap, rfEl.nextSibling);
+        cb.addEventListener('change', function() {
+          RegionShowAll.set(cb.checked);
+          try { loadNodes(); } catch (e) { }
+        });
+      })();
     })();
 
     // Node filter input — autocomplete-as-you-type (#1110)
@@ -1627,15 +1821,19 @@
     // hidden attribute. At wide viewports the bodies are always shown.
     (function wireLiveCollapseToggles() {
       var pairs = [
-        { rootId: 'liveHeader',   togId: 'liveHeaderToggle',   bodyId: 'liveHeaderBody',
-          showLabel: 'Show live stats',   hideLabel: 'Hide live stats' },
-        { rootId: 'liveControls', togId: 'liveControlsToggle', bodyId: 'liveControlsBody',
-          showLabel: 'Show live controls', hideLabel: 'Hide live controls' },
+        {
+          rootId: 'liveHeader', togId: 'liveHeaderToggle', bodyId: 'liveHeaderBody',
+          showLabel: 'Show live stats', hideLabel: 'Hide live stats'
+        },
+        {
+          rootId: 'liveControls', togId: 'liveControlsToggle', bodyId: 'liveControlsBody',
+          showLabel: 'Show live controls', hideLabel: 'Hide live controls'
+        },
       ];
       var narrowMql = window.matchMedia('(max-width: 768px)');
       function setExpanded(p, expanded) {
         var root = document.getElementById(p.rootId);
-        var tog  = document.getElementById(p.togId);
+        var tog = document.getElementById(p.togId);
         var body = document.getElementById(p.bodyId);
         if (!root || !tog || !body) return;
         if (expanded) {
@@ -1660,7 +1858,7 @@
             // Always expanded; no hidden attr; no collapse class
             var root = document.getElementById(p.rootId);
             var body = document.getElementById(p.bodyId);
-            var tog  = document.getElementById(p.togId);
+            var tog = document.getElementById(p.togId);
             if (body) body.removeAttribute('hidden');
             if (root) { root.classList.remove('is-collapsed'); root.classList.remove('is-expanded'); }
             if (tog)  { tog.setAttribute('aria-expanded', 'true'); }
@@ -1988,7 +2186,8 @@
     // Auto-hide nav with pin toggle (#62)
     const topNav = document.querySelector('.top-nav');
     if (topNav) { topNav.style.position = 'fixed'; topNav.style.width = '100%'; topNav.style.zIndex = '1100'; }
-    _navCleanup = { timeout: null, fn: null, pinned: false };
+    const _savedPin = localStorage.getItem('live-nav-pinned') === 'true';
+    _navCleanup = { timeout: null, fn: null, pinned: _savedPin };
     // Add pin button to nav (guard against duplicate)
     if (topNav && !document.getElementById('navPinBtn')) {
       const pinBtn = document.createElement('button');
@@ -2002,6 +2201,7 @@
         _navCleanup.pinned = !_navCleanup.pinned;
         pinBtn.classList.toggle('pinned', _navCleanup.pinned);
         pinBtn.setAttribute('aria-pressed', _navCleanup.pinned);
+        try { localStorage.setItem('live-nav-pinned', _navCleanup.pinned); } catch (_) {}
         if (_navCleanup.pinned) {
           clearTimeout(_navCleanup.timeout);
           topNav.classList.remove('nav-autohide');
@@ -2009,7 +2209,17 @@
           _navCleanup.timeout = setTimeout(() => { topNav.classList.add('nav-autohide'); }, 4000);
         }
       });
-      topNav.appendChild(pinBtn);
+        if (_navCleanup.pinned) {
+        pinBtn.classList.add('pinned');
+        pinBtn.setAttribute('aria-pressed', 'true');
+        topNav.classList.remove('nav-autohide');
+      }
+      const navRight = topNav.querySelector('.nav-right');
+      if (navRight) {
+        navRight.appendChild(pinBtn);
+      } else {
+        topNav.appendChild(pinBtn);
+      }
     }
     function showNav() {
       if (topNav) topNav.classList.remove('nav-autohide');
@@ -2089,8 +2299,7 @@
           <table style="font-size:12px;width:100%;border-collapse:collapse;">
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Last Seen</td><td>${lastSeen}</td></tr>
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Adverts</td><td>${n.advert_count || 0}</td></tr>
-            ${'default_scope' in n ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Scope</td><td>${
-  n.default_scope === null ? '<span style="color:var(--text-muted)">—</span>'
+            ${'default_scope' in n ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Scope</td><td>${n.default_scope === null ? '<span style="color:var(--text-muted)">—</span>'
   : n.default_scope === '' ? '<span style="color:var(--text-muted)">unknown scope</span>'
   : `<code style="color:var(--accent)">${escapeHtml(n.default_scope)}</code>`
 }</td></tr>` : ''}
@@ -2168,9 +2377,13 @@
   async function loadNodes(beforeTs) {
     try {
       const aqs = AreaFilter.areaQueryString();
+      // #1108 — honor region selector for visible map nodes unless
+      // "Show all nodes" is enabled. Empty string when no region set.
+      const rqs = (window.RegionFilter && typeof RegionFilter.nodesRegionQueryString === 'function')
+        ? RegionFilter.nodesRegionQueryString() : '';
       const url = beforeTs
-        ? `/api/nodes?limit=2000&before=${encodeURIComponent(new Date(beforeTs).toISOString())}${aqs}`
-        : `/api/nodes?limit=2000${aqs}`;
+        ? `/api/nodes?limit=2000&before=${encodeURIComponent(new Date(beforeTs).toISOString())}${aqs}${rqs}`
+        : `/api/nodes?limit=2000${aqs}${rqs}`;
       // Full reload (no beforeTs): clear existing markers so switching areas
       // removes nodes that no longer belong to the selected area.
       if (!beforeTs) {
@@ -2402,6 +2615,16 @@
     rebuildFeedList();
   }
 
+  /**
+   * Round to the next even integer to prevent browser sub-pixel snapping on
+   * SVG node markers. Cross-link: live.css (~line 1300) — "Eliminate SVG
+   * baseline drift" — relies on icon size being even so the half-size
+   * iconAnchor lands on a whole pixel.
+   * @param {number} n size in CSS pixels
+   * @returns {number} `n` if even, else `n + 1`
+   */
+  function evenSize(n) { return n % 2 ? n + 1 : n; }
+
   function addNodeMarker(n) {
     if (nodeMarkers[n.public_key]) return nodeMarkers[n.public_key];
     const color = ROLE_COLORS[n.role] || ROLE_COLORS.unknown;
@@ -2416,13 +2639,13 @@
     // Shape-aware sizing: keep prior visual weight (~6/4 base) but
     // route through divIcon so colourblind ops get distinct silhouettes
     // (#1293). Size is the SVG box; circleMarker radius ~= size/3.
-    const sizePx = Math.max(10, Math.round((isRepeater ? 18 : 14) * zoomScale));
+    let sizePx = evenSize(Math.max(10, Math.round((isRepeater ? 18 : 14) * zoomScale)));
 
     const svgHtml = (window.makeRoleMarkerSVG
       ? window.makeRoleMarkerSVG(n.role, null, sizePx)
       : '<svg width="' + sizePx + '" height="' + sizePx + '" viewBox="0 0 ' + sizePx + ' ' + sizePx +
         '"><circle cx="' + (sizePx/2) + '" cy="' + (sizePx/2) + '" r="' + (sizePx/2 - 2) +
-        '" fill="' + fillExpr + '" stroke="#fff" stroke-width="1"/></svg>');
+        '" fill="' + fillExpr + '" stroke="var(--mc-marker-stroke-color)" stroke-width="var(--mc-marker-stroke-width)" stroke-opacity="var(--mc-marker-stroke-opacity)"/></svg>');
 
     const icon = L.divIcon({
       html: svgHtml,
@@ -2431,22 +2654,20 @@
       iconAnchor: [sizePx / 2, sizePx / 2],
       popupAnchor: [0, -sizePx / 2]
     });
-    const marker = L.marker([n.lat, n.lon], { icon: icon, interactive: true }).addTo(nodesLayer);
-
-    // Highlight ring (#1293): a separate stroke-only circleMarker layered
-    // BENEATH the shape. Hidden by default; pulseNodeMarker grows/fades
-    // its radius + opacity — never fills, so same-hue concentric stacking
-    // (issue's "blue-on-blue") is impossible.
-    const ringPos = [n.lat, n.lon];
-    const ring = L.circleMarker(ringPos, {
-      radius: sizePx / 2 + 4,
-      fillOpacity: 0,
-      fill: false,
-      color: color,
-      weight: 0,
-      opacity: 0,
-      interactive: false
-    }).addTo(nodesLayer);
+    const marker = L.marker([n.lat, n.lon], { icon: icon, interactive: true });
+    if (nodesLayer) {
+      try {
+        // If the marker is outside the current map bounds, it is intentionally
+        // deferred to save DOM nodes. cullMarkers() is the only path that will
+        // re-attach it later when the user pans or zooms.
+        if (!map || map.getBounds().pad(0.5).contains(marker.getLatLng())) {
+          marker.addTo(nodesLayer);
+        }
+      } catch (e) {
+        // Fallback: map.getBounds() can throw during early Leaflet initialization
+        marker.addTo(nodesLayer);
+      }
+    }
 
     marker.bindTooltip(escapeHtml(n.name || n.public_key.slice(0, 8)), {
       permanent: false, direction: 'top', offset: [0, -sizePx / 2], className: 'live-tooltip'
@@ -2454,7 +2675,6 @@
 
     marker.on('click', () => showNodeDetail(n.public_key));
 
-    marker._highlightRing = ring;
     marker._baseColor = color;
     marker._baseSize = sizePx;
     marker._role = n.role || 'unknown';
@@ -2490,15 +2710,20 @@
   function _liveSetMarkerSize(marker, sizePx) {
     var el = _liveMarkerEl(marker);
     if (!el) return;
+
+    // Update the DOM container styles manually so the anchor remains centered
+    // without having to destroy and recreate the Leaflet marker object.
+    el.style.width = sizePx + 'px';
+    el.style.height = sizePx + 'px';
+    el.style.marginLeft = -(sizePx / 2) + 'px';
+    el.style.marginTop = -(sizePx / 2) + 'px';
+
     var svg = el.querySelector('svg');
     if (svg) {
       svg.setAttribute('width', sizePx);
       svg.setAttribute('height', sizePx);
     }
     marker._baseSize = sizePx;
-    if (marker._highlightRing && typeof marker._highlightRing.setRadius === 'function') {
-      marker._highlightRing.setRadius(sizePx / 2 + 4);
-    }
   }
   function _liveSetMarkerColor(marker, color) {
     var el = _liveMarkerEl(marker);
@@ -2520,7 +2745,7 @@
     for (const [key, marker] of Object.entries(nodeMarkers)) {
       const n = nodeData[key];
       const isRepeater = n && n.role === 'repeater';
-      const sizePx = Math.max(10, Math.round((isRepeater ? 18 : 14) * zoomScale));
+      let sizePx = evenSize(Math.max(10, Math.round((isRepeater ? 18 : 14) * zoomScale)));
       _liveSetMarkerSize(marker, sizePx);
     }
   }
@@ -2549,8 +2774,7 @@
           // WS-only nodes: remove to prevent unbounded memory growth
           if (marker) {
             if (nodesLayer) {
-              try { nodesLayer.removeLayer(marker); } catch (e) {}
-              if (marker._highlightRing) try { nodesLayer.removeLayer(marker._highlightRing); } catch (e) {}
+              try { nodesLayer.removeLayer(marker); } catch (e) { }
             }
           }
           delete nodeMarkers[key];
@@ -2586,6 +2810,7 @@
   window._liveNodeActivity = function() { return nodeActivity; };
   window._vcrFormatTime = vcrFormatTime;
   window._liveDbPacketToLive = dbPacketToLive;
+  window._liveStepPulse = stepPulse;
   window._liveExpandToBufferEntries = expandToBufferEntries;
   window._liveExpandToBufferEntriesAsync = expandToBufferEntriesAsync;
   window._liveSEG_MAP = SEG_MAP;
@@ -2614,6 +2839,17 @@
     return addFeedItem(icon, typeName, payload, hops, color, pkt);
   };
   window._liveRebuildFeedList = function() { return rebuildFeedList(); };
+
+  // PR #1490 test seams: Expose internal state for Playwright assertions
+  window._liveDrawAnimatedLine = drawAnimatedLine;
+  window._liveTestSeams = {
+    getAnimCount: () => activeAnimations.length,
+    isAnimating: () => isAnimating,
+    getPathCount: () => (typeof recentPaths !== 'undefined' ? recentPaths.length : 0),
+    wake: wakeCanvasEngine,
+    getPulses: () => activePulses,
+    triggerPulse: pulseNode
+  };
 
   async function replayRecent() {
     try {
@@ -2658,7 +2894,7 @@
         lastTs = groupTs;
       }
       updateTimeline();
-    } catch {}
+    } catch { }
   }
 
   function connectWS() {
@@ -2668,7 +2904,7 @@
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'packet') bufferPacket(msg.data);
-      } catch {}
+      } catch { }
     };
     ws.onclose = () => setTimeout(connectWS, WS_RECONNECT_MS);
     ws.onerror = () => {};
@@ -2969,33 +3205,29 @@
         return;
       }
       if (!animLayer) return;
-      // Audio hook: notify per-hop callback
-      if (onHop) try { onHop(hopIndex, hopPositions.length, hopPositions[hopIndex]); } catch (e) {}
+
       const hp = hopPositions[hopIndex];
+
+      // Audio hook: notify per-hop callback
+      if (onHop) {
+        try {
+          onHop(hopIndex, hopPositions.length, hp);
+        } catch (e) { }
+      }
+
       const isGhost = hp.ghost;
 
       if (isGhost) {
         if (!nodeMarkers[hp.key]) {
           const ghost = L.circleMarker(hp.pos, {
-            radius: 3, fillColor: '#94a3b8', fillOpacity: 0.35, color: '#94a3b8', weight: 1, opacity: 0.5
+            radius: 3, fillColor: '#94a3b8', fillOpacity: 0.35, color: '#94a3b8', weight: 1, opacity: 0.5,
           }).addTo(animLayer);
-          let pulseUp = true;
-          let lastPulseTime = performance.now();
-          const pulseExpiry = lastPulseTime + 3000;
-          function ghostPulse(now) {
-            if (!animLayer || !animLayer.hasLayer(ghost)) return;
-            if (now >= pulseExpiry) {
-              if (animLayer && animLayer.hasLayer(ghost)) animLayer.removeLayer(ghost);
-              return;
-            }
-            if (now - lastPulseTime >= 600) {
-              lastPulseTime = now;
-              ghost.setStyle({ fillOpacity: pulseUp ? 0.6 : 0.25, opacity: pulseUp ? 0.7 : 0.4 });
-              pulseUp = !pulseUp;
-            }
-            requestAnimationFrame(ghostPulse);
+
+          activeGhosts.push({ marker: ghost, timeLeft: 3000, lastTick: null });
+          if (!isAnimating) {
+            isAnimating = true;
+            requestAnimationFrame(renderAnimations);
           }
-          requestAnimationFrame(ghostPulse);
         }
       } else {
         pulseNode(hp.key, hp.pos, typeName);
@@ -3034,56 +3266,23 @@
     if (!marker) return;
     const color = TYPE_COLORS[typeName] || '#6b7280';
 
-    const ring = L.circleMarker(pos, {
-      radius: 2, fillColor: 'transparent', fillOpacity: 0, color: color, weight: 3, opacity: 0.9
-    }).addTo(animLayer);
-
-    let r = 2, op = 0.9;
-    let lastPulse = performance.now();
-    const pulseStart = lastPulse;
-    function animatePulse(now) {
-      if (!animLayer) return;
-      if (now - pulseStart > 2000) {
-        try { animLayer.removeLayer(ring); } catch {}
-        return;
-      }
-      const elapsed = now - lastPulse;
-      if (elapsed >= 26) {
-        const ticks = Math.min(Math.floor(elapsed / 26), 4);
-        r += 1.5 * ticks; op -= 0.03 * ticks;
-        lastPulse = now;
-        if (op <= 0) {
-          try { animLayer.removeLayer(ring); } catch {}
-          return;
-        }
-        try {
-          ring.setRadius(r);
-          ring.setStyle({ opacity: op, weight: Math.max(0.3, 3 - r * 0.04) });
-        } catch { return; }
-      }
-      requestAnimationFrame(animatePulse);
-    }
-    requestAnimationFrame(animatePulse);
-
     const baseColor = marker._baseColor || '#6b7280';
     const baseSize = marker._baseSize || 14;
 
-    // #1293 — highlight via OUTLINE ring (no same-colour concentric
-    // fill). Use the marker's pre-allocated _highlightRing; grow + fade
-    // it. Marker shape/colour is left untouched so colourblind silhouette
-    // stays distinguishable during the pulse.
-    const ringHl = marker._highlightRing;
-    if (ringHl && typeof ringHl.setStyle === 'function') {
-      try {
-        ringHl.setStyle({ color: color, weight: 3, opacity: 0.95, fillOpacity: 0, fill: false });
-        ringHl.setRadius(baseSize / 2 + 4);
-        setTimeout(() => {
-          try { ringHl.setStyle({ opacity: 0.4, weight: 2 }); ringHl.setRadius(baseSize / 2 + 8); } catch (e) {}
-        }, 200);
-        setTimeout(() => {
-          try { ringHl.setStyle({ opacity: 0, weight: 0 }); } catch (e) {}
-        }, 700);
-      } catch (e) { /* circleMarker absent — ignore */ }
+    activePulses.push({
+      pos: pos,
+      color: color,
+      r: 2,
+      op: 0.9,
+      hl_r: baseSize / 2 + 4,
+      hl_op: 0.95,
+      hl_weight: 3,
+      startTime: performance.now(),
+      lastPulse: null
+    });
+    if (!isAnimating) {
+      isAnimating = true;
+      requestAnimationFrame(renderAnimations);
     }
 
     nodeActivity[key] = (nodeActivity[key] || 0) + 1;
@@ -3280,7 +3479,7 @@
 
     const matrixGreen = '#00ff41';
     const TRAIL_LEN = Math.min(6, bytes.length);
-    const DURATION_MS = 1100 / VCR.speed;
+    const DURATION_MS = VCR.mode === 'REPLAY' ? 1100 / VCR.speed : 1100;
     const CHAR_INTERVAL = 0.06; // spawn a char every 6% of progress
     const charMarkers = [];
     let nextCharAt = CHAR_INTERVAL;
@@ -3368,21 +3567,277 @@
     requestAnimationFrame(tick);
   }
 
+  function tickDt(obj, fieldName, now) {
+    if (obj[fieldName] === null) obj[fieldName] = now;
+    const rawDt = now - obj[fieldName];
+    const dt = Math.min(rawDt, 32);
+    obj[fieldName] = now;
+    const speed = VCR.mode === 'REPLAY' ? (VCR.speed || 1) : 1;
+    return dt * speed;
+  }
+
+  function stepPulse(pulse, now, isPaused) {
+    const scaledDt = tickDt(pulse, 'lastPulse', now);
+
+    if (!isPaused) {
+      const dtSec = scaledDt / 1000;
+      // Inner pulse (58px/sec, fade out 1.15/sec)
+      pulse.r += 58 * dtSec;
+      pulse.op -= 1.15 * dtSec;
+      // Outer highlight ring (grow 20px/sec, fade out 1.35/sec)
+      pulse.hl_r += 20 * dtSec;
+      pulse.hl_op -= 1.35 * dtSec;
+      pulse.hl_weight = pulse.hl_op > 0.4 ? 3 : 2;
+    }
+  }
+
+  function renderAnimations(now) {
+    if (!animCtx) return;
+
+    if (activeAnimations.length === 0 && activePulses.length === 0 && activeGhosts.length === 0) {
+      isAnimating = false;
+      animCtx.clearRect(0, 0, animCanvas.clientWidth, animCanvas.clientHeight);
+      return;
+    }
+
+    const isPaused = VCR.mode === 'PAUSED' || VCR.speed === 0;
+
+    // Clear the canvas for this frame
+    animCtx.clearRect(0, 0, animCanvas.clientWidth, animCanvas.clientHeight);
+
+    // Render Ghosts (VCR-aware timeout)
+    for (let i = activeGhosts.length - 1; i >= 0; i--) {
+      const g = activeGhosts[i];
+      if (g.lastTick === null) g.lastTick = now;
+      const dt = now - g.lastTick;
+      g.lastTick = now;
+
+      if (!isPaused) {
+        g.timeLeft -= dt * (VCR.speed || 1);
+      }
+
+      if (g.timeLeft <= 0) {
+        if (animLayer && animLayer.hasLayer(g.marker)) {
+          try { animLayer.removeLayer(g.marker); } catch { }
+        }
+        activeGhosts.splice(i, 1);
+      }
+    }
+
+    // Render Pulses
+    for (let i = activePulses.length - 1; i >= 0; i--) {
+      const pulse = activePulses[i];
+      stepPulse(pulse, now, isPaused);
+
+      // Natural completion based purely on scaled simulation time
+      // with a 30-second wall-clock safety backstop for engine stalls.
+      if (pulse.op <= 0 || now - pulse.startTime > 30000) {
+        activePulses.splice(i, 1);
+        continue;
+      }
+
+      const pulseLayerPt = map.latLngToLayerPoint(pulse.pos);
+      const pulsePt = {
+        x: pulseLayerPt.x - canvasTopLeft.x,
+        y: pulseLayerPt.y - canvasTopLeft.y
+      };
+
+      const W = animCanvas.clientWidth;
+      const H = animCanvas.clientHeight;
+      if (pulsePt.x >= -pulse.r && pulsePt.x <= W + pulse.r && pulsePt.y >= -pulse.r && pulsePt.y <= H + pulse.r) {
+        // Inner expanding pulse
+        animCtx.beginPath();
+        animCtx.arc(pulsePt.x, pulsePt.y, pulse.r, 0, Math.PI * 2);
+        animCtx.lineWidth = Math.max(0.3, 3 - pulse.r * 0.04);
+        animCtx.strokeStyle = pulse.color;
+        animCtx.globalAlpha = Math.max(0, pulse.op);
+        animCtx.stroke();
+
+        // Outer highlight ring (previously marker._highlightRing)
+        if (pulse.hl_op > 0) {
+          animCtx.beginPath();
+          animCtx.arc(pulsePt.x, pulsePt.y, pulse.hl_r, 0, Math.PI * 2);
+          animCtx.lineWidth = pulse.hl_weight;
+          animCtx.strokeStyle = pulse.color;
+          animCtx.globalAlpha = Math.max(0, pulse.hl_op);
+          animCtx.stroke();
+        }
+      }
+    }
+    animCtx.globalAlpha = 1.0;
+
+    for (let i = activeAnimations.length - 1; i >= 0; i--) {
+      const anim = activeAnimations[i];
+      const scaledDt = tickDt(anim, 'lastTick', now);
+
+      // Advance progress only if we are not paused
+      if (!isPaused) {
+        anim.progress += scaledDt / 660;
+      }
+
+      const t = Math.min(1, anim.progress);
+
+      // Use LayerPoint math so coordinates lock to the moving pane
+      const fromLayerPt = map.latLngToLayerPoint(anim.from);
+      const toLayerPt = map.latLngToLayerPoint(anim.to);
+
+      // Offset by the canvas's position within the pane to get drawable pixels.
+      // #1514 S2 — reuse module-scoped scratch objects instead of allocating per frame.
+      const fromPt = _scratchFrom;
+      fromPt.x = fromLayerPt.x - canvasTopLeft.x;
+      fromPt.y = fromLayerPt.y - canvasTopLeft.y;
+      const toPt = _scratchTo;
+      toPt.x = toLayerPt.x - canvasTopLeft.x;
+      toPt.y = toLayerPt.y - canvasTopLeft.y;
+
+      const W = animCanvas.clientWidth;
+      const H = animCanvas.clientHeight;
+      const cull = (fromPt.x < 0 && toPt.x < 0) || (fromPt.x > W && toPt.x > W) ||
+        (fromPt.y < 0 && toPt.y < 0) || (fromPt.y > H && toPt.y > H);
+
+      if (!cull) {
+        const currentX = fromPt.x + (toPt.x - fromPt.x) * t;
+        const currentY = fromPt.y + (toPt.y - fromPt.y) * t;
+
+        // Draw Contrail (glow)
+        animCtx.beginPath();
+        animCtx.moveTo(fromPt.x, fromPt.y);
+        animCtx.lineTo(currentX, currentY);
+        animCtx.strokeStyle = anim.contrailColor;
+        animCtx.lineWidth = 6;
+        animCtx.globalAlpha = anim.opacity * 0.2;
+        animCtx.lineCap = 'round';
+        animCtx.stroke();
+
+        // Draw Core Line
+        animCtx.beginPath();
+        animCtx.moveTo(fromPt.x, fromPt.y);
+        animCtx.lineTo(currentX, currentY);
+        if (anim.isDashed) {
+          animCtx.setLineDash([4, 6]);
+          animCtx.lineWidth = 1.5;
+        } else {
+          animCtx.lineWidth = 2;
+        }
+        animCtx.strokeStyle = anim.lineColor;
+        animCtx.globalAlpha = anim.opacity;
+        animCtx.stroke();
+        animCtx.setLineDash([]); // Reset for next draw
+
+        // Draw Leading Dot
+        animCtx.beginPath();
+        animCtx.arc(currentX, currentY, 3.5, 0, Math.PI * 2);
+        animCtx.fillStyle = anim.hashFill;
+        animCtx.fill();
+        animCtx.lineWidth = 1.5;
+        animCtx.strokeStyle = anim.hashOutline;
+        animCtx.stroke();
+        animCtx.globalAlpha = 1.0; // Reset
+      }
+
+      // Handle completion
+      if (t >= 1) {
+        createFadingLeafletLine(anim);
+        if (anim.onComplete) anim.onComplete();
+        activeAnimations.splice(i, 1);
+      }
+    }
+
+    // SLEEP LOGIC: If paused, halt the loop and prepare all animations for a clean wake
+    if (isPaused) {
+      isAnimating = false;
+      for (let i = 0; i < activeAnimations.length; i++) {
+        activeAnimations[i].lastTick = null;
+      }
+      for (let i = 0; i < activeGhosts.length; i++) {
+        activeGhosts[i].lastTick = null;
+      }
+      return; // Stop requesting frames. GPU goes to sleep.
+    }
+
+    requestAnimationFrame(renderAnimations);
+  }
+
+  function renderFades(now) {
+    if (activeFades.length === 0) {
+      isFading = false;
+      return;
+    }
+    for (let i = activeFades.length - 1; i >= 0; i--) {
+      const f = activeFades[i];
+      if (!pathsLayer) continue;
+      const fadeElapsed = now - f.lastFade;
+              if (fadeElapsed >= 52) {
+                const fadeTicks = Math.min(Math.floor(fadeElapsed / 52), 4);
+        f.lastFade = now;
+        f.opacity -= 0.1 * fadeTicks;
+        if (f.opacity <= 0) {
+          if (pathsLayer) { pathsLayer.removeLayer(f.line); pathsLayer.removeLayer(f.contrail); }
+          recentPaths = recentPaths.filter(p => p.line !== f.line);
+          activeFades.splice(i, 1);
+        } else {
+          f.line.setStyle({ opacity: f.opacity });
+          f.contrail.setStyle({ opacity: f.opacity * 0.15 });
+        }
+      }
+    }
+    if (activeFades.length > 0) {
+      requestAnimationFrame(renderFades);
+    } else {
+      isFading = false;
+    }
+  }
+
+  function createFadingLeafletLine(anim) {
+    if (!pathsLayer) return;
+
+    const contrail = L.polyline([anim.from, anim.to], {
+      pane: 'animationsPane', // #1514 M2 — fades stack with the moving phase (z=625).
+      color: anim.contrailColor, weight: 6, opacity: anim.opacity * 0.2, lineCap: 'round'
+    }).addTo(pathsLayer);
+
+    const line = L.polyline([anim.from, anim.to], {
+      pane: 'animationsPane', // #1514 M2 — fades stack with the moving phase (z=625).
+      color: anim.lineColor, weight: anim.isDashed ? 1.5 : 2, opacity: anim.opacity,
+      lineCap: 'round', dashArray: anim.isDashed ? '4 6' : null
+    }).addTo(pathsLayer);
+
+          recentPaths.push({ line, glowLine: contrail, time: Date.now() });
+          while (recentPaths.length > 5) {
+            const old = recentPaths.shift();
+            if (pathsLayer) { pathsLayer.removeLayer(old.line); pathsLayer.removeLayer(old.glowLine); }
+      activeFades = activeFades.filter(f => f.line !== old.line);
+    }
+
+    activeFades.push({
+      line: line,
+      contrail: contrail,
+      opacity: anim.opacity,
+      lastFade: performance.now()
+    });
+
+    if (!isFading) {
+      isFading = true;
+      requestAnimationFrame(renderFades);
+    }
+  }
+
   function drawAnimatedLine(from, to, color, onComplete, overrideOpacity, rawHex, hash) {
-    if (!animLayer || !pathsLayer) { if (onComplete) onComplete(); return; }
+    // GUARD: Prevent stale callbacks from pushing to a destroyed map
+    if (!map || !animCtx) {
+      if (onComplete) onComplete();
+      return;
+    }
+
     if (matrixMode) return drawMatrixLine(from, to, color, onComplete, rawHex);
-    const steps = 20;
-    const latStep = (to[0] - from[0]) / steps;
-    const lonStep = (to[1] - from[1]) / steps;
-    let step = 0;
-    let currentCoords = [from];
+
     const mainOpacity = overrideOpacity ?? 0.8;
     const isDashed = overrideOpacity != null;
 
-    // Hash-derived color for fill + contrail + outline (when toggle ON and not ghost/dashed line)
     var hashFill = '#fff';
     var hashOutline = color;
     var contrailColor = color;
+
     if (colorByHash && hash && !isDashed && window.HashColor) {
       var hsl = HashColor.hashToHsl(hash, _liveTheme());
       hashFill = hsl;
@@ -3390,82 +3845,26 @@
       contrailColor = hsl;
     }
 
-    const contrail = L.polyline([from], {
-      color: contrailColor, weight: 6, opacity: mainOpacity * 0.2, lineCap: 'round'
-    }).addTo(pathsLayer);
+    // Push to the hardware-accelerated canvas engine
+    activeAnimations.push({
+      from: from,
+      to: to,
+      progress: 0, // Start at 0%
+      lastTick: null,
+      opacity: mainOpacity,
+      isDashed: isDashed,
+      lineColor: (colorByHash && hash && !isDashed && window.HashColor) ? hashFill : color,
+      contrailColor: contrailColor,
+      hashFill: hashFill,
+      hashOutline: hashOutline,
+      onComplete: onComplete
+    });
 
-    const line = L.polyline([from], {
-      color: (colorByHash && hash && !isDashed && window.HashColor) ? hashFill : color,
-      weight: isDashed ? 1.5 : 2, opacity: mainOpacity, lineCap: 'round',
-      dashArray: isDashed ? '4 6' : null,
-      className: 'live-packet-trace'
-    }).addTo(pathsLayer);
-
-    const dot = L.circleMarker(from, {
-      radius: 3.5, fillColor: hashFill, fillOpacity: 1, color: hashOutline, weight: 1.5
-    }).addTo(animLayer);
-
-    let lastStep = performance.now();
-    function animateLine(now) {
-      if (!animLayer || !pathsLayer) {
-        if (onComplete) onComplete();
-        return;
-      }
-      const elapsed = now - lastStep;
-      const stepMs = 33 / VCR.speed;
-      if (elapsed >= stepMs) {
-        const ticks = Math.min(Math.floor(elapsed / stepMs), 4);
-        lastStep = now;
-        for (let t = 0; t < ticks && step < steps; t++) {
-          step++;
-          const lat = from[0] + latStep * step;
-          const lon = from[1] + lonStep * step;
-          currentCoords.push([lat, lon]);
-        }
-        const lastPt = currentCoords[currentCoords.length - 1];
-        line.setLatLngs(currentCoords);
-        contrail.setLatLngs(currentCoords);
-        dot.setLatLng(lastPt);
-
-        if (step >= steps) {
-          if (animLayer) animLayer.removeLayer(dot);
-
-          recentPaths.push({ line, glowLine: contrail, time: Date.now() });
-          while (recentPaths.length > 5) {
-            const old = recentPaths.shift();
-            if (pathsLayer) { pathsLayer.removeLayer(old.line); pathsLayer.removeLayer(old.glowLine); }
-          }
-
-          setTimeout(() => {
-            let fadeOp = mainOpacity;
-            let lastFade = performance.now();
-            function animateFade(now) {
-              if (!pathsLayer) return;
-              const fadeElapsed = now - lastFade;
-              if (fadeElapsed >= 52) {
-                const fadeTicks = Math.min(Math.floor(fadeElapsed / 52), 4);
-                lastFade = now;
-                fadeOp -= 0.1 * fadeTicks;
-                if (fadeOp <= 0) {
-                  if (pathsLayer) { pathsLayer.removeLayer(line); pathsLayer.removeLayer(contrail); }
-                  recentPaths = recentPaths.filter(p => p.line !== line);
-                  return;
-                }
-                line.setStyle({ opacity: fadeOp });
-                contrail.setStyle({ opacity: fadeOp * 0.15 });
-              }
-              requestAnimationFrame(animateFade);
-            }
-            requestAnimationFrame(animateFade);
-          }, 800);
-
-          if (onComplete) onComplete();
-          return;
-        }
-      }
-      requestAnimationFrame(animateLine);
+    // WAKE LOGIC: Kickstart the loop if it is currently sleeping
+    if (!isAnimating) {
+      isAnimating = true;
+      requestAnimationFrame(renderAnimations);
     }
-    requestAnimationFrame(animateLine);
   }
 
   function showHeatMap() {
@@ -3712,6 +4111,37 @@
   }
 
   function destroy() {
+    // #1514 S3 — drain onComplete callbacks BEFORE clearing the array. Audio
+    // `onHop` hooks rely on these firing exactly once per queued animation;
+    // previously destroy() dropped them silently when navigating away with
+    // packets in flight.
+    for (let i = 0; i < activeAnimations.length; i++) {
+      const a = activeAnimations[i];
+      if (a && typeof a.onComplete === 'function') {
+        try { a.onComplete(); } catch (_) {}
+      }
+    }
+    activeAnimations.length = 0;
+    activePulses.length = 0;
+    activeFades.length = 0;
+    activeGhosts.length = 0;
+    isAnimating = false;
+    isFading = false;
+    // #1514 S8 — tear down animation canvas + DPR listener BEFORE map.remove()
+    // (Leaflet pane is still attached). Doing this after map.remove() would
+    // call clearRect on a context whose backing pane is gone, and a late DPR
+    // change could still fire updateAnimCanvas() against a null map.
+    if (animCtx && animCanvas) {
+      try { animCtx.clearRect(0, 0, animCanvas.clientWidth, animCanvas.clientHeight); } catch (_) {}
+      animCanvas.remove();
+      animCanvas = null;
+      animCtx = null;
+    }
+    if (_dprMedia && _dprChangeHandler) {
+      try { _dprMedia.removeEventListener('change', _dprChangeHandler); } catch (_) {}
+      _dprMedia = null;
+      _dprChangeHandler = null;
+    }
     stopReplay();
     if (_timelineRefreshInterval) { clearInterval(_timelineRefreshInterval); _timelineRefreshInterval = null; }
     if (_lcdClockInterval) { clearInterval(_lcdClockInterval); _lcdClockInterval = null; }
@@ -3769,6 +4199,11 @@
   // across re-mounts. window.__liveMQLBindCount is a debug seam consumed by
   // test-live-mql-leak-1180-e2e.js and otherwise unused.
   var _liveNarrowMqlBound = false;
+  // #1514 S4 — single source of truth for window._liveTestSeams is at the
+  // earlier exposure block (search for `window._liveTestSeams = {`). The
+  // duplicate definition that lived here previously added a `_liveTestSeams.wake`
+  // that bypassed pause/empty-queue guards; tests must use the production
+  // `wakeCanvasEngine` exposed there.
 
   registerPage('live', {
     init: function(app, routeParam) {

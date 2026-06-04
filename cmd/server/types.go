@@ -88,6 +88,11 @@ type StatsResponse struct {
 	ProcessRSSMB  float64 `json:"processRSSMB"`  // process RSS from /proc (Linux) or runtime.Sys fallback
 	GoHeapInuseMB float64 `json:"goHeapInuseMB"` // runtime.MemStats.HeapInuse
 	GoSysMB       float64 `json:"goSysMB"`       // runtime.MemStats.Sys (total Go-managed)
+
+	// NeighborGraphCacheRebuildFailures counts panic/marshal failures in the
+	// background neighbor-graph cache recomputer. Non-zero = stale snapshot
+	// being served indefinitely. Surfaced for operator visibility. #1483 follow-up.
+	NeighborGraphCacheRebuildFailures uint64 `json:"neighborGraphCacheRebuildFailures"`
 }
 
 // ─── Scope Stats ───────────────────────────────────────────────────────────────
@@ -898,6 +903,14 @@ type ObserverResp struct {
 	Lat             interface{} `json:"lat"`
 	Lon             interface{} `json:"lon"`
 	NodeRole        interface{} `json:"nodeRole"`
+	// Issue #1478: surface naive-clock observers to the UI.
+	// `clock_naive` is derived from clock_last_naive_at being within the
+	// last 24h; once decayed, all three skew fields read as zero/null so the
+	// chip and banner clear automatically.
+	ClockNaive        bool        `json:"clock_naive"`
+	ClockSkewSeconds  interface{} `json:"clock_skew_seconds"`
+	ClockSkewCount24h int         `json:"clock_skew_count_24h"`
+	ClockLastNaiveAt  interface{} `json:"clock_last_naive_at"`
 }
 
 type ObserverListResponse struct {
@@ -966,6 +979,9 @@ type ThemeResponse struct {
 	NodeColors map[string]interface{} `json:"nodeColors"`
 	TypeColors map[string]interface{} `json:"typeColors"`
 	Home       interface{}            `json:"home"`
+	// #1488 — marker stroke overlay so the frontend can apply server-side
+	// defaults before the operator's localStorage override loads.
+	MarkerStroke map[string]interface{} `json:"markerStroke,omitempty"`
 }
 
 type MapConfigResponse struct {

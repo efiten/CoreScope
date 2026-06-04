@@ -73,6 +73,40 @@ type StoreObs struct {
 	PathJSON       string
 	RawHex         string
 	Timestamp      string
+
+	// #1481 P0-2: cached parsed timestamp. The legacy handlers parse
+	// Timestamp as RFC3339Nano/RFC3339/"2006-01-02 15:04:05" with a
+	// fallback chain on every read; for /api/observers/{id}/analytics
+	// that fires 60k+ times per request under RLock. ParsedTime returns
+	// the parsed value once, caching for the lifetime of the StoreObs.
+	tsParseOnce sync.Once
+	tsParsed    time.Time
+	tsParsedOK  bool
+}
+
+// ParsedTime returns the parsed Timestamp, caching the result.
+// Tries RFC3339Nano → RFC3339 → "2006-01-02 15:04:05" in order.
+// Returns (zero, false) if Timestamp is empty or unparseable.
+// Thread-safe via sync.Once.
+func (o *StoreObs) ParsedTime() (time.Time, bool) {
+	o.tsParseOnce.Do(func() {
+		if o.Timestamp == "" {
+			return
+		}
+		if t, err := time.Parse(time.RFC3339Nano, o.Timestamp); err == nil {
+			o.tsParsed, o.tsParsedOK = t, true
+			return
+		}
+		if t, err := time.Parse(time.RFC3339, o.Timestamp); err == nil {
+			o.tsParsed, o.tsParsedOK = t, true
+			return
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", o.Timestamp); err == nil {
+			o.tsParsed, o.tsParsedOK = t, true
+			return
+		}
+	})
+	return o.tsParsed, o.tsParsedOK
 }
 
 // ParsedDecoded returns the parsed DecodedJSON map, caching the result.
@@ -349,6 +383,14 @@ type PacketStore struct {
 	evicted          int64          // total packets evicted
 	trackedBytes     int64          // running total of estimated packet store memory
 	memoryEstimator  func() float64 // injectable for tests; nil = use runtime.ReadMemStats (stats only)
+
+	// Short-lived cache for the observations aggregate in GetStoreStats (30s TTL).
+	// Avoids a per-/api/stats full-table scan; values accurate to ~30s which is
+	// sufficient for dashboard display.
+	statsCacheMu   sync.Mutex
+	statsCacheTime time.Time
+	statsLastHour  int
+	statsLast24h   int
 }
 
 // Precomputed distance records for fast analytics aggregation.
@@ -1593,11 +1635,24 @@ func (s *PacketStore) GetStoreStats() (*Stats, error) {
 	oneHourAgo := time.Now().Add(-1 * time.Hour).Unix()
 	oneDayAgo := time.Now().Add(-24 * time.Hour).Unix()
 
-	// Run node/observer counts and observation counts concurrently (2 queries instead of 5).
+	// Serve observation counts from cache if fresh (avoids per-request full-table scan).
+	var obsFromCache bool
+	s.statsCacheMu.Lock()
+	if !s.statsCacheTime.IsZero() && time.Since(s.statsCacheTime) < 30*time.Second {
+		st.PacketsLastHour = s.statsLastHour
+		st.PacketsLast24h = s.statsLast24h
+		obsFromCache = true
+	}
+	s.statsCacheMu.Unlock()
+
+	// Run node/observer counts and (if cache miss) observation counts concurrently.
 	var wg sync.WaitGroup
 	var nodeErr, obsErr error
 
-	wg.Add(2)
+	wg.Add(1)
+	if !obsFromCache {
+		wg.Add(1)
+	}
 	go func() {
 		defer wg.Done()
 		nodeErr = s.db.conn.QueryRow(
@@ -1608,16 +1663,25 @@ func (s *PacketStore) GetStoreStats() (*Stats, error) {
 			sevenDaysAgo,
 		).Scan(&st.TotalNodes, &st.TotalNodesAllTime, &st.TotalObservers)
 	}()
-	go func() {
-		defer wg.Done()
-		obsErr = s.db.conn.QueryRow(
-			`SELECT
-				COALESCE(SUM(CASE WHEN timestamp > ? THEN 1 ELSE 0 END), 0),
-				COALESCE(SUM(CASE WHEN timestamp > ? THEN 1 ELSE 0 END), 0)
-			FROM observations WHERE timestamp > ?`,
-			oneHourAgo, oneDayAgo, oneDayAgo,
-		).Scan(&st.PacketsLastHour, &st.PacketsLast24h)
-	}()
+	if !obsFromCache {
+		go func() {
+			defer wg.Done()
+			obsErr = s.db.conn.QueryRow(
+				`SELECT
+					COALESCE(SUM(CASE WHEN timestamp > ? THEN 1 ELSE 0 END), 0),
+					COALESCE(SUM(CASE WHEN timestamp > ? THEN 1 ELSE 0 END), 0)
+				FROM observations WHERE timestamp > ?`,
+				oneHourAgo, oneDayAgo, oneDayAgo,
+			).Scan(&st.PacketsLastHour, &st.PacketsLast24h)
+			if obsErr == nil {
+				s.statsCacheMu.Lock()
+				s.statsLastHour = st.PacketsLastHour
+				s.statsLast24h = st.PacketsLast24h
+				s.statsCacheTime = time.Now()
+				s.statsCacheMu.Unlock()
+			}
+		}()
+	}
 	wg.Wait()
 
 	if nodeErr != nil {

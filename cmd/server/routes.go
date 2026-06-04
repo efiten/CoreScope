@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -62,6 +63,26 @@ type Server struct {
 
 	// Router reference for OpenAPI spec generation
 	router *mux.Router
+
+	// Cached default (no-filter) /api/observers response, served from an
+	// atomic-pointer snapshot. Refilled via singleflight on TTL boundary
+	// to prevent thundering-herd SQL stampedes. Issue #1481 P0-3 +
+	// #1483 follow-up (singleflight + monotonic time).
+	observersCacheV2 observersCacheField
+
+	// Cached default-shape /api/analytics/neighbor-graph response,
+	// recomputed every 5 min in a background goroutine. Issue #1481 P0-1.
+	neighborGraphCache neighborGraphCacheField
+
+	// Counter for rebuild-panic events on the neighbor-graph cache
+	// background recomputer. Surfaced via /api/stats. #1483 follow-up.
+	neighborGraphCacheRebuildFailures uint64
+
+	// Test injection: when non-nil, replaces the real
+	// computeNeighborGraphResponse pipeline so tests can assert the
+	// bypass branch was exercised without standing up a full DB/store.
+	// Production code MUST leave this nil. #1483 follow-up.
+	computeNeighborGraphResponseFn func(minCount int, minScore float64, region, role string) NeighborGraphResponse
 }
 
 // PerfStats tracks request performance.
@@ -490,7 +511,7 @@ func (s *Server) handleConfigTheme(w http.ResponseWriter, r *http.Request) {
 		"heroTitle":    "CoreScope",
 		"heroSubtitle": "Real-time MeshCore LoRa mesh network analyzer",
 		"steps": []interface{}{
-			map[string]interface{}{"emoji": "🔵", "title": "Connect via Bluetooth", "description": "Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.co.uk/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair"},
+			map[string]interface{}{"emoji": "🔵", "title": "Connect via Bluetooth", "description": "Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.io/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair"},
 			map[string]interface{}{"emoji": "📻", "title": "Set the right frequency preset", "description": "**US Recommended:**\n`910.525 MHz · BW 62.5 kHz · SF 7 · CR 5`\nSelect **\"US Recommended\"** in the app or flasher."},
 			map[string]interface{}{"emoji": "📡", "title": "Advertise yourself", "description": "Tap the signal icon → **Flood** to broadcast your node to the mesh. Companions only advert when you trigger it manually."},
 			map[string]interface{}{"emoji": "🔁", "title": "Check \"Heard N repeats\"", "description": "- **\"Sent\"** = transmitted, no confirmation\n- **\"Heard 0 repeats\"** = no repeater picked it up\n- **\"Heard 1+ repeats\"** = you're on the mesh!"},
@@ -502,13 +523,23 @@ func (s *Server) handleConfigTheme(w http.ResponseWriter, r *http.Request) {
 	}
 	home := mergeMap(defaultHome, s.cfg.Home, theme.Home)
 
+	// #1488 — marker stroke overlay. Defaults mirror the :root values in
+	// public/style.css so a fresh visitor with no config + no override
+	// still gets the same painted outline as the static CSS fallback.
+	markerStroke := mergeMap(map[string]interface{}{
+		"color":   "rgba(255,255,255,0.85)",
+		"width":   1,
+		"opacity": 1,
+	}, s.cfg.MarkerStroke, theme.MarkerStroke)
+
 	writeJSON(w, ThemeResponse{
-		Branding:   branding,
-		Theme:      themeColors,
-		ThemeDark:  themeDark,
-		NodeColors: nodeColors,
-		TypeColors: typeColors,
-		Home:       home,
+		Branding:     branding,
+		Theme:        themeColors,
+		ThemeDark:    themeDark,
+		NodeColors:   nodeColors,
+		TypeColors:   typeColors,
+		Home:         home,
+		MarkerStroke: markerStroke,
 	})
 }
 
@@ -708,6 +739,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		ProcessRSSMB:  mem.ProcessRSSMB,
 		GoHeapInuseMB: mem.GoHeapInuseMB,
 		GoSysMB:       mem.GoSysMB,
+
+		NeighborGraphCacheRebuildFailures: atomic.LoadUint64(&s.neighborGraphCacheRebuildFailures),
 	}
 
 	s.statsMu.Lock()
@@ -857,15 +890,16 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("order") == "asc" {
 			order = "ASC"
 		}
+		lim := queryLimit(r, 50, 500)
 		var result *PacketResult
 		var err error
 		if s.store != nil {
 			result = s.store.QueryMultiNodePackets(cleaned,
-				queryInt(r, "limit", 50), queryInt(r, "offset", 0),
+				lim, queryInt(r, "offset", 0),
 				order, r.URL.Query().Get("since"), r.URL.Query().Get("until"))
 		} else {
 			result, err = s.db.QueryMultiNodePackets(cleaned,
-				queryInt(r, "limit", 50), queryInt(r, "offset", 0),
+				lim, queryInt(r, "offset", 0),
 				order, r.URL.Query().Get("since"), r.URL.Query().Get("until"))
 		}
 		if err != nil {
@@ -875,14 +909,14 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, PacketListResponse{
 			Packets: mapSliceToTransmissions(result.Packets),
 			Total:   result.Total,
-			Limit:   queryInt(r, "limit", 50),
+			Limit:   lim,
 			Offset:  queryInt(r, "offset", 0),
 		})
 		return
 	}
 
 	q := PacketQuery{
-		Limit:    queryInt(r, "limit", 50),
+		Limit:    queryLimit(r, 50, 500),
 		Offset:   queryInt(r, "offset", 0),
 		Observer: r.URL.Query().Get("observer"),
 		Hash:     r.URL.Query().Get("hash"),
@@ -1176,7 +1210,7 @@ func (s *Server) handlePostPacket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	nodes, total, counts, err := s.db.GetNodes(
-		queryInt(r, "limit", 50),
+		queryLimit(r, 50, 500),
 		queryInt(r, "offset", 0),
 		q.Get("role"), q.Get("search"), q.Get("before"),
 		q.Get("lastHeard"), q.Get("sortBy"), q.Get("region"),
@@ -1417,10 +1451,7 @@ func (s *Server) handleNodeHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBulkHealth(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 50)
-	if limit > 200 {
-		limit = 200
-	}
+	limit := queryLimit(r, 50, 200)
 
 	if s.store != nil {
 		region := r.URL.Query().Get("region")
@@ -2015,7 +2046,7 @@ func (s *Server) handleAnalyticsSubpaths(w http.ResponseWriter, r *http.Request)
 			minLen = 2
 		}
 		maxLen := queryInt(r, "maxLen", 8)
-		limit := queryInt(r, "limit", 100)
+		limit := queryLimit(r, 100, 200)
 		data := s.store.GetAnalyticsSubpaths(region, minLen, maxLen, limit)
 		if s.cfg != nil && len(s.cfg.NodeBlacklist) > 0 {
 			data = s.filterBlacklistedFromSubpaths(data)
@@ -2058,6 +2089,12 @@ func (s *Server) handleAnalyticsSubpathsBulk(w http.ResponseWriter, r *http.Requ
 		if err1 != nil || err2 != nil || err3 != nil || mn < 2 || mx < mn || lim < 1 {
 			writeJSON(w, ErrorResp{Error: "invalid group: " + g})
 			return
+		}
+		// Uniform clamp per audit-input-vulns-20260603 (MEDIUM): match the
+		// /api/analytics/subpaths ceiling so a single bulk request can't
+		// allocate more than the per-group endpoint allows.
+		if lim > 200 {
+			lim = 200
 		}
 		groups = append(groups, subpathGroup{mn, mx, lim})
 	}
@@ -2299,7 +2336,7 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleChannelMessages(w http.ResponseWriter, r *http.Request) {
 	hash := mux.Vars(r)["hash"]
-	limit := queryInt(r, "limit", 100)
+	limit := queryLimit(r, 100, 500)
 	offset := queryInt(r, "offset", 0)
 	region := r.URL.Query().Get("region")
 	// Prefer DB for full history (in-memory store has limited retention)
@@ -2321,10 +2358,62 @@ func (s *Server) handleChannelMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleObservers(w http.ResponseWriter, r *http.Request) {
-	observers, err := s.db.GetObservers()
+	// #1481 P0-3 + #1483: serve from 30s atomic-pointer cache for the
+	// default (no-filter) query shape. Refill is collapsed via
+	// singleflight so concurrent TTL-boundary requests do not stampede
+	// the 1.9M-row observations table.
+	isDefault := r.URL.RawQuery == ""
+	if isDefault {
+		if e, ok := s.loadObserversCache(); ok && !s.observersCacheExpired(e.at) {
+			w.Header().Set("X-Cache-Age-Seconds", cacheAgeSecondsHeader(time.Since(e.at)))
+			writeJSON(w, e.resp)
+			return
+		}
+	}
+
+	if isDefault {
+		v, err, _ := s.observersCacheV2.sf.Do(observersCacheFlightKey, func() (interface{}, error) {
+			// Double-check inside the singleflight: another winner
+			// may have just stored a fresh entry.
+			if e, ok := s.loadObserversCache(); ok && !s.observersCacheExpired(e.at) {
+				return e, nil
+			}
+			resp, herr := s.buildObserversDefaultResponse()
+			if herr != nil {
+				return nil, herr
+			}
+			s.observersCacheV2.fillCount.Add(1)
+			entry := &observersCacheEntry{resp: resp, at: time.Now()}
+			s.observersCacheV2.ptr.Store(entry)
+			return entry, nil
+		})
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		entry := v.(*observersCacheEntry)
+		w.Header().Set("X-Cache-Age-Seconds", cacheAgeSecondsHeader(time.Since(entry.at)))
+		writeJSON(w, entry.resp)
+		return
+	}
+
+	// Non-default queries bypass the cache entirely (filters not yet wired).
+	resp, err := s.buildObserversDefaultResponse()
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	writeJSON(w, resp)
+}
+
+// buildObserversDefaultResponse runs the underlying SQL pipeline for
+// the default-shape /api/observers payload. Extracted so the cache
+// refill path can be wrapped in singleflight and counted by tests.
+// #1483 follow-up.
+func (s *Server) buildObserversDefaultResponse() (ObserverListResponse, error) {
+	observers, err := s.db.GetObservers()
+	if err != nil {
+		return ObserverListResponse{}, err
 	}
 
 	// Batch lookup: packetsLastHour per observer
@@ -2339,7 +2428,9 @@ func (s *Server) handleObservers(w http.ResponseWriter, r *http.Request) {
 	nodeLocations := s.db.GetNodeLocationsByKeys(observerIDs)
 
 	result := make([]ObserverResp, 0, len(observers))
-	for _, o := range observers {
+	nowTime := time.Now().UTC()
+	for i := range observers {
+		o := &observers[i]
 		// Defense in depth: skip observers that are in the blacklist
 		if s.cfg != nil && s.cfg.IsObserverBlacklisted(o.ID) {
 			continue
@@ -2355,7 +2446,7 @@ func (s *Server) handleObservers(w http.ResponseWriter, r *http.Request) {
 			nodeRole = nodeLoc["role"]
 		}
 
-		result = append(result, ObserverResp{
+		resp := ObserverResp{
 			ID: o.ID, Name: o.Name, IATA: o.IATA,
 			LastSeen: o.LastSeen, FirstSeen: o.FirstSeen,
 			PacketCount: o.PacketCount,
@@ -2366,12 +2457,14 @@ func (s *Server) handleObservers(w http.ResponseWriter, r *http.Request) {
 			LastPacketAt: o.LastPacketAt,
 			PacketsLastHour: plh,
 			Lat: lat, Lon: lon, NodeRole: nodeRole,
-		})
+		}
+		applyObserverNaiveClock(&resp, o, nowTime)
+		result = append(result, resp)
 	}
-	writeJSON(w, ObserverListResponse{
+	return ObserverListResponse{
 		Observers:  result,
 		ServerTime: time.Now().UTC().Format(time.RFC3339),
-	})
+	}, nil
 }
 
 func (s *Server) handleObserverDetail(w http.ResponseWriter, r *http.Request) {
@@ -2397,17 +2490,21 @@ func (s *Server) handleObserverDetail(w http.ResponseWriter, r *http.Request) {
 		plh = c
 	}
 
-	writeJSON(w, ObserverResp{
-		ID: obs.ID, Name: obs.Name, IATA: obs.IATA,
-		LastSeen: obs.LastSeen, FirstSeen: obs.FirstSeen,
-		PacketCount: obs.PacketCount,
-		Model: obs.Model, Firmware: obs.Firmware,
-		ClientVersion: obs.ClientVersion, Radio: obs.Radio,
-		BatteryMv: obs.BatteryMv, UptimeSecs: obs.UptimeSecs,
-		NoiseFloor: obs.NoiseFloor,
-		LastPacketAt: obs.LastPacketAt,
-		PacketsLastHour: plh,
-	})
+	writeJSON(w, func() ObserverResp {
+		resp := ObserverResp{
+			ID: obs.ID, Name: obs.Name, IATA: obs.IATA,
+			LastSeen: obs.LastSeen, FirstSeen: obs.FirstSeen,
+			PacketCount: obs.PacketCount,
+			Model: obs.Model, Firmware: obs.Firmware,
+			ClientVersion: obs.ClientVersion, Radio: obs.Radio,
+			BatteryMv: obs.BatteryMv, UptimeSecs: obs.UptimeSecs,
+			NoiseFloor: obs.NoiseFloor,
+			LastPacketAt: obs.LastPacketAt,
+			PacketsLastHour: plh,
+		}
+		applyObserverNaiveClock(&resp, obs, time.Now().UTC())
+		return resp
+	}())
 }
 
 func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request) {
@@ -2427,19 +2524,15 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	s.store.mu.RLock()
 	obsList := s.store.byObserver[id]
-	filtered := make([]*StoreObs, 0, len(obsList))
-	for _, obs := range obsList {
-		if obs.Timestamp == "" {
-			continue
-		}
-		t, err := time.Parse(time.RFC3339Nano, obs.Timestamp)
-		if err != nil {
-			t, err = time.Parse(time.RFC3339, obs.Timestamp)
-		}
-		if err != nil {
-			t, err = time.Parse("2006-01-02 15:04:05", obs.Timestamp)
-		}
-		if err != nil {
+	// #1481 P0-2: snapshot pointer slice and release RLock immediately —
+	// don't iterate + json-decode + time-parse under the lock.
+	obsSnapshot := make([]*StoreObs, len(obsList))
+	copy(obsSnapshot, obsList)
+	s.store.mu.RUnlock()
+	filtered := make([]*StoreObs, 0, len(obsSnapshot))
+	for _, obs := range obsSnapshot {
+		t, ok := obs.ParsedTime()
+		if !ok {
 			continue
 		}
 		if t.Equal(since) || t.After(since) {
@@ -2471,14 +2564,8 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 	recentPackets := make([]map[string]interface{}, 0, 20)
 
 	for i, obs := range filtered {
-		ts, err := time.Parse(time.RFC3339Nano, obs.Timestamp)
-		if err != nil {
-			ts, err = time.Parse(time.RFC3339, obs.Timestamp)
-		}
-		if err != nil {
-			ts, err = time.Parse("2006-01-02 15:04:05", obs.Timestamp)
-		}
-		if err != nil {
+		ts, ok := obs.ParsedTime()
+		if !ok {
 			continue
 		}
 		bucketStart := ts.UTC().Truncate(bucketDur).Unix()
@@ -2520,7 +2607,8 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 			recentPackets = append(recentPackets, enriched)
 		}
 	}
-	s.store.mu.RUnlock()
+	// #1481 P0-2: RLock was released earlier after snapshotting the
+	// observation pointer slice; no Unlock needed here.
 
 	buildTimeline := func(counts map[int64]int) []TimeBucket {
 		keys := make([]int64, 0, len(counts))
@@ -3086,12 +3174,7 @@ func (s *Server) filterBlacklistedFromSubpaths(data map[string]interface{}) map[
 
 // handleDroppedPackets returns recently dropped packets for investigation.
 func (s *Server) handleDroppedPackets(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
-		}
-	}
+	limit := queryLimit(r, 100, 500)
 	observerID := r.URL.Query().Get("observer")
 	nodePubkey := r.URL.Query().Get("pubkey")
 

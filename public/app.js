@@ -175,6 +175,21 @@ function getHashParams() {
   return new URLSearchParams(location.hash.split('?')[1] || '');
 }
 
+// shouldEmbedRoute — issue #1369. Returns true when the SPA should render in
+// "embed" mode (chrome suppressed: no top-nav, no bottom-nav, no side drawer,
+// content full-bleed). Triggered by ?embed=1 in the hash query string.
+//
+// Allowlisted to /#/map and /#/channels — the two surfaces operators asked
+// for in the cross-domain embed scenario. Other pages have chrome assumptions
+// we are not committing to in embed mode (Tufte: ship narrow, expand later
+// only when there is a real ask).
+function shouldEmbedRoute(basePage, hashSearch) {
+  if (basePage !== 'map' && basePage !== 'channels') return false;
+  if (!hashSearch) return false;
+  var params = new URLSearchParams(hashSearch);
+  return params.get('embed') === '1';
+}
+
 function getDistanceUnit() {
   var stored = localStorage.getItem('meshcore-distance-unit');
   if (stored === 'km') return 'km';
@@ -345,35 +360,6 @@ function formatChartAxisLabel(d, shortForm) {
 function truncate(str, len) {
   if (!str) return '';
   return str.length > len ? str.slice(0, len) + '…' : str;
-}
-
-function formatEngineBadge(engine) {
-  if (!engine) return '';
-  return ` <span class="engine-badge">${engine}</span>`;
-}
-
-function formatVersionBadge(version, commit, engine, buildTime) {
-  if (!version && !commit && !engine) return '';
-  var buildAge = '';
-  if (buildTime && buildTime !== 'unknown') {
-    var age = timeAgo(buildTime);
-    if (age && age !== '—') buildAge = ' <span class="build-age">(' + age + ')</span>';
-  }
-  var port = (typeof location !== 'undefined' && location.port) || '';
-  var isProd = !port || port === '80' || port === '443';
-  var GH = 'https://github.com/Kpa-clawbot/corescope';
-  var parts = [];
-  if (version && isProd) {
-    var vTag = version.charAt(0) === 'v' ? version : 'v' + version;
-    parts.push('<a href="' + GH + '/releases/tag/' + vTag + '" target="_blank" rel="noopener">' + vTag + '</a>');
-  }
-  if (commit && commit !== 'unknown') {
-    var short = commit.length > 7 ? commit.slice(0, 7) : commit;
-    parts.push('<a href="' + GH + '/commit/' + commit + '" target="_blank" rel="noopener">' + short + '</a>' + buildAge);
-  }
-  if (engine) parts.push('<span class="engine-badge">' + engine + '</span>');
-  if (parts.length === 0) return '';
-  return ' <span class="version-badge">' + parts.join(' · ') + '</span>';
 }
 
 // --- Favorites ---
@@ -805,10 +791,24 @@ window.pullReconnect = pullReconnect;
 window.setupPullToReconnect = setupPullToReconnect;
 window.connectWS = connectWS;
 
-/* Global escapeHtml — used by multiple pages */
+/* Global escapeHtml — used by multiple pages.
+   5-char OWASP set: escapes ' too so this helper is safe in both
+   double-quoted AND single-quoted attribute contexts (e.g. the
+   data-conflict='${escapeHtml(JSON.stringify(...))}' attr in
+   hop-display.js, where JSON containing a single quote would
+   otherwise break out of the attribute). Fixes #1536.
+
+   CANONICAL ESCAPE for HTML sinks that interpolate node-controlled or
+   MQTT-controlled fields (name, adv_name, observer, sender, channel,
+   pubkey, body, …). Enforced at PR-creation time by:
+     - scripts/check-xss-sinks.sh                            (local mirror)
+     - ~/.openclaw/skills/pr-preflight/scripts/check-xss-sinks.sh  (canonical)
+     - test-preflight-xss-gate.js                            (CI gate)
+   See also: escapeAttr (public/home.js, public/path-inspector.js) for
+   attribute-only contexts. */
 function escapeHtml(s) {
   if (s == null) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 /* Global debounce */
@@ -957,6 +957,14 @@ function navigate() {
   // Pages with fixed-height containers (maps, virtual-scroll, split-panels)
   const fixedPages = { packets: 1, nodes: 1, map: 1, live: 1, channels: 1, 'audio-lab': 1 };
   app.classList.toggle('app-fixed', basePage in fixedPages);
+
+  // Issue #1369: ?embed=1 chrome suppression for cross-domain iframe embeds.
+  // Toggles body.embed; CSS in style.css hides top-nav / bottom-nav / nav-drawer
+  // and zeroes body padding so /#/map and /#/channels render full-bleed.
+  try {
+    var hashSearch = (location.hash.split('?')[1] || '');
+    document.body.classList.toggle('embed', shouldEmbedRoute(basePage, hashSearch));
+  } catch (_) { /* DOM may be missing in some test contexts */ }
   if (pages[basePage]?.init) {
     const t0 = performance.now();
     pages[basePage].init(app, routeParam);
@@ -1036,7 +1044,7 @@ window.addEventListener('DOMContentLoaded', () => {
         if (themeData[key]) root.setProperty(varMap[key], themeData[key]);
       }
       if (themeData.background) root.setProperty('--content-bg', themeData.contentBg || themeData.background);
-      if (themeData.surface1) root.setProperty('--card-bg', themeData.cardBg || themeData.surface1);
+      if (themeData.surface1) root.setProperty('--card-bg', themeData.cardBg || themeData.surface2 || themeData.surface1);
       // Nav gradient
       if (themeData.navBg) {
         var nav = document.querySelector('.top-nav');
@@ -1149,7 +1157,6 @@ window.addEventListener('DOMContentLoaded', () => {
                      .concat(allLinks.filter(a => a.dataset.priority === 'high' && !a.classList.contains('active')).reverse());
     }
     var overflowQueue = buildOverflowQueue();
-
 
     function rebuildMoreMenu() {
       navMoreMenu.innerHTML = '';
@@ -1566,7 +1573,7 @@ window.addEventListener('DOMContentLoaded', () => {
       const stats = await api('/stats', { ttl: CLIENT_TTL.stats });
       const el = document.getElementById('navStats');
       if (el) {
-        el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> pkts · <span class="stat-val">${stats.totalNodes}</span> nodes · <span class="stat-val">${stats.totalObservers}</span> obs${formatVersionBadge(stats.version, stats.commit, stats.engine, stats.buildTime)}`;
+        el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> pkts · <span class="stat-val">${stats.totalNodes}</span> nodes · <span class="stat-val">${stats.totalObservers}</span> obs`;
         el.querySelectorAll('.stat-val').forEach(s => s.classList.add('updated'));
         setTimeout(() => { el.querySelectorAll('.stat-val').forEach(s => s.classList.remove('updated')); }, 600);
         if (navPriorityFn) requestAnimationFrame(navPriorityFn);
