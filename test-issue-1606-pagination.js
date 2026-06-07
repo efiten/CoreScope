@@ -65,6 +65,10 @@ function makeSandbox() {
     location: { hash: '' },
     getHashParams: function () { return new URLSearchParams((ctx.location.hash.split('?')[1] || '')); },
     CustomEvent: class CustomEvent {},
+    // Fork-only globals (public/locode.js) referenced by renderRows; the
+    // upstream test doesn't load locode.js, so stub them as no-ops.
+    locodeAttr: () => '',
+    parseLocodeName: () => null,
   };
   vm.createContext(ctx);
   return ctx;
