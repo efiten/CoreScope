@@ -241,6 +241,7 @@
     "invalidateApiCache": "readonly",
     "isFavorite": "readonly",
     "isTransportRoute": "readonly",
+    "locodeAttr": "readonly",
     "makeColumnsResizable": "readonly",
     "makeRoleMarkerSVG": "readonly",
     "miniMarkdown": "readonly",
