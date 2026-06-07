@@ -23,7 +23,7 @@ COPY internal/dbschema/ ../../internal/dbschema/
 COPY internal/prunequeue/ ../../internal/prunequeue/
 COPY internal/perfio/ ../../internal/perfio/
 COPY internal/mbcapqueue/ ../../internal/mbcapqueue/
-RUN go mod download
+RUN for i in 1 2 3 4 5; do go mod download && break || { echo "go mod download failed (attempt $i/5), retrying…"; sleep 5; }; done
 COPY cmd/server/ ./
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags "-X main.Version=${APP_VERSION} -X main.Commit=${GIT_COMMIT} -X main.BuildTime=${BUILD_TIME}" -o /corescope-server .
@@ -39,7 +39,7 @@ COPY internal/dbschema/ ../../internal/dbschema/
 COPY internal/prunequeue/ ../../internal/prunequeue/
 COPY internal/perfio/ ../../internal/perfio/
 COPY internal/mbcapqueue/ ../../internal/mbcapqueue/
-RUN go mod download
+RUN for i in 1 2 3 4 5; do go mod download && break || { echo "go mod download failed (attempt $i/5), retrying…"; sleep 5; }; done
 COPY cmd/ingestor/ ./
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -o /corescope-ingestor .
@@ -48,7 +48,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 WORKDIR /build/decrypt
 COPY cmd/decrypt/go.mod cmd/decrypt/go.sum ./
 COPY internal/channel/ ../../internal/channel/
-RUN go mod download
+RUN for i in 1 2 3 4 5; do go mod download && break || { echo "go mod download failed (attempt $i/5), retrying…"; sleep 5; }; done
 COPY cmd/decrypt/ ./
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w" -o /corescope-decrypt .
