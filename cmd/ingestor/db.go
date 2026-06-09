@@ -226,6 +226,29 @@ func applySchema(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_transmissions_payload_type ON transmissions(payload_type);
 		-- idx_transmissions_from_pubkey is created by the from_pubkey_v1
 		-- migration after the column is added on legacy DBs (#1143).
+
+		-- Mobile client RX coverage: a roaming companion = a mobile observer
+		-- with a moving GPS position, so it gets its own table rather than
+		-- observations (which assumes a fixed observer/location).
+		CREATE TABLE IF NOT EXISTS client_receptions (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			rx_pubkey     TEXT NOT NULL,
+			heard_key     TEXT NOT NULL,
+			heard_keylen  INTEGER NOT NULL,
+			rssi          INTEGER,
+			snr           REAL,
+			lat           REAL NOT NULL,
+			lon           REAL NOT NULL,
+			pos_acc_m     REAL,
+			h3            TEXT NOT NULL,
+			rx_at         TEXT NOT NULL,
+			ingested_at   TEXT NOT NULL,
+			src           TEXT NOT NULL,
+			UNIQUE(rx_pubkey, heard_key, rx_at)
+		);
+		CREATE INDEX IF NOT EXISTS idx_client_recept_heard ON client_receptions(heard_key);
+		CREATE INDEX IF NOT EXISTS idx_client_recept_rxpk ON client_receptions(rx_pubkey);
+		CREATE INDEX IF NOT EXISTS idx_client_recept_h3 ON client_receptions(h3);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
