@@ -7,6 +7,16 @@
 .nq-note { margin:6px 0 0; padding:6px 10px; font-size:11px; line-height:1.4; color:var(--text-muted, #57606a); background:var(--section-bg, #f6f8fa); border:1px solid var(--border, #d0d7de); border-radius:6px; }
 .nq-map { height:420px; border:1px solid var(--border, #d0d7de); border-radius:6px; margin-bottom:12px; }
 
+/* RX coverage hex layer (mobile client receptions) */
+:root {
+  --nq-cov-strong: #2ecc71;
+  --nq-cov-mid: #f1c40f;
+  --nq-cov-weak: #e67e22;
+  --nq-cov-grey: #95a5a6;
+}
+.nq-cov-legend { display:flex; gap:12px; align-items:center; font-size:11px; color:var(--text-muted, #57606a); margin:4px 0 10px; }
+.nq-cov-legend i { width:12px; height:12px; border-radius:2px; display:inline-block; margin-right:4px; vertical-align:middle; }
+
 .nq-table { border-collapse:collapse; width:100%; font-size:12px; margin-bottom:24px; }
 .nq-table th, .nq-table td { border:1px solid var(--border, #d0d7de); padding:3px 7px; }
 .nq-table th { background:var(--section-bg, #f6f8fa); font-size:10px; text-transform:uppercase; }

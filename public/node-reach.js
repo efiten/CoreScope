@@ -6,6 +6,16 @@
 (function () {
   var qmap = null;
   var current = null;
+  var coverageOn = false; // mobile RX coverage hex layer toggle (deep-linked ?coverage=1)
+  var covHandle = null;
+
+  // setCoverageHash reflects the coverage toggle in the URL hash without
+  // re-triggering the router (history.replaceState, not location.hash =).
+  function setCoverageHash(on) {
+    var h = location.hash.replace(/([?&])coverage=1/, '$1').replace(/[?&]$/, '');
+    if (on) { h += (h.indexOf('?') >= 0 ? '&' : '?') + 'coverage=1'; }
+    try { history.replaceState(null, '', h || location.pathname + location.search); } catch (e) {}
+  }
 
   function colorVar(b) {
     if (b >= 300) return 'var(--link-strong)';
@@ -79,6 +89,7 @@
 
   async function load(container, pubkey, days) {
     current = { pubkey: pubkey, days: days };
+    coverageOn = (typeof getHashParams === 'function' && getHashParams().get('coverage') === '1');
     if (qmap) { try { qmap.remove(); } catch (e) {} qmap = null; }
     container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading reach…</div>';
 
@@ -132,8 +143,15 @@
       '<div class="nq-actions nq-noprint">' +
       '<label><input type="checkbox" id="nqIncoming"> incoming <span class="nq-dir">(we hear them)</span></label>' +
       '<label><input type="checkbox" id="nqOutgoing"> outgoing <span class="nq-dir">(they hear us)</span></label>' +
+      '<label><input type="checkbox" id="nqCoverage"' + (coverageOn ? ' checked' : '') + '> coverage <span class="nq-dir">(where clients heard it)</span></label>' +
       '<span id="nqCount" class="nq-count"></span>' +
       '<button id="nqPrintBtn" class="btn-primary" style="margin-left:auto">🖨️ Print / PDF</button>' +
+      '</div>' +
+      '<div class="nq-cov-legend nq-noprint" id="nqCovLegend" style="display:' + (coverageOn ? 'flex' : 'none') + '">' +
+      '<span><i style="background:var(--nq-cov-strong)"></i>strong</span>' +
+      '<span><i style="background:var(--nq-cov-mid)"></i>medium</span>' +
+      '<span><i style="background:var(--nq-cov-weak)"></i>weak</span>' +
+      '<span><i style="background:var(--nq-cov-grey)"></i>no signal</span>' +
       '</div>' +
       '<div id="nqMap" class="nq-map"></div>' +
       '<table class="nq-table"><thead><tr><th>#</th><th>Neighbour</th><th>we hear</th>' +
@@ -141,9 +159,13 @@
       '</div>';
 
     function renderMap(list) {
+      if (covHandle) { try { covHandle.off(); } catch (e) {} covHandle = null; }
       if (qmap) { try { qmap.remove(); } catch (e) {} qmap = null; }
       if (window.NodeReachMap && n.lat != null) {
         qmap = window.NodeReachMap.render('nqMap', n, list, colorVar);
+        if (coverageOn && qmap && window.NodeReachCoverage) {
+          covHandle = window.NodeReachCoverage.addLayer(qmap, pubkey);
+        }
       }
     }
 
@@ -169,6 +191,13 @@
     paint();
     document.getElementById('nqIncoming').addEventListener('change', paint);
     document.getElementById('nqOutgoing').addEventListener('change', paint);
+    document.getElementById('nqCoverage').addEventListener('change', function (e) {
+      coverageOn = e.target.checked;
+      setCoverageHash(coverageOn);
+      var legend = document.getElementById('nqCovLegend');
+      if (legend) legend.style.display = coverageOn ? 'flex' : 'none';
+      paint(); // re-renders the map, which (re)applies or drops the coverage layer
+    });
     document.getElementById('nqPrintBtn').addEventListener('click', printReport);
 
     wireTimeRange(container, pubkey);
@@ -183,6 +212,7 @@
   }
 
   function destroy() {
+    if (covHandle) { try { covHandle.off(); } catch (e) {} covHandle = null; }
     if (qmap) { try { qmap.remove(); } catch (e) {} qmap = null; }
     current = null;
   }
