@@ -7,6 +7,26 @@ with the phone's GPS position, and publishes it to MQTT. CoreScope ingests these
 
 This is the contract the mobile capture app (separate repo, "Plan 2") implements.
 
+## Companion BLE source (verified against firmware)
+
+The mobile app's RX data comes from the companion's **`PUSH_CODE_LOG_RX_DATA` (0x88)** BLE frame:
+`[0x88][snr×4 int8][rssi int8][raw packet bytes]`. This is emitted for **every** received
+packet (promiscuous, incl. overheard flood traffic), not just messages addressed to the device:
+
+- `src/Dispatcher.cpp:198` calls `logRxRaw(getLastSNR(), getLastRSSI(), raw, len)` in `checkRecv()`
+  **unconditionally** — NOT behind `#if MESH_PACKET_LOGGING`. So it works on stock firmware.
+- `examples/companion_radio/MyMesh.cpp:283` overrides it to write the 0x88 frame whenever the app
+  is connected over BLE (`_serial->isConnected()`).
+
+So per received packet the app gets SNR + RSSI + the raw bytes. It decodes the raw packet (standard
+MeshCore format) to derive the directly-heard node (`path[last]` or 0-hop advert pubkey) and pairs it
+with the phone's GPS. The bare advert push (`PUSH_CODE_ADVERT` 0x80) carries only a pubkey (no SNR/
+RSSI/path) and is NOT used — 0x88 already covers adverts (the raw advert is in its payload).
+
+Caveats: 0x88 is only sent while the app is BLE-connected; packets larger than `MAX_FRAME_SIZE` are
+skipped; the firmware doc labels 0x88 "can be ignored" (messaging-app view) — for coverage it is the
+primary frame. GPS is always the phone's, never the companion's.
+
 ## MQTT topic & payload
 
 Topic: `meshcore/client/{PUBLIC_KEY}/packets` — `{PUBLIC_KEY}` is the companion's pubkey. The
