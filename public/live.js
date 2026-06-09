@@ -2381,9 +2381,9 @@
       // "Show all nodes" is enabled. Empty string when no region set.
       const rqs = (window.RegionFilter && typeof RegionFilter.nodesRegionQueryString === 'function')
         ? RegionFilter.nodesRegionQueryString() : '';
-      const url = beforeTs
-        ? `/api/nodes?limit=2000&before=${encodeURIComponent(new Date(beforeTs).toISOString())}${aqs}${rqs}`
-        : `/api/nodes?limit=2000${aqs}${rqs}`;
+      const beforeQs = beforeTs
+        ? `&before=${encodeURIComponent(new Date(beforeTs).toISOString())}`
+        : '';
       // Full reload (no beforeTs): clear existing markers so switching areas
       // removes nodes that no longer belong to the selected area.
       if (!beforeTs) {
@@ -2391,9 +2391,13 @@
         nodeMarkers = {};
         nodeData = {};
       }
-      const resp = await fetch(url);
-      const nodes = await resp.json();
-      const list = Array.isArray(nodes) ? nodes : (nodes.nodes || []);
+      // Paginate past the server's 500-row /api/nodes cap so the live map isn't
+      // truncated to the top-500 by advert. safetyCap (2000) is fetchAllNodes'
+      // hard ceiling on returned nodes — preserves the prior limit=2000 intent
+      // while actually surfacing nodes past the first page.
+      const { nodes: list } = await fetchAllNodes(`${beforeQs}${aqs}${rqs}`, {
+        safetyCap: 2000,
+      });
       var now = Date.now();
       list.forEach(n => {
         if (n.lat != null && n.lon != null && !(n.lat === 0 && n.lon === 0)) {
