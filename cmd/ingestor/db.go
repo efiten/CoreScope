@@ -240,7 +240,6 @@ func applySchema(db *sql.DB) error {
 			lat           REAL NOT NULL,
 			lon           REAL NOT NULL,
 			pos_acc_m     REAL,
-			h3            TEXT NOT NULL,
 			rx_at         TEXT NOT NULL,
 			ingested_at   TEXT NOT NULL,
 			src           TEXT NOT NULL,
@@ -248,7 +247,6 @@ func applySchema(db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_client_recept_heard ON client_receptions(heard_key);
 		CREATE INDEX IF NOT EXISTS idx_client_recept_rxpk ON client_receptions(rx_pubkey);
-		CREATE INDEX IF NOT EXISTS idx_client_recept_h3 ON client_receptions(h3);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
