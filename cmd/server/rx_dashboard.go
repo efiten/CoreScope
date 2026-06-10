@@ -99,10 +99,13 @@ type RxLeaderboardResp struct {
 
 func (s *Server) rxLeaderboard(days, limit int) ([]LeaderObserver, error) {
 	since := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
+	// Name preference: the node's advertised name, else the companion's
+	// self-reported name (client_observers), else empty (UI shows the prefix).
 	rows, err := s.db.conn.Query(`
-		SELECT cr.rx_pubkey, COALESCE(n.name,''), COUNT(*), COUNT(DISTINCT cr.heard_key)
+		SELECT cr.rx_pubkey, COALESCE(NULLIF(n.name,''), NULLIF(co.name,''), ''), COUNT(*), COUNT(DISTINCT cr.heard_key)
 		FROM client_receptions cr
 		LEFT JOIN nodes n ON n.public_key = cr.rx_pubkey
+		LEFT JOIN client_observers co ON co.pubkey = cr.rx_pubkey
 		WHERE cr.rx_at >= ?
 		GROUP BY cr.rx_pubkey
 		ORDER BY COUNT(*) DESC

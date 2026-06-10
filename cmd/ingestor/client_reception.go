@@ -67,6 +67,26 @@ func handleClientPacket(store *Store, tag, rxPubkey string, msg map[string]inter
 	if _, err := store.InsertClientReception(rec); err != nil {
 		log.Printf("MQTT [%s] client_reception insert: %v", tag, err)
 	}
+	// Remember the companion's self-reported name (sent as "origin") so the
+	// leaderboard can show a name even if this companion never advertised.
+	if name := stringField(msg, "origin"); name != "" {
+		if err := store.UpsertClientObserver(rec.RxPubkey, name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			log.Printf("MQTT [%s] client_observer upsert: %v", tag, err)
+		}
+	}
+}
+
+// UpsertClientObserver records/updates a mobile client's self-reported name.
+// All writes live in the ingestor (read/write invariant #1283).
+func (s *Store) UpsertClientObserver(pubkey, name, ts string) error {
+	if pubkey == "" || name == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO client_observers (pubkey, name, last_seen) VALUES (?,?,?)
+		ON CONFLICT(pubkey) DO UPDATE SET name = excluded.name, last_seen = excluded.last_seen`,
+		strings.ToLower(pubkey), name, ts)
+	return err
 }
 
 // firstPresent returns the first present value among the given keys.

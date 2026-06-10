@@ -13,6 +13,7 @@ func seedCoverageDB(t *testing.T) *DB {
 	mustExecDB(t, db, `CREATE TABLE client_receptions (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, rx_pubkey TEXT, heard_key TEXT, heard_keylen INTEGER,
 		rssi INTEGER, snr REAL, lat REAL, lon REAL, pos_acc_m REAL, rx_at TEXT, ingested_at TEXT, src TEXT)`)
+	mustExecDB(t, db, `CREATE TABLE client_observers (pubkey TEXT PRIMARY KEY, name TEXT, last_seen TEXT)`)
 	return db
 }
 

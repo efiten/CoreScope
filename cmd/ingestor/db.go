@@ -247,6 +247,15 @@ func applySchema(db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_client_recept_heard ON client_receptions(heard_key);
 		CREATE INDEX IF NOT EXISTS idx_client_recept_rxpk ON client_receptions(rx_pubkey);
+
+		-- Self-reported name of each mobile client (companion), from the SELF_INFO
+		-- name the app sends as "origin". Lets the leaderboard show a name even
+		-- when the companion never advertised (so it isn't in the nodes table).
+		CREATE TABLE IF NOT EXISTS client_observers (
+			pubkey    TEXT PRIMARY KEY,
+			name      TEXT,
+			last_seen TEXT
+		);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)

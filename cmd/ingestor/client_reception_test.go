@@ -92,11 +92,18 @@ func TestHandleClientPacketAdvertWritesReception(t *testing.T) {
 		"raw":       advertHex,
 		"direction": "rx",
 		"timestamp": "2026-06-09T12:00:00Z",
+		"origin":    "MyMob",
 		"SNR":       -7.0,
 		"RSSI":      -92.0,
 		"gps":       map[string]interface{}{"lat": 51.05, "lon": 3.72, "acc_m": 8.0},
 	}
 	handleClientPacket(s, "test", "companionpk", msg, nil)
+
+	var obsName string
+	s.db.QueryRow(`SELECT name FROM client_observers WHERE pubkey='companionpk'`).Scan(&obsName)
+	if obsName != "MyMob" {
+		t.Fatalf("expected client_observers name 'MyMob', got %q", obsName)
+	}
 
 	// This fixture is a relayed advert (non-empty path), so by the capture HARD
 	// RULE we record the directly-heard LAST hop (multibyte), not the originator.
