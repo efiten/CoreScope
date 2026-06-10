@@ -66,11 +66,33 @@
     el.querySelectorAll('.rxb-row[data-rx]').forEach(function (r) {
       r.addEventListener('click', function () {
         selectedRx = r.dataset.rx; selectedName = r.dataset.name || '';
-        renderBoard(); drawCoverage(); syncHash();
+        renderBoard(); fitToObserver(); syncHash();
       });
     });
     var all = document.getElementById('rxAll');
     if (all) all.addEventListener('click', function () { selectedRx = ''; selectedName = ''; renderBoard(); drawCoverage(); syncHash(); });
+  }
+
+  // fitToObserver zooms the map to the selected observer's full coverage extent
+  // (fetched with a world bbox so it's independent of the current view), then the
+  // resulting moveend redraws the hexes at the fitted resolution.
+  function fitToObserver() {
+    if (!map || !selectedRx) { drawCoverage(); return; }
+    var url = '/api/rx-coverage?bbox=-90,-180,90,180&z=' + Math.max(8, map.getZoom()) + '&days=' + days + '&rx=' + encodeURIComponent(selectedRx);
+    fetch(url).then(function (r) { return r.json(); }).then(function (fc) {
+      if (destroyed || !map) return;
+      var minLat = 90, minLon = 180, maxLat = -90, maxLon = -180, any = false;
+      (fc.features || []).forEach(function (f) {
+        (f.geometry.coordinates[0] || []).forEach(function (c) {
+          any = true;
+          if (c[1] < minLat) minLat = c[1]; if (c[1] > maxLat) maxLat = c[1];
+          if (c[0] < minLon) minLon = c[0]; if (c[0] > maxLon) maxLon = c[0];
+        });
+      });
+      if (!any) { drawCoverage(); return; } // observer has no data in window → keep view
+      map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [30, 30], maxZoom: 15 });
+      drawCoverage(); // fitBounds may not fire moveend if the view is unchanged
+    }).catch(function () { drawCoverage(); });
   }
 
   function loadBoard() {
@@ -104,7 +126,7 @@
     map.on('moveend zoomend', drawCoverage);
     var bar = document.getElementById('rxDays');
     if (bar) bar.addEventListener('click', function (e) { var b = e.target.closest('button[data-days]'); if (b) setDays(+b.dataset.days); });
-    setTimeout(function () { if (!destroyed && map) { map.invalidateSize(); drawCoverage(); } }, 150);
+    setTimeout(function () { if (!destroyed && map) { map.invalidateSize(); if (selectedRx) fitToObserver(); else drawCoverage(); } }, 150);
     loadBoard();
   }
 
