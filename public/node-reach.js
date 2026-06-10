@@ -119,6 +119,7 @@
       '<div class="analytics-stats">' +
       statCard('Neighbours', imp.neighbor_degree, 'Distinct neighbours in the all-time neighbour graph (built only from advert first-hop + observer last-hop, geo-filtered).') +
       statCard('Rank', '#' + imp.degree_rank + ' / ' + imp.nodes_with_edges, 'Rank by neighbour count among all nodes that have edges. #1 = the most-connected node in the network.') +
+      statCard('Mobile RX', (d.mobile_rx_count || 0), 'Total packets from roaming mobile clients (CoreScope RX) that heard this node directly' + (d.mobile_rx_clients ? ', from ' + d.mobile_rx_clients + ' contributor(s).' : '.')) +
       '</div>' +
       '<div class="nq-group-h">Last ' + d.window.days + ' days</div>' +
       '<div class="analytics-stats">' +

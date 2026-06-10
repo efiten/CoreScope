@@ -121,6 +121,21 @@ func (s *Server) queryCoverageRows(pubkey string, b bbox) ([]coverageRow, error)
 	return out, rows.Err()
 }
 
+// mobileRxStats returns the total mobile-client receptions of a node (by its
+// 2-3 byte prefix or full pubkey) and the number of distinct contributing clients.
+func (s *Server) mobileRxStats(pubkey string) (count, clients int) {
+	if s.db == nil || s.db.conn == nil {
+		return 0, 0
+	}
+	pk := strings.ToLower(pubkey)
+	s.db.conn.QueryRow(`
+		SELECT COUNT(*), COUNT(DISTINCT rx_pubkey) FROM client_receptions
+		WHERE (heard_keylen = 32 AND heard_key = ?)
+		   OR (heard_keylen IN (2,3) AND substr(?, 1, heard_keylen*2) = heard_key)`,
+		pk, pk).Scan(&count, &clients)
+	return count, clients
+}
+
 // zoomToHexRes maps a Leaflet zoom level to a display hex resolution.
 func zoomToHexRes(z int) int {
 	switch {

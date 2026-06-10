@@ -170,6 +170,8 @@ type NodeReachResponse struct {
 	Importance      NodeReachImportance `json:"importance"`
 	DirectObservers []NodeReachObserver `json:"direct_observers"`
 	Links           []NodeReachLink     `json:"links"`
+	MobileRxCount   int                 `json:"mobile_rx_count"`   // total mobile-client receptions of this node (all-time)
+	MobileRxClients int                 `json:"mobile_rx_clients"` // distinct mobile clients that heard it
 }
 
 func fptr(v float64) *float64 { return &v }
@@ -262,6 +264,7 @@ func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
+	resp.MobileRxCount, resp.MobileRxClients = s.mobileRxStats(pubkey)
 	raw, _ := json.Marshal(resp)
 	reachCachePut(cacheKey, raw)
 	w.Header().Set("Content-Type", "application/json")
