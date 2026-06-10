@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -99,26 +98,7 @@ func (s *Server) queryCoverageRows(pubkey string, b bbox) ([]coverageRow, error)
 		return nil, err
 	}
 	defer rows.Close()
-	out := []coverageRow{}
-	for rows.Next() {
-		var lat, lon float64
-		var snr sql.NullFloat64
-		var rssi sql.NullInt64
-		if err := rows.Scan(&lat, &lon, &snr, &rssi); err != nil {
-			return nil, err
-		}
-		cr := coverageRow{Lat: lat, Lon: lon}
-		if snr.Valid {
-			v := snr.Float64
-			cr.SNR = &v
-		}
-		if rssi.Valid {
-			v := int(rssi.Int64)
-			cr.RSSI = &v
-		}
-		out = append(out, cr)
-	}
-	return out, rows.Err()
+	return scanCoverageRows(rows)
 }
 
 // mobileRxStats returns the total mobile-client receptions of a node (by its

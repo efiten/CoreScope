@@ -163,7 +163,7 @@
       if (covHandle) { try { covHandle.off(); } catch (e) {} covHandle = null; }
       if (qmap) { try { qmap.remove(); } catch (e) {} qmap = null; }
       if (window.NodeReachMap && n.lat != null) {
-        qmap = window.NodeReachMap.render('nqMap', n, list, colorVar);
+        qmap = window.NodeReachMap.render('nqMap', n, list, colorVar, { hideLines: coverageOn });
         if (coverageOn && qmap && window.NodeReachCoverage) {
           covHandle = window.NodeReachCoverage.addLayer(qmap, pubkey);
         }
