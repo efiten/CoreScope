@@ -4,6 +4,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/meshcore-analyzer/packetpath"
 )
 
 // handleClientPacket processes a packet from the mobile client RX topic
@@ -58,7 +60,7 @@ func handleClientPacket(store *Store, tag, rxPubkey string, msg map[string]inter
 
 	rec, ok := buildClientReception(
 		firstNonEmpty(rxPubkey, stringField(msg, "origin_id")),
-		direction, decoded.Path.Hops, decoded.Payload.PubKey, isAdvert,
+		direction, decoded.Header.RouteType, decoded.Path.Hops, decoded.Payload.PubKey, isAdvert,
 		snrPtr, rssiPtr, lat, lon, accPtr, rxAt, time.Now().UTC().Format(time.RFC3339),
 	)
 	if !ok {
@@ -127,16 +129,24 @@ type ClientReception struct {
 // deriveHeardKey applies the RX capture HARD RULE: record only what the
 // companion heard itself and directly.
 //   - direction must be "rx".
-//   - hops present → the directly-heard node is the LAST hop (path[len-1]);
-//     1-byte (2 hex char) prefixes are collision-prone and rejected.
+//   - hops present AND a FLOOD route → the directly-heard node is the LAST hop
+//     (path[len-1] = the forwarder that just transmitted; each FLOOD forwarder
+//     appends its hash to the end). 1-byte (2 hex char) prefixes are rejected.
+//   - hops present on a DIRECT route → NOT attributable: direct forwarders
+//     consume the next hop from the FRONT (firmware Mesh.cpp removeSelfFromPath),
+//     so path[len-1] is the route's destination-side end, not who was heard.
 //   - hops empty + isAdvert → the 0-hop advertiser, by its full pubkey.
 //   - otherwise → not attributable (ok=false).
+//
 // Returns (heardKey lowercased, keylenBytes, src, ok).
-func deriveHeardKey(direction string, hops []string, advertPubkey string, isAdvert bool) (string, int, string, bool) {
+func deriveHeardKey(direction string, routeType int, hops []string, advertPubkey string, isAdvert bool) (string, int, string, bool) {
 	if !strings.EqualFold(direction, "rx") {
 		return "", 0, "", false
 	}
 	if len(hops) > 0 {
+		if !packetpath.IsFloodRoute(routeType) { // direct route: path[last] is not the transmitter
+			return "", 0, "", false
+		}
 		last := strings.ToLower(strings.TrimSpace(hops[len(hops)-1]))
 		keylen := len(last) / 2
 		if keylen < 2 { // exclude 1-byte (collision-prone), matching Reach
@@ -154,7 +164,7 @@ func deriveHeardKey(direction string, hops []string, advertPubkey string, isAdve
 // buildClientReception validates inputs and assembles a ClientReception, or
 // returns ok=false when the packet is not attributable / out of range.
 func buildClientReception(
-	rxPubkey, direction string, hops []string, advertPubkey string, isAdvert bool,
+	rxPubkey, direction string, routeType int, hops []string, advertPubkey string, isAdvert bool,
 	snr *float64, rssi *int, lat, lon float64, posAccM *float64, rxAt, ingestedAt string,
 ) (*ClientReception, bool) {
 	if rxPubkey == "" || rxAt == "" {
@@ -163,7 +173,7 @@ func buildClientReception(
 	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
 		return nil, false
 	}
-	heardKey, keylen, src, ok := deriveHeardKey(direction, hops, advertPubkey, isAdvert)
+	heardKey, keylen, src, ok := deriveHeardKey(direction, routeType, hops, advertPubkey, isAdvert)
 	if !ok {
 		return nil, false
 	}

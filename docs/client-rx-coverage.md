@@ -60,9 +60,13 @@ Payload — meshcoretomqtt-compatible packet, plus a `gps` object:
 The app and ingestor record **only the node the companion physically received**, never upstream
 relayers:
 
-- Packet **with a path** (≥1 hop) → record `path[len-1]` (the last forwarder = the immediate RF
-  transmitter). Confirmed against firmware `Mesh.cpp` (a forwarder appends its own hash to the end
-  of the path) and CoreScope's `neighbor_builder.go:226-228`.
+- **FLOOD** packet **with a path** (≥1 hop) → record `path[len-1]` (the last forwarder = the
+  immediate RF transmitter). Confirmed against firmware `Mesh.cpp` (`routeRecvPacket` appends the
+  forwarder's hash to the END of the path) and CoreScope's `neighbor_builder.go:226-228`.
+- **DIRECT** packet **with a path** → **NOT attributable, discarded.** Direct forwarders consume the
+  next hop from the FRONT (`Mesh.cpp removeSelfFromPath`), so `path[len-1]` is the route's
+  destination-side end, NOT the node we heard. Attributing it credits the SNR to the wrong (often
+  far-away) node. Only FLOOD routes (0,1) are recorded from a path.
 - Packet **with no path** (0 hops) **and** an advert → record the advertiser's full pubkey.
 - `direction` must be `rx`. 1-byte (2 hex char) prefixes are excluded (collision-prone, like Reach).
 - The RSSI/SNR belong to the directly-received transmission, so they attach to the recorded node.

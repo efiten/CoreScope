@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/meshcore-analyzer/packetpath"
 )
 
 func TestClientReceptionsTableExists(t *testing.T) {
@@ -35,33 +37,44 @@ func crI(i int) *int         { return &i }
 
 func TestDeriveHeardKey(t *testing.T) {
 	full := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	k, l, src, ok := deriveHeardKey("rx", nil, strings.ToUpper(full), true)
+	k, l, src, ok := deriveHeardKey("rx", packetpath.RouteFlood, nil, strings.ToUpper(full), true)
 	if !ok || l != 32 || src != "advert" || k != full {
 		t.Fatalf("0-hop advert: got k=%q l=%d src=%q ok=%v", k, l, src, ok)
 	}
-	k, l, src, ok = deriveHeardKey("rx", []string{"aa", "bbccdd"}, "", false)
+	k, l, src, ok = deriveHeardKey("rx", packetpath.RouteFlood, []string{"aa", "bbccdd"}, "", false)
 	if !ok || k != "bbccdd" || l != 3 || src != "rxlog" {
-		t.Fatalf("path: got k=%q l=%d src=%q ok=%v", k, l, src, ok)
+		t.Fatalf("flood path: got k=%q l=%d src=%q ok=%v", k, l, src, ok)
 	}
-	if _, _, _, ok = deriveHeardKey("rx", []string{"aa", "bb"}, "", false); ok {
+	// DIRECT route: path[last] is the route's far end, not the transmitter — must be rejected.
+	if _, _, _, ok = deriveHeardKey("rx", packetpath.RouteDirect, []string{"aa", "bbccdd"}, "", false); ok {
+		t.Fatalf("direct-route path must be rejected")
+	}
+	if _, _, _, ok = deriveHeardKey("rx", packetpath.RouteTransportDirect, []string{"aa", "bbccdd"}, "", false); ok {
+		t.Fatalf("transport-direct-route path must be rejected")
+	}
+	if _, _, _, ok = deriveHeardKey("rx", packetpath.RouteFlood, []string{"aa", "bb"}, "", false); ok {
 		t.Fatalf("1-byte last hop should be rejected")
 	}
-	if _, _, _, ok = deriveHeardKey("tx", []string{"aabbcc"}, "", false); ok {
+	if _, _, _, ok = deriveHeardKey("tx", packetpath.RouteFlood, []string{"aabbcc"}, "", false); ok {
 		t.Fatalf("tx must be rejected")
 	}
-	if _, _, _, ok = deriveHeardKey("rx", nil, "", false); ok {
+	if _, _, _, ok = deriveHeardKey("rx", packetpath.RouteFlood, nil, "", false); ok {
 		t.Fatalf("no hops + non-advert must be rejected")
 	}
 }
 
 func TestBuildClientReception(t *testing.T) {
 	acc := 8.0
-	rec, ok := buildClientReception("companionpk", "rx", []string{"aa", "bbccdd"}, "", false,
+	rec, ok := buildClientReception("companionpk", "rx", packetpath.RouteFlood, []string{"aa", "bbccdd"}, "", false,
 		crF(-7.5), crI(-92), 51.05, 3.72, &acc, "2026-06-09T12:00:00Z", "2026-06-09T12:00:01Z")
 	if !ok || rec.HeardKey != "bbccdd" || rec.HeardKeyLen != 3 || rec.Src != "rxlog" {
 		t.Fatalf("bad reception: %+v ok=%v", rec, ok)
 	}
-	if _, ok := buildClientReception("c", "rx", []string{"bbccdd"}, "", false, nil, nil, 99.0, 3.72, nil, "t", "t"); ok {
+	if _, ok := buildClientReception("c", "rx", packetpath.RouteDirect, []string{"bbccdd"}, "", false,
+		crF(-7.5), crI(-92), 51.05, 3.72, nil, "t", "t"); ok {
+		t.Fatal("direct-route path must be rejected (not the transmitter)")
+	}
+	if _, ok := buildClientReception("c", "rx", packetpath.RouteFlood, []string{"bbccdd"}, "", false, nil, nil, 99.0, 3.72, nil, "t", "t"); ok {
 		t.Fatal("out-of-range lat must be rejected")
 	}
 }
