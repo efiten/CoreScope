@@ -116,21 +116,18 @@ func (s *Server) mobileRxStats(pubkey string) (count, clients int) {
 	return count, clients
 }
 
-// zoomToHexRes maps a Leaflet zoom level to a display hex resolution.
+// zoomToHexRes maps a Leaflet zoom level to the display resolution used for hex
+// binning. Resolution == zoom (clamped to a sane range) so hex size tracks the map
+// scale 1:1 and renders at a constant ~hexTargetPx (see hexSizeForRes). The clamp also
+// guards the missing-param case (z parses to 0).
 func zoomToHexRes(z int) int {
 	switch {
-	case z >= 15:
-		return 11
-	case z >= 13:
-		return 10
-	case z >= 11:
-		return 9
-	case z >= 9:
-		return 8
-	case z >= 7:
-		return 7
+	case z < 3:
+		return 3
+	case z > 18:
+		return 18
 	default:
-		return 6
+		return z
 	}
 }
 

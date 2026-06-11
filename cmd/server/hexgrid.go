@@ -15,6 +15,14 @@ import (
 
 const hexEarthRadius = 6378137.0 // Web Mercator sphere radius (m)
 
+// hexTargetPx is the desired on-screen hex size (point-to-point height) in CSS
+// pixels. mercUPPZ0 is Web Mercator units per pixel at zoom 0 (world span / 256);
+// Leaflet halves it each zoom level, independent of latitude. Sizing the hex in
+// these units therefore renders it at a constant ~hexTargetPx at every zoom — the
+// old fixed-meter buckets looked like specks when zoomed out (issue: hexes too small).
+const hexTargetPx = 28.0
+const mercUPPZ0 = 156543.03392
+
 func hexMercator(lat, lon float64) (float64, float64) {
 	x := hexEarthRadius * lon * math.Pi / 180
 	y := hexEarthRadius * math.Log(math.Tan(math.Pi/4+lat*math.Pi/360))
@@ -27,22 +35,13 @@ func hexInvMercator(x, y float64) (lat, lon float64) {
 	return lat, lon
 }
 
-// hexSizeForRes is the hex circumradius (center→corner) in meters per resolution.
+// hexSizeForRes is the hex circumradius (center→corner) in Web Mercator units for a
+// display resolution. Resolution equals the Leaflet zoom level (see zoomToHexRes), so
+// the size scales as 2^-zoom and the hex keeps a constant ~hexTargetPx on-screen size
+// regardless of zoom. hexCellAt (binning) and hexBoundary (drawing) both read this, so
+// they stay consistent for a given cell id.
 func hexSizeForRes(res int) float64 {
-	switch {
-	case res >= 11:
-		return 40
-	case res == 10:
-		return 90
-	case res == 9:
-		return 180
-	case res == 8:
-		return 360
-	case res == 7:
-		return 720
-	default:
-		return 1500
-	}
+	return (hexTargetPx / 2) * mercUPPZ0 / math.Pow(2, float64(res))
 }
 
 // hexCellAt returns a stable cell id ("res:q:r") for the lat/lon at res.
