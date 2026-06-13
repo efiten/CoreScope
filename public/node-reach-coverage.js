@@ -5,12 +5,13 @@
 'use strict';
 (function () {
   // coverageColorVar maps a GeoJSON feature's properties to a CSS variable name.
-  // Grey = received but no signal metric; otherwise green→orange by best SNR.
+  // Grey = received but no signal metric; otherwise SF8 SNR thresholds: ≥ −5 green
+  // (good margin), −9..−5 orange (near the limit), < −9 red (packet loss likely).
   function coverageColorVar(props) {
     if (!props || !props.has_sig || props.best_snr == null) return '--nq-cov-grey';
     var s = Number(props.best_snr);
-    if (s >= -6) return '--nq-cov-strong';
-    if (s >= -14) return '--nq-cov-mid';
+    if (s >= -5) return '--nq-cov-strong';
+    if (s >= -9) return '--nq-cov-mid';
     return '--nq-cov-weak';
   }
 

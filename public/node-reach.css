@@ -9,10 +9,10 @@
 
 /* RX coverage hex layer (mobile client receptions) */
 :root {
-  --nq-cov-strong: #2ecc71;
-  --nq-cov-mid: #f1c40f;
-  --nq-cov-weak: #e67e22;
-  --nq-cov-grey: #95a5a6;
+  --nq-cov-strong: #2ecc71; /* SF8: SNR ≥ −5 dB  (good margin) */
+  --nq-cov-mid: #e67e22;    /* SF8: −9..−5 dB    (near the limit) */
+  --nq-cov-weak: #e74c3c;   /* SF8: < −9 dB      (poor, packet loss likely) */
+  --nq-cov-grey: #95a5a6;   /* heard, no SNR metric */
 }
 .nq-cov-legend { display:flex; gap:12px; align-items:center; font-size:11px; color:var(--text-muted, #57606a); margin:4px 0 10px; }
 .nq-cov-legend i { width:12px; height:12px; border-radius:2px; display:inline-block; margin-right:4px; vertical-align:middle; }

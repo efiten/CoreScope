@@ -12,11 +12,13 @@
     try { return getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || '#888'; }
     catch (e) { return '#888'; }
   }
+  // SF8 SNR thresholds: ≥ −5 good margin, −9..−5 near the limit, < −9 packet loss
+  // likely. Grey = heard but no SNR metric.
   function colorVar(p) {
     if (!p || !p.has_sig || p.best_snr == null) return '--nq-cov-grey';
     var s = Number(p.best_snr);
-    if (s >= -6) return '--nq-cov-strong';
-    if (s >= -14) return '--nq-cov-mid';
+    if (s >= -5) return '--nq-cov-strong';
+    if (s >= -9) return '--nq-cov-mid';
     return '--nq-cov-weak';
   }
 
