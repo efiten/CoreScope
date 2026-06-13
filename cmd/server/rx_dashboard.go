@@ -9,17 +9,18 @@ import (
 	"time"
 )
 
-// scanCoverageRows reads (lat,lon,snr,rssi) rows into coverageRow values.
+// scanCoverageRows reads (lat,lon,snr,rssi,heard_key,rx_at) rows into coverageRow values.
 func scanCoverageRows(rows *sql.Rows) ([]coverageRow, error) {
 	out := []coverageRow{}
 	for rows.Next() {
 		var lat, lon float64
 		var snr sql.NullFloat64
 		var rssi sql.NullInt64
-		if err := rows.Scan(&lat, &lon, &snr, &rssi); err != nil {
+		var heardKey, rxAt sql.NullString
+		if err := rows.Scan(&lat, &lon, &snr, &rssi, &heardKey, &rxAt); err != nil {
 			return nil, err
 		}
-		cr := coverageRow{Lat: lat, Lon: lon}
+		cr := coverageRow{Lat: lat, Lon: lon, HeardKey: strings.ToLower(heardKey.String), RxAt: rxAt.String}
 		if snr.Valid {
 			v := snr.Float64
 			cr.SNR = &v
@@ -31,6 +32,54 @@ func scanCoverageRows(rows *sql.Rows) ([]coverageRow, error) {
 		out = append(out, cr)
 	}
 	return out, rows.Err()
+}
+
+// resolveCoverageNames fills CoverageNode.Name by resolving each heard_key prefix to a
+// unique node name (empty when the prefix is unknown or shared by multiple nodes).
+// Distinct prefixes are resolved once and cached for the request. heard_key may be a
+// 2-3 byte prefix or a full pubkey; the LIKE is anchored on the public_key primary key.
+func (s *Server) resolveCoverageNames(fc *CoverageFeatureCollection) {
+	if s.db == nil || s.db.conn == nil {
+		return
+	}
+	cache := map[string]string{}
+	for fi := range fc.Features {
+		nodes := fc.Features[fi].Properties.Nodes
+		for ni := range nodes {
+			pfx := nodes[ni].Prefix
+			name, seen := cache[pfx]
+			if !seen {
+				name = s.resolveHeardName(pfx)
+				cache[pfx] = name
+			}
+			fc.Features[fi].Properties.Nodes[ni].Name = name
+		}
+	}
+}
+
+// resolveHeardName returns the node name for a heard_key prefix, or "" when unknown
+// or ambiguous (>1 match). LIMIT 2 is enough to tell unique from ambiguous.
+func (s *Server) resolveHeardName(prefix string) string {
+	if prefix == "" || !hexPrefixRe.MatchString(prefix) {
+		return ""
+	}
+	rows, err := s.db.conn.Query(`SELECT COALESCE(name,'') FROM nodes WHERE public_key LIKE ? LIMIT 2`, prefix+"%")
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return ""
+		}
+		names = append(names, n)
+	}
+	if len(names) == 1 {
+		return names[0]
+	}
+	return ""
 }
 
 // queryCoverageFiltered returns coverage rows within a bbox, optionally filtered
@@ -53,7 +102,7 @@ func (s *Server) queryCoverageFiltered(node, rx string, days int, b bbox) ([]cov
 		where = append(where, "rx_at >= ?")
 		args = append(args, since)
 	}
-	rows, err := s.db.conn.Query("SELECT lat, lon, snr, rssi FROM client_receptions WHERE "+strings.Join(where, " AND "), args...)
+	rows, err := s.db.conn.Query("SELECT lat, lon, snr, rssi, heard_key, rx_at FROM client_receptions WHERE "+strings.Join(where, " AND "), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -80,8 +129,10 @@ func (s *Server) handleRxCoverage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "query failed", http.StatusInternalServerError)
 		return
 	}
+	fc := aggregateCoverage(rows, zoomToHexRes(z))
+	s.resolveCoverageNames(&fc) // fill per-cell node names (matches the per-node endpoint)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(aggregateCoverage(rows, zoomToHexRes(z)))
+	json.NewEncoder(w).Encode(fc)
 }
 
 // --- Leaderboard (top mobile observers) ---

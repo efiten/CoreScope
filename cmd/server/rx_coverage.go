@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,8 @@ type coverageRow struct {
 	Lat, Lon float64
 	SNR      *float64
 	RSSI     *int
+	HeardKey string // directly-heard node key (2-3 byte prefix or full pubkey), lowercase
+	RxAt     string // reception time (RFC3339); used to pick the latest SNR per node
 }
 
 // GeoJSON output (named structs, no map[string]interface{} — AGENTS.md).
@@ -31,16 +34,34 @@ type CoveragePolygon struct {
 	Coordinates [][][2]float64   `json:"coordinates"` // one ring: [ [ [lon,lat], ... ] ]
 }
 type CoverageProperties struct {
-	Cell    string   `json:"cell"`
-	Count   int      `json:"count"`
-	BestSNR *float64 `json:"best_snr"`
-	HasSig  bool     `json:"has_sig"` // false → render grey (no signal metric)
+	Cell    string         `json:"cell"`
+	Count   int            `json:"count"`
+	BestSNR *float64       `json:"best_snr"`
+	HasSig  bool           `json:"has_sig"` // false → render grey (no signal metric)
+	Nodes   []CoverageNode `json:"nodes"`   // per-node breakdown, strongest latest-SNR first
+}
+
+// CoverageNode is one directly-heard node within a cell, with its latest SNR.
+type CoverageNode struct {
+	Prefix string   `json:"prefix"`         // heard_key (resolved to Name when unique)
+	Name   string   `json:"name,omitempty"` // node name, empty if unknown/ambiguous prefix
+	SNR    *float64 `json:"snr"`            // latest SNR (by rx_at); nil → heard without signal
+	Count  int      `json:"count"`
 }
 
 type covAgg struct {
 	count   int
 	bestSNR *float64
 	hasSig  bool
+	nodes   map[string]*covNodeAgg
+}
+
+// covNodeAgg tracks, per directly-heard node within a cell, its reception count and
+// the SNR of its most recent reception (by rx_at).
+type covNodeAgg struct {
+	count     int
+	latestAt  string
+	latestSNR *float64
 }
 
 // aggregateCoverage bins raw rows into display-resolution hex cells, keeping the
@@ -62,6 +83,22 @@ func aggregateCoverage(rows []coverageRow, res int) CoverageFeatureCollection {
 				a.bestSNR = &v
 			}
 		}
+		if row.HeardKey != "" {
+			if a.nodes == nil {
+				a.nodes = map[string]*covNodeAgg{}
+			}
+			na := a.nodes[row.HeardKey]
+			if na == nil {
+				na = &covNodeAgg{}
+				a.nodes[row.HeardKey] = na
+			}
+			na.count++
+			// rx_at is RFC3339, so lexical >= is chronological; keep the latest SNR.
+			if na.count == 1 || row.RxAt >= na.latestAt {
+				na.latestAt = row.RxAt
+				na.latestSNR = row.SNR
+			}
+		}
 	}
 	fc := CoverageFeatureCollection{Type: "FeatureCollection", Features: []CoverageFeature{}}
 	for cell, a := range byCell {
@@ -74,10 +111,35 @@ func aggregateCoverage(rows []coverageRow, res int) CoverageFeatureCollection {
 			Geometry: CoveragePolygon{Type: "Polygon", Coordinates: [][][2]float64{ring}},
 			Properties: CoverageProperties{
 				Cell: cell, Count: a.count, BestSNR: a.bestSNR, HasSig: a.hasSig,
+				Nodes: sortedCoverageNodes(a.nodes),
 			},
 		})
 	}
 	return fc
+}
+
+// sortedCoverageNodes flattens the per-node aggregates into a slice sorted by latest
+// SNR descending (nodes heard without a signal sort last), tie-broken by count then
+// prefix for a stable order. Names are filled in later by the handler.
+func sortedCoverageNodes(m map[string]*covNodeAgg) []CoverageNode {
+	out := make([]CoverageNode, 0, len(m))
+	for prefix, na := range m {
+		out = append(out, CoverageNode{Prefix: prefix, SNR: na.latestSNR, Count: na.count})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		si, sj := out[i].SNR, out[j].SNR
+		if (si == nil) != (sj == nil) {
+			return si != nil // signal before no-signal
+		}
+		if si != nil && *si != *sj {
+			return *si > *sj
+		}
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Prefix < out[j].Prefix
+	})
+	return out
 }
 
 type bbox struct{ MinLat, MinLon, MaxLat, MaxLon float64 }
@@ -88,7 +150,7 @@ type bbox struct{ MinLat, MinLon, MaxLat, MaxLon float64 }
 func (s *Server) queryCoverageRows(pubkey string, b bbox) ([]coverageRow, error) {
 	pk := strings.ToLower(pubkey)
 	rows, err := s.db.conn.Query(`
-		SELECT lat, lon, snr, rssi
+		SELECT lat, lon, snr, rssi, heard_key, rx_at
 		FROM client_receptions
 		WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?
 		  AND ( (heard_keylen = 32 AND heard_key = ?)
@@ -166,6 +228,7 @@ func (s *Server) handleNodeRxCoverage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fc := aggregateCoverage(rows, zoomToHexRes(z))
+	s.resolveCoverageNames(&fc)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(fc)
 }

@@ -34,6 +34,31 @@
       '</div>';
   }
 
+  // coverageNodeRow renders one heard node: name (or heard_key prefix) + latest SNR + count.
+  function coverageNodeRow(n) {
+    var label = n.name ? escapeHtml(n.name) : '<code>' + escapeHtml(n.prefix || '?') + '</code>';
+    var snr = (n.snr != null) ? Number(n.snr).toFixed(1) + ' dB' : 'no sig';
+    return '<div style="display:flex;gap:8px;justify-content:space-between;font-size:12px;line-height:1.6">' +
+      '<span>' + label + '</span>' +
+      '<span style="color:var(--text-muted)">' + snr + ' · ×' + n.count + '</span></div>';
+  }
+
+  // coverageNodesHtml lists the nodes directly heard in a cell (properties.nodes:
+  // {prefix, name, snr, count}, strongest latest-SNR first). cap > 0 truncates with a
+  // "+N more — click" hint (hover tooltip); cap 0 shows the full list (click popup).
+  function coverageNodesHtml(p, cap) {
+    var nodes = (p && p.nodes) || [];
+    var head = '<div style="font-weight:600;margin-bottom:4px">' +
+      nodes.length + (nodes.length === 1 ? ' node heard here' : ' nodes heard here') + '</div>';
+    if (!nodes.length) return head + '<div style="color:var(--text-muted)">n=' + (p ? p.count : 0) + '</div>';
+    var shown = (cap > 0) ? nodes.slice(0, cap) : nodes;
+    var rows = shown.map(coverageNodeRow).join('');
+    var more = (cap > 0 && nodes.length > cap)
+      ? '<div style="color:var(--text-muted);font-size:11px;margin-top:3px">+' + (nodes.length - cap) + ' more — click</div>'
+      : '';
+    return head + '<div style="max-height:200px;overflow:auto;min-width:180px">' + rows + '</div>' + more;
+  }
+
   function drawCoverage() {
     if (!map || destroyed) return;
     var b = map.getBounds();
@@ -46,7 +71,8 @@
         var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
         var col = cssColor(colorVar(f.properties));
         L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: 0.45 }).addTo(covLayer)
-          .bindTooltip('n=' + f.properties.count + (f.properties.best_snr != null ? ' · SNR ' + f.properties.best_snr : ' · no signal'));
+          .bindTooltip(coverageNodesHtml(f.properties, 10))
+          .bindPopup(coverageNodesHtml(f.properties, 0));
       });
     }).catch(function () {});
   }

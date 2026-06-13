@@ -35,6 +35,59 @@ func TestAggregateCoverageGreyWhenNoSignal(t *testing.T) {
 	}
 }
 
+// TestAggregateCoverageNodeBreakdown covers the per-cell node list: each heard node
+// keeps its latest SNR (by rx_at) and reception count, sorted strongest-first with
+// heard-without-signal nodes last.
+func TestAggregateCoverageNodeBreakdown(t *testing.T) {
+	rows := []coverageRow{
+		// node A: two receptions; the later one (t2) has the weaker SNR -10.
+		{Lat: 51.05, Lon: 3.72, SNR: covF(-4), HeardKey: "aabb", RxAt: "2026-06-01T10:00:00Z"},
+		{Lat: 51.05001, Lon: 3.72001, SNR: covF(-10), HeardKey: "aabb", RxAt: "2026-06-02T10:00:00Z"},
+		// node B: single reception, strongest latest SNR.
+		{Lat: 51.05, Lon: 3.72, SNR: covF(-6), HeardKey: "ccdd", RxAt: "2026-06-01T10:00:00Z"},
+		// node C: heard without a signal metric.
+		{Lat: 51.05, Lon: 3.72, HeardKey: "eeff", RxAt: "2026-06-01T10:00:00Z"},
+	}
+	fc := aggregateCoverage(rows, 9)
+	if len(fc.Features) != 1 {
+		t.Fatalf("expected 1 cell, got %d", len(fc.Features))
+	}
+	nodes := fc.Features[0].Properties.Nodes
+	if len(nodes) != 3 {
+		t.Fatalf("expected 3 nodes, got %d (%+v)", len(nodes), nodes)
+	}
+	if nodes[0].Prefix != "ccdd" || nodes[0].SNR == nil || *nodes[0].SNR != -6 {
+		t.Errorf("node[0] want ccdd@-6 (strongest), got %+v", nodes[0])
+	}
+	if nodes[1].Prefix != "aabb" || nodes[1].SNR == nil || *nodes[1].SNR != -10 || nodes[1].Count != 2 {
+		t.Errorf("node[1] want aabb latest -10 count 2, got %+v", nodes[1])
+	}
+	if nodes[2].Prefix != "eeff" || nodes[2].SNR != nil {
+		t.Errorf("node[2] want eeff no-signal (last), got %+v", nodes[2])
+	}
+}
+
+// TestResolveHeardName covers prefix→name resolution: unique match resolves, an
+// ambiguous prefix (>1 node) and an unknown/empty prefix resolve to "".
+func TestResolveHeardName(t *testing.T) {
+	db := seedCoverageDB(t)
+	mustExecDB(t, db, `INSERT INTO nodes (public_key,name,role) VALUES ('aabbccdd11223344','Alice','repeater')`)
+	mustExecDB(t, db, `INSERT INTO nodes (public_key,name,role) VALUES ('aabbcc99887766aa','Bob','repeater')`)
+	srv := &Server{db: db}
+	if got := srv.resolveHeardName("aabbccdd"); got != "Alice" {
+		t.Errorf("unique prefix → Alice, got %q", got)
+	}
+	if got := srv.resolveHeardName("aabbcc"); got != "" {
+		t.Errorf("ambiguous prefix → \"\", got %q", got)
+	}
+	if got := srv.resolveHeardName("ffff"); got != "" {
+		t.Errorf("unknown prefix → \"\", got %q", got)
+	}
+	if got := srv.resolveHeardName(""); got != "" {
+		t.Errorf("empty prefix → \"\", got %q", got)
+	}
+}
+
 func TestZoomToHexRes(t *testing.T) {
 	// Resolution tracks zoom 1:1 within [3,18], clamped at the edges (z=0 is the
 	// missing-param case).
