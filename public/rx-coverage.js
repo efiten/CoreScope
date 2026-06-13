@@ -45,13 +45,19 @@
 
   // coverageNodesHtml lists the nodes directly heard in a cell (properties.nodes:
   // {prefix, name, snr, count}, strongest latest-SNR first; prefix shown when the
-  // name is unresolved). Rendered in the hover tooltip — full list, no truncation.
+  // name is unresolved). Rendered in the hover tooltip; capped at 10 rows with a
+  // "(N more)" footer so dense cells don't produce an unwieldy tooltip.
+  var COVERAGE_NODE_CAP = 10;
   function coverageNodesHtml(p) {
     var nodes = (p && p.nodes) || [];
     var head = '<div style="font-weight:600;margin-bottom:4px">' +
       nodes.length + (nodes.length === 1 ? ' node heard here' : ' nodes heard here') + '</div>';
     if (!nodes.length) return head + '<div style="color:var(--text-muted)">n=' + (p ? p.count : 0) + '</div>';
-    return head + '<div style="min-width:180px">' + nodes.map(coverageNodeRow).join('') + '</div>';
+    var rows = nodes.slice(0, COVERAGE_NODE_CAP).map(coverageNodeRow).join('');
+    var more = (nodes.length > COVERAGE_NODE_CAP)
+      ? '<div style="color:var(--text-muted);font-size:11px;margin-top:3px">(' + (nodes.length - COVERAGE_NODE_CAP) + ' more)</div>'
+      : '';
+    return head + '<div style="min-width:180px">' + rows + '</div>' + more;
   }
 
   function drawCoverage() {
