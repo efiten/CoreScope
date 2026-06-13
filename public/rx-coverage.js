@@ -44,19 +44,14 @@
   }
 
   // coverageNodesHtml lists the nodes directly heard in a cell (properties.nodes:
-  // {prefix, name, snr, count}, strongest latest-SNR first). cap > 0 truncates with a
-  // "+N more — click" hint (hover tooltip); cap 0 shows the full list (click popup).
-  function coverageNodesHtml(p, cap) {
+  // {prefix, name, snr, count}, strongest latest-SNR first; prefix shown when the
+  // name is unresolved). Rendered in the hover tooltip — full list, no truncation.
+  function coverageNodesHtml(p) {
     var nodes = (p && p.nodes) || [];
     var head = '<div style="font-weight:600;margin-bottom:4px">' +
       nodes.length + (nodes.length === 1 ? ' node heard here' : ' nodes heard here') + '</div>';
     if (!nodes.length) return head + '<div style="color:var(--text-muted)">n=' + (p ? p.count : 0) + '</div>';
-    var shown = (cap > 0) ? nodes.slice(0, cap) : nodes;
-    var rows = shown.map(coverageNodeRow).join('');
-    var more = (cap > 0 && nodes.length > cap)
-      ? '<div style="color:var(--text-muted);font-size:11px;margin-top:3px">+' + (nodes.length - cap) + ' more — click</div>'
-      : '';
-    return head + '<div style="max-height:200px;overflow:auto;min-width:180px">' + rows + '</div>' + more;
+    return head + '<div style="min-width:180px">' + nodes.map(coverageNodeRow).join('') + '</div>';
   }
 
   function drawCoverage() {
@@ -71,8 +66,7 @@
         var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
         var col = cssColor(colorVar(f.properties));
         L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: 0.45 }).addTo(covLayer)
-          .bindTooltip(coverageNodesHtml(f.properties, 10))
-          .bindPopup(coverageNodesHtml(f.properties, 0));
+          .bindTooltip(coverageNodesHtml(f.properties));
       });
     }).catch(function () {});
   }

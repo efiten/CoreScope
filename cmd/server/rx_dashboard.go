@@ -34,52 +34,50 @@ func scanCoverageRows(rows *sql.Rows) ([]coverageRow, error) {
 	return out, rows.Err()
 }
 
-// resolveCoverageNames fills CoverageNode.Name by resolving each heard_key prefix to a
-// unique node name (empty when the prefix is unknown or shared by multiple nodes).
-// Distinct prefixes are resolved once and cached for the request. heard_key may be a
-// 2-3 byte prefix or a full pubkey; the LIKE is anchored on the public_key primary key.
-func (s *Server) resolveCoverageNames(fc *CoverageFeatureCollection) {
+// heardKeyResolver returns a request-scoped, memoized nodeResolver. It maps a heard_key
+// to (pubkey, name) on a unique match — so the same node heard under different prefix
+// lengths collapses into one entry — and to (heardKey, "") when unknown or ambiguous.
+func (s *Server) heardKeyResolver() nodeResolver {
 	if s.db == nil || s.db.conn == nil {
-		return
+		return nil
 	}
-	cache := map[string]string{}
-	for fi := range fc.Features {
-		nodes := fc.Features[fi].Properties.Nodes
-		for ni := range nodes {
-			pfx := nodes[ni].Prefix
-			name, seen := cache[pfx]
-			if !seen {
-				name = s.resolveHeardName(pfx)
-				cache[pfx] = name
-			}
-			fc.Features[fi].Properties.Nodes[ni].Name = name
+	type kv struct{ key, name string }
+	cache := map[string]kv{}
+	return func(heardKey string) (string, string) {
+		if v, ok := cache[heardKey]; ok {
+			return v.key, v.name
 		}
+		key, name := s.resolveHeardKey(heardKey)
+		cache[heardKey] = kv{key, name}
+		return key, name
 	}
 }
 
-// resolveHeardName returns the node name for a heard_key prefix, or "" when unknown
-// or ambiguous (>1 match). LIMIT 2 is enough to tell unique from ambiguous.
-func (s *Server) resolveHeardName(prefix string) string {
-	if prefix == "" || !hexPrefixRe.MatchString(prefix) {
-		return ""
+// resolveHeardKey resolves a heard_key (2-3 byte prefix or full pubkey) to a canonical
+// (pubkey, name) on a unique match. Unknown or ambiguous (>1 match) keys return the
+// heard_key itself with an empty name. LIMIT 2 is enough to tell unique from ambiguous.
+func (s *Server) resolveHeardKey(heardKey string) (string, string) {
+	if heardKey == "" || !hexPrefixRe.MatchString(heardKey) {
+		return heardKey, ""
 	}
-	rows, err := s.db.conn.Query(`SELECT COALESCE(name,'') FROM nodes WHERE public_key LIKE ? LIMIT 2`, prefix+"%")
+	rows, err := s.db.conn.Query(`SELECT public_key, COALESCE(name,'') FROM nodes WHERE public_key LIKE ? LIMIT 2`, heardKey+"%")
 	if err != nil {
-		return ""
+		return heardKey, ""
 	}
 	defer rows.Close()
-	var names []string
+	var pks, names []string
 	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			return ""
+		var pk, n string
+		if err := rows.Scan(&pk, &n); err != nil {
+			return heardKey, ""
 		}
+		pks = append(pks, pk)
 		names = append(names, n)
 	}
-	if len(names) == 1 {
-		return names[0]
+	if len(pks) == 1 {
+		return pks[0], names[0]
 	}
-	return ""
+	return heardKey, ""
 }
 
 // queryCoverageFiltered returns coverage rows within a bbox, optionally filtered
@@ -129,8 +127,7 @@ func (s *Server) handleRxCoverage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "query failed", http.StatusInternalServerError)
 		return
 	}
-	fc := aggregateCoverage(rows, zoomToHexRes(z))
-	s.resolveCoverageNames(&fc) // fill per-cell node names (matches the per-node endpoint)
+	fc := aggregateCoverage(rows, zoomToHexRes(z), s.heardKeyResolver())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(fc)
 }

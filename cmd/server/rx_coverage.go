@@ -57,16 +57,26 @@ type covAgg struct {
 }
 
 // covNodeAgg tracks, per directly-heard node within a cell, its reception count and
-// the SNR of its most recent reception (by rx_at).
+// the SNR of its most recent reception (by rx_at). name/prefix are the resolved node
+// name (when known) and a display prefix fallback.
 type covNodeAgg struct {
 	count     int
 	latestAt  string
 	latestSNR *float64
+	name      string
+	prefix    string
 }
 
+// nodeResolver maps a heard_key (2-3 byte prefix or full pubkey) to a canonical
+// identity key and a display name. A unique match returns (pubkey, name) so the same
+// node heard under different prefix lengths collapses into one bucket; unknown or
+// ambiguous keys return (heardKey, "") and stay distinct. nil disables resolution.
+type nodeResolver func(heardKey string) (key, name string)
+
 // aggregateCoverage bins raw rows into display-resolution hex cells, keeping the
-// best (max) SNR per cell, and emits GeoJSON polygons.
-func aggregateCoverage(rows []coverageRow, res int) CoverageFeatureCollection {
+// best (max) SNR per cell, and emits GeoJSON polygons. resolve (may be nil) collapses
+// per-node receptions by resolved node identity.
+func aggregateCoverage(rows []coverageRow, res int, resolve nodeResolver) CoverageFeatureCollection {
 	byCell := map[string]*covAgg{}
 	for _, row := range rows {
 		cell := hexCellAt(row.Lat, row.Lon, res)
@@ -87,10 +97,19 @@ func aggregateCoverage(rows []coverageRow, res int) CoverageFeatureCollection {
 			if a.nodes == nil {
 				a.nodes = map[string]*covNodeAgg{}
 			}
-			na := a.nodes[row.HeardKey]
+			key, name := row.HeardKey, ""
+			if resolve != nil {
+				if k, n := resolve(row.HeardKey); k != "" {
+					key, name = k, n
+				}
+			}
+			na := a.nodes[key]
 			if na == nil {
-				na = &covNodeAgg{}
-				a.nodes[row.HeardKey] = na
+				na = &covNodeAgg{prefix: row.HeardKey, name: name}
+				a.nodes[key] = na
+			}
+			if name != "" {
+				na.name = name
 			}
 			na.count++
 			// rx_at is RFC3339, so lexical >= is chronological; keep the latest SNR.
@@ -120,11 +139,11 @@ func aggregateCoverage(rows []coverageRow, res int) CoverageFeatureCollection {
 
 // sortedCoverageNodes flattens the per-node aggregates into a slice sorted by latest
 // SNR descending (nodes heard without a signal sort last), tie-broken by count then
-// prefix for a stable order. Names are filled in later by the handler.
+// prefix for a stable order.
 func sortedCoverageNodes(m map[string]*covNodeAgg) []CoverageNode {
 	out := make([]CoverageNode, 0, len(m))
-	for prefix, na := range m {
-		out = append(out, CoverageNode{Prefix: prefix, SNR: na.latestSNR, Count: na.count})
+	for _, na := range m {
+		out = append(out, CoverageNode{Prefix: na.prefix, Name: na.name, SNR: na.latestSNR, Count: na.count})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		si, sj := out[i].SNR, out[j].SNR
@@ -227,8 +246,7 @@ func (s *Server) handleNodeRxCoverage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "query failed", http.StatusInternalServerError)
 		return
 	}
-	fc := aggregateCoverage(rows, zoomToHexRes(z))
-	s.resolveCoverageNames(&fc)
+	fc := aggregateCoverage(rows, zoomToHexRes(z), s.heardKeyResolver())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(fc)
 }

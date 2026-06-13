@@ -13,7 +13,7 @@ func TestAggregateCoverageBucketsBestSNR(t *testing.T) {
 		{Lat: 51.05000, Lon: 3.72000, SNR: covF(-12)},
 		{Lat: 51.05001, Lon: 3.72001, SNR: covF(-6)}, // same cell, stronger
 	}
-	fc := aggregateCoverage(rows, 9)
+	fc := aggregateCoverage(rows, 9, nil)
 	if len(fc.Features) != 1 {
 		t.Fatalf("expected 1 cell, got %d", len(fc.Features))
 	}
@@ -29,7 +29,7 @@ func TestAggregateCoverageBucketsBestSNR(t *testing.T) {
 }
 
 func TestAggregateCoverageGreyWhenNoSignal(t *testing.T) {
-	fc := aggregateCoverage([]coverageRow{{Lat: 51.05, Lon: 3.72}}, 9)
+	fc := aggregateCoverage([]coverageRow{{Lat: 51.05, Lon: 3.72}}, 9, nil)
 	if len(fc.Features) != 1 || fc.Features[0].Properties.HasSig {
 		t.Fatalf("expected one grey (no-sig) cell, got %+v", fc.Features)
 	}
@@ -48,7 +48,7 @@ func TestAggregateCoverageNodeBreakdown(t *testing.T) {
 		// node C: heard without a signal metric.
 		{Lat: 51.05, Lon: 3.72, HeardKey: "eeff", RxAt: "2026-06-01T10:00:00Z"},
 	}
-	fc := aggregateCoverage(rows, 9)
+	fc := aggregateCoverage(rows, 9, nil)
 	if len(fc.Features) != 1 {
 		t.Fatalf("expected 1 cell, got %d", len(fc.Features))
 	}
@@ -67,24 +67,49 @@ func TestAggregateCoverageNodeBreakdown(t *testing.T) {
 	}
 }
 
-// TestResolveHeardName covers prefix→name resolution: unique match resolves, an
-// ambiguous prefix (>1 node) and an unknown/empty prefix resolve to "".
-func TestResolveHeardName(t *testing.T) {
+// TestResolveHeardKey covers heard_key → (pubkey, name) resolution: a unique match
+// returns the canonical pubkey + name; an ambiguous prefix (>1 node) and an
+// unknown/empty key return the key itself with an empty name.
+func TestResolveHeardKey(t *testing.T) {
 	db := seedCoverageDB(t)
 	mustExecDB(t, db, `INSERT INTO nodes (public_key,name,role) VALUES ('aabbccdd11223344','Alice','repeater')`)
 	mustExecDB(t, db, `INSERT INTO nodes (public_key,name,role) VALUES ('aabbcc99887766aa','Bob','repeater')`)
 	srv := &Server{db: db}
-	if got := srv.resolveHeardName("aabbccdd"); got != "Alice" {
-		t.Errorf("unique prefix → Alice, got %q", got)
+	if k, n := srv.resolveHeardKey("aabbccdd"); k != "aabbccdd11223344" || n != "Alice" {
+		t.Errorf("unique prefix → (pubkey,Alice), got (%q,%q)", k, n)
 	}
-	if got := srv.resolveHeardName("aabbcc"); got != "" {
-		t.Errorf("ambiguous prefix → \"\", got %q", got)
+	if k, n := srv.resolveHeardKey("aabbcc"); k != "aabbcc" || n != "" {
+		t.Errorf("ambiguous prefix → (key,\"\"), got (%q,%q)", k, n)
 	}
-	if got := srv.resolveHeardName("ffff"); got != "" {
-		t.Errorf("unknown prefix → \"\", got %q", got)
+	if k, n := srv.resolveHeardKey("ffff"); k != "ffff" || n != "" {
+		t.Errorf("unknown prefix → (key,\"\"), got (%q,%q)", k, n)
 	}
-	if got := srv.resolveHeardName(""); got != "" {
-		t.Errorf("empty prefix → \"\", got %q", got)
+	if k, n := srv.resolveHeardKey(""); k != "" || n != "" {
+		t.Errorf("empty prefix → (\"\",\"\"), got (%q,%q)", k, n)
+	}
+}
+
+// TestAggregateCoverageMergesResolvedNodes verifies that the same node heard under
+// two different heard_keys (e.g. a 3-byte prefix and the full pubkey) collapses into a
+// single entry — summed count, latest SNR — when the resolver maps both to one node.
+func TestAggregateCoverageMergesResolvedNodes(t *testing.T) {
+	rows := []coverageRow{
+		{Lat: 51.05, Lon: 3.72, SNR: covF(-4), HeardKey: "aabbcc", RxAt: "2026-06-01T10:00:00Z"},
+		{Lat: 51.05, Lon: 3.72, SNR: covF(-9), HeardKey: "aabbccdd11223344", RxAt: "2026-06-03T10:00:00Z"},
+		{Lat: 51.05, Lon: 3.72, SNR: covF(-7), HeardKey: "aabbcc", RxAt: "2026-06-02T10:00:00Z"},
+	}
+	resolve := func(hk string) (string, string) { return "aabbccdd11223344", "Alice" }
+	fc := aggregateCoverage(rows, 9, resolve)
+	if len(fc.Features) != 1 {
+		t.Fatalf("expected 1 cell, got %d", len(fc.Features))
+	}
+	nodes := fc.Features[0].Properties.Nodes
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 merged node, got %d (%+v)", len(nodes), nodes)
+	}
+	n := nodes[0]
+	if n.Name != "Alice" || n.Count != 3 || n.SNR == nil || *n.SNR != -9 {
+		t.Errorf("merged node want Alice count 3 latest -9, got %+v (snr=%v)", n, n.SNR)
 	}
 }
 
