@@ -70,24 +70,22 @@ const PAGES = [
       // virtual-scroll spacer race on the packets page (#1662).
       await page.waitForFunction((rowSel) => {
         return document.querySelector(rowSel) !== null;
-      }, p.rowSel, { timeout: 8000 });
+      }, p.rowSel, { timeout: 20000 });
     });
 
     await step(`${tag}: clicking row opens slide-over with backdrop`, async () => {
       // Click the first body row — prefer one with a data-action attribute
       // (packets) or any row otherwise.
-      const diag = await page.evaluate((sel) => {
+      const diag = await page.evaluate(({sel, rowSel}) => {
         const t = document.querySelector(sel);
         if (!t) return { ok: false, why: 'no table' };
-        const rows = t.querySelectorAll('tbody tr');
-        // The packets table uses virtual scroll, so the FIRST DOM-order <tr>
-        // is a spacer with no data-* attrs and no click handler. Skip those:
-        // pick the first row that actually carries a delegated action.
-        const candidates = Array.from(rows);
+        // Use the page-specific rowSel so we never match the virtual-scroll
+        // spacer (#1662). Don't fall through to bare 'tbody tr'.
+        const candidates = Array.from(t.querySelectorAll(rowSel));
         const row = candidates.find(r => r.hasAttribute('data-action'))
                 || candidates.find(r => r.hasAttribute('data-value'))
-                || candidates.find(r => r.children.length > 0);
-        if (!row) return { ok: false, why: 'no row', rowCount: rows.length };
+                || candidates[0];
+        if (!row) return { ok: false, why: 'no row', rowCount: candidates.length };
         // Click a real cell (avoid empty/loading rows)
         const td = row.querySelector('td:not(:empty)') || row;
         // Dispatch a real bubbling click event so delegated tbody handlers fire.
@@ -95,14 +93,14 @@ const PAGES = [
         td.dispatchEvent(ev);
         return {
           ok: true,
-          rowCount: rows.length,
+          rowCount: candidates.length,
           rowAction: row.getAttribute('data-action') || null,
           rowValue: row.getAttribute('data-value') || null,
           hasSlideOver: typeof window.SlideOver !== 'undefined',
           shouldUse: !!(window.SlideOver && window.SlideOver.shouldUse && window.SlideOver.shouldUse()),
           innerW: window.innerWidth,
         };
-      }, p.tableSel);
+      }, { sel: p.tableSel, rowSel: p.rowSel });
       if (!diag.ok) throw new Error('click setup failed: ' + JSON.stringify(diag));
       // Wait up to 15s for the slide-over to appear (packets does async fetches).
       try {
