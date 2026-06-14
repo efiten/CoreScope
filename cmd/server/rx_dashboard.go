@@ -110,7 +110,21 @@ func (s *Server) queryCoverageFiltered(node, rx string, days int, b bbox) ([]cov
 
 // handleRxCoverage serves global (or per-observer via ?rx=) coverage as GeoJSON
 // hexbins, over a time window. ?node= also works (same as the per-node endpoint).
+// requireClientRxCoverage writes a 404 and returns false when the opt-in
+// client-RX coverage feature is disabled, so the coverage endpoints read as
+// "not found" instead of serving data on deployments that haven't enabled it.
+func (s *Server) requireClientRxCoverage(w http.ResponseWriter, r *http.Request) bool {
+	if !s.cfg.ClientRxCoverageEnabled() {
+		http.NotFound(w, r)
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleRxCoverage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireClientRxCoverage(w, r) {
+		return
+	}
 	b, ok := parseBBox(r.URL.Query().Get("bbox"))
 	if !ok {
 		http.Error(w, "bbox required as minLat,minLon,maxLat,maxLon", http.StatusBadRequest)
@@ -174,6 +188,9 @@ func (s *Server) rxLeaderboard(days, limit int) ([]LeaderObserver, error) {
 }
 
 func (s *Server) handleRxLeaderboard(w http.ResponseWriter, r *http.Request) {
+	if !s.requireClientRxCoverage(w, r) {
+		return
+	}
 	if s.db == nil || s.db.conn == nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return

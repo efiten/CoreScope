@@ -21,7 +21,7 @@ func TestQueryCoverageRowsByPrefixAndBBox(t *testing.T) {
 	db := seedCoverageDB(t)
 	mustExecDB(t, db, `INSERT INTO client_receptions (rx_pubkey,heard_key,heard_keylen,snr,lat,lon,rx_at,ingested_at,src)
 		VALUES ('comp','aabbcc',3,-6,51.05,3.72,'t','t','rxlog')`)
-	srv := &Server{db: db}
+	srv := &Server{db: db, cfg: &Config{ClientRxCoverage: &ClientRxCoverageConfig{Enabled: true}}}
 
 	rows, err := srv.queryCoverageRows("aabbccddeeff00112233", bbox{MinLat: 50, MinLon: 3, MaxLat: 52, MaxLon: 4})
 	if err != nil {
@@ -41,7 +41,7 @@ func TestMobileRxStats(t *testing.T) {
 	mustExecDB(t, db, `INSERT INTO client_receptions (rx_pubkey,heard_key,heard_keylen,snr,lat,lon,rx_at,ingested_at,src) VALUES ('compA','aabbcc',3,-6,51.05,3.72,'t1','t','rxlog')`)
 	mustExecDB(t, db, `INSERT INTO client_receptions (rx_pubkey,heard_key,heard_keylen,snr,lat,lon,rx_at,ingested_at,src) VALUES ('compB','aabbcc',3,-8,51.06,3.73,'t2','t','rxlog')`)
 	mustExecDB(t, db, `INSERT INTO client_receptions (rx_pubkey,heard_key,heard_keylen,snr,lat,lon,rx_at,ingested_at,src) VALUES ('compA','ffeedd',3,-5,51.07,3.74,'t3','t','rxlog')`)
-	srv := &Server{db: db}
+	srv := &Server{db: db, cfg: &Config{ClientRxCoverage: &ClientRxCoverageConfig{Enabled: true}}}
 	c, cl := srv.mobileRxStats("aabbccddeeff00112233")
 	if c != 2 || cl != 2 {
 		t.Fatalf("got count=%d clients=%d, want 2/2", c, cl)
@@ -61,7 +61,7 @@ func TestRxCoverageEndpointGeoJSON(t *testing.T) {
 	db := seedCoverageDB(t)
 	mustExecDB(t, db, `INSERT INTO client_receptions (rx_pubkey,heard_key,heard_keylen,snr,lat,lon,rx_at,ingested_at,src)
 		VALUES ('comp','aabbcc',3,-6,51.05,3.72,'t','t','rxlog')`)
-	srv := &Server{db: db}
+	srv := &Server{db: db, cfg: &Config{ClientRxCoverage: &ClientRxCoverageConfig{Enabled: true}}}
 
 	rr := serveRxCoverage(srv, "/api/nodes/aabbccddeeff00112233/rx-coverage?bbox=50,3,52,4&z=12")
 	if rr.Code != 200 {

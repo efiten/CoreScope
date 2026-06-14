@@ -230,6 +230,9 @@ func parseBBox(s string) (bbox, bool) {
 
 // handleNodeRxCoverage serves per-node mobile RX coverage as a GeoJSON hex grid.
 func (s *Server) handleNodeRxCoverage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireClientRxCoverage(w, r) {
+		return
+	}
 	pubkey := strings.ToLower(mux.Vars(r)["pubkey"])
 	b, ok := parseBBox(r.URL.Query().Get("bbox"))
 	if !ok {
