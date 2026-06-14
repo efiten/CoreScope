@@ -214,7 +214,7 @@
   function renderNodeBadges(n, roleColor) {
     // Returns HTML for: role badge, hash prefix badge, hash inconsistency link, status label
     const info = getStatusInfo(n);
-    let html = `<span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span>`;
+    let html = `<span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(roleColor)) || ('background:'+roleColor+';color:#fff')}">${n.role}</span>`;
     if (n.hash_size) {
       html += ` <span class="badge pubkey-prefix-badge">${n.public_key.slice(0, n.hash_size * 2).toUpperCase()}</span>`;
     }
@@ -240,7 +240,7 @@
   function renderHashInconsistencyWarning(n) {
     if (!n.hash_size_inconsistent) return '';
     const sizes = Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : [];
-    return `<div style="font-size:11px;color:var(--text-muted);margin:-2px 0 6px;padding:6px 10px;background:var(--surface-2);border-radius:4px;border-left:3px solid var(--status-yellow)">Adverts show varying hash sizes (<strong>${sizes.join('-byte, ')}-byte</strong>). This is a <a href="https://github.com/meshcore-dev/MeshCore/commit/fcfdc5f" target="_blank" style="color:var(--accent)">known bug</a> where automatic adverts ignore the configured multibyte path setting. Fixed in <a href="https://github.com/meshcore-dev/MeshCore/releases/tag/repeater-v1.14.1" target="_blank" style="color:var(--accent)">repeater v1.14.1</a>.</div>`;
+    return `<div style="font-size:11px;color:var(--text-muted);margin:-2px 0 6px;padding:6px 10px;background:var(--surface-2);border-radius:4px;border-left:3px solid var(--status-yellow)">Adverts show varying hash sizes (<strong>${sizes.join('-byte, ')}-byte</strong>). This is a <a href="https://github.com/meshcore-dev/MeshCore/commit/fcfdc5f" target="_blank" style="color:var(--link-color)">known bug</a> where automatic adverts ignore the configured multibyte path setting. Fixed in <a href="https://github.com/meshcore-dev/MeshCore/releases/tag/repeater-v1.14.1" target="_blank" style="color:var(--link-color)">repeater v1.14.1</a>.</div>`;
   }
 
   // ─── Neighbor section helpers ───────────────────────────────────────────────
@@ -250,8 +250,48 @@
 
   function getConfidenceIndicator(entry) {
     if (entry.ambiguous) return { icon: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg>', label: 'AMBIGUOUS', cls: 'confidence-ambiguous' };
-    if (entry.count <= 1) return { icon: '<span style="color:var(--status-red)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'LOW', cls: 'confidence-low' };
-    if (entry.score >= 0.5 && entry.count >= 3) return { icon: '<span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'HIGH', cls: 'confidence-high' };
+    // Issue #1638: weight observations by hash-prefix mode. Per firmware
+    // (firmware/src/Packet.cpp:13-18) valid wire hash modes are 1/2/3-byte
+    // (hash_size==4 is reserved). 1-byte prefixes collide ~8-way across a
+    // typical mesh (low ambiguity-resistance); 2-byte ~256-way reduces
+    // collision sharply; 3-byte (~16M) is effectively unambiguous. Bucket 0
+    // is the legacy/unknown bucket used for edges loaded from the persisted
+    // snapshot (no per-mode breakdown stored) — weight is conservative 0.5.
+    var modeWeight = { 0: 0.5, 1: 0.125, 2: 0.875, 3: 1.0 };
+    var cbm = entry.counts_by_mode || null;
+    var weighted;
+    if (cbm) {
+      weighted = 0;
+      var summed = 0;
+      for (var k in cbm) {
+        if (Object.prototype.hasOwnProperty.call(cbm, k)) {
+          var w = modeWeight[k] != null ? modeWeight[k] : 0.5; // unknown mode → conservative
+          var c = cbm[k] || 0;
+          weighted += w * c;
+          summed += c;
+        }
+      }
+      // If the flat Count exceeds the sum of the per-mode breakdown (e.g.
+      // partial breakdown after merging a legacy-snapshot edge with new
+      // sightings), apportion the delta to the legacy/unknown bucket so
+      // we honestly count every observation without inflating its weight.
+      var total = entry.count || 0;
+      if (total > summed) {
+        weighted += modeWeight[0] * (total - summed);
+      }
+    } else {
+      // Back-compat: no per-mode breakdown at all → treat all sightings as
+      // legacy/unknown bucket (conservative weight).
+      weighted = (entry.count || 0) * modeWeight[0];
+    }
+    if ((entry.count || 0) <= 1 && weighted < 1) {
+      return { icon: '<span style="color:var(--status-red)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'LOW', cls: 'confidence-low' };
+    }
+    // HIGH when EITHER the legacy heuristic clears OR ≥3 unambiguous-equivalent
+    // sightings have accumulated (weighted ≥ 3).
+    if ((entry.score >= 0.5 && entry.count >= 3) || weighted >= 3) {
+      return { icon: '<span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'HIGH', cls: 'confidence-high' };
+    }
     return { icon: '<span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'MEDIUM', cls: 'confidence-medium' };
   }
 
@@ -271,6 +311,13 @@
         ? '<span class="badge" style="background:' + (ROLE_COLORS[nb.role] || 'var(--surface-2)') + ';color:#fff;font-size:10px">' + escapeHtml(role) + '</span>'
         : '<span class="text-muted">—</span>';
       var scoreTitle = 'Observations: ' + nb.count;
+      if (nb.counts_by_mode) {
+        var parts = [];
+        [1, 2, 4, 6].forEach(function(m) {
+          if (nb.counts_by_mode[m]) parts.push(m + '-byte: ' + nb.counts_by_mode[m]);
+        });
+        if (parts.length) scoreTitle += ' (' + parts.join(', ') + ')';
+      }
       if (nb.avg_snr != null) scoreTitle += ' · Avg SNR: ' + Number(nb.avg_snr).toFixed(1) + ' dB';
       var distanceCell = nb.distance_km != null
         ? formatDistance(Number(nb.distance_km))
@@ -350,10 +397,10 @@
     }
     var html = renderNeighborTable(data.neighbors, limit);
     if (limit && data.neighbors.length > limit) {
-      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link show-all-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--accent);padding:0">Show all ' + data.neighbors.length + ' neighbors <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg></button></div>';
+      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link show-all-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--link-color);padding:0">Show all ' + data.neighbors.length + ' neighbors <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg></button></div>';
     } else if (!limit && data.neighbors.length > 5) {
       // Collapse toggle when expanded (#855)
-      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link collapse-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--accent);padding:0">Show fewer <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg></button></div>';
+      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link collapse-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--link-color);padding:0">Show fewer <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg></button></div>';
     }
     el.innerHTML = html;
 
@@ -897,7 +944,7 @@
                 return isThis ? html.replace('class="', 'class="hop-current ') : html;
               }
               const name = escapeHtml(h.name || h.prefix);
-              const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}" style="${isThis ? 'font-weight:700;color:var(--accent, #3b82f6)' : ''}">${name}</a>` : `<span>${name}</span>`;
+              const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}" style="${isThis ? 'font-weight:700;color:var(--link-color, #3b82f6)' : ''}">${name}</a>` : `<span>${name}</span>`;
               return link;
             }).join(' → ');
             return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
@@ -1418,7 +1465,7 @@
       return `<tr data-key="${n.public_key}" data-action="select" data-value="${n.public_key}" tabindex="0" role="row" class="${selectedKey === n.public_key ? 'selected' : ''}${isClaimed ? ' claimed-row' : ''}">
         <td ${locodeAttr(n.name)}>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span> ' : ''}<strong>${escapeHtml(n.name || '(unnamed)')}</strong>${dupNameBadge(n.name, n.public_key, dupMap)}${skewBadgeHtml}</td>
         <td class="mono col-pubkey">${truncate(n.public_key, 16)}</td>
-        <td><span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span></td>
+        <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(roleColor)) || ('background:'+roleColor+';color:#fff')}">${n.role}</span></td>
         <td style="font-family:var(--mono);font-size:12px">${n.default_scope ? escapeHtml(n.default_scope) : ''}</td>
         <td class="${lastSeenClass}">${renderNodeTimestampHtml(n.last_heard || n.last_seen)}</td>
         <td>${n.first_seen ? renderNodeTimestampHtml(n.first_seen) : '<span class="text-muted">—</span>'}</td>
@@ -1706,7 +1753,7 @@
           const chain = p.hops.map(h => {
             const isThis = h.pubkey === n.public_key;
             const name = escapeHtml(h.name || h.prefix);
-            const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}" style="${isThis ? 'font-weight:700;color:var(--accent, #3b82f6)' : ''}">${name}</a>` : `<span>${name}</span>`;
+            const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}" style="${isThis ? 'font-weight:700;color:var(--link-color, #3b82f6)' : ''}">${name}</a>` : `<span>${name}</span>`;
             return link;
           }).join(' → ');
           return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">

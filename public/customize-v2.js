@@ -1123,7 +1123,7 @@
       '.cust-tab{padding:8px 10px;cursor:pointer;border:none;background:none;color:var(--text-muted);font-size:12px;font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;flex:1;text-align:center}',
       '.cust-tab-text{font-size:10px;display:block}',
       '.cust-tab:hover{color:var(--text)}',
-      '.cust-tab.active{color:var(--accent);border-bottom-color:var(--accent)}',
+      '.cust-tab.active{color:var(--link-color);border-bottom-color:var(--accent)}',
       '.cust-tab .cv2-tab-badge{font-size:9px;background:var(--accent);color:#fff;border-radius:8px;padding:0 4px;margin-left:2px}',
       '.cust-panel{display:none;padding:12px 16px}',
       '.cust-panel.active{display:block}',
@@ -1137,7 +1137,7 @@
       '.cust-hint{font-size:10px;color:var(--text-muted);margin-top:1px;line-height:1.2}',
       '.cust-color-row input[type="color"]{width:40px;height:32px;border:1px solid var(--border);border-radius:6px;cursor:pointer;padding:2px;background:var(--input-bg)}',
       '.cust-color-row .cust-hex{font-family:var(--mono);font-size:12px;color:var(--text-muted);min-width:70px}',
-      '.cv2-override-dot{color:var(--accent);cursor:pointer;font-size:10px;margin-left:4px;vertical-align:middle;title:"Reset to server default"}',
+      '.cv2-override-dot{color:var(--link-color);cursor:pointer;font-size:10px;margin-left:4px;vertical-align:middle;title:"Reset to server default"}',
       '.cv2-override-dot:hover{color:var(--status-red)}',
       '.cust-node-dot{display:inline-block;width:16px;height:16px;border-radius:50%;vertical-align:middle}',
       '.cust-preview-img{max-width:200px;max-height:60px;margin-top:6px;border-radius:6px;border:1px solid var(--border)}',
@@ -1153,7 +1153,7 @@
       '.cust-list-btn:hover{background:var(--surface-3)}',
       '.cust-list-btn.danger{color:#ef4444}',
       '.cust-list-btn.danger:hover{background:#fef2f2}',
-      '.cust-add-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px dashed var(--border);border-radius:6px;background:none;color:var(--accent);cursor:pointer;font-size:13px;margin-top:4px}',
+      '.cust-add-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px dashed var(--border);border-radius:6px;background:none;color:var(--link-color);cursor:pointer;font-size:13px;margin-top:4px}',
       '.cust-add-btn:hover{background:var(--hover-bg)}',
       '.cust-export-btns{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}',
       '.cust-export-btns button{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500}',
@@ -1567,8 +1567,29 @@
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Re-show first-visit gesture discoverability hints (swipe rows, swipe tabs, edge-swipe drawer, pull-to-refresh).</p>' +
       '<button type="button" class="cust-dl-btn" data-cv2-reset-hints data-reset-gesture-hints>↺ Reset gesture hints</button>' +
       _renderChannelsShowEncryptedToggle() +
+      _renderHide1ByteHopsToggle() +
       _renderTileProviderSelector() +
     '</div>';
+  }
+
+  // ── #1633 Hide 1-byte path hops toggle ──
+  // Writes localStorage["meshcore-hide-1byte-hops"]. Default OFF: key is
+  // removed (not "false") so MC_getHide1ByteHops cleanly returns false.
+  // Fires `mc-hide-1byte-hops-changed`; map.js + packets.js subscribe and
+  // re-render in place (PR #1689 r1 adv #4). Analytics + route-view rebuild
+  // on next navigation — they don't need live wiring because they re-render
+  // on tab activation.
+  function _renderHide1ByteHopsToggle() {
+    var on = false;
+    try { on = localStorage.getItem('meshcore-hide-1byte-hops') === 'true'; } catch (_e) {}
+    return '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Path Display</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">1-byte path-hash prefixes (firmware default) collide ~8-way at ~2k relays — many polylines and route-pattern rows they produce are visual noise. Hide them globally without changing what\'s stored.</p>' +
+      '<div class="cust-field" style="display:flex;align-items:center;gap:8px">' +
+        '<input type="checkbox" id="cv2-hide-1byte-hops" data-cv2-hide-1byte-hops' +
+          (on ? ' checked' : '') +
+          ' style="width:16px;height:16px;cursor:pointer">' +
+        '<label for="cv2-hide-1byte-hops" style="cursor:pointer;margin:0">Hide short (1-byte) path-hash hops</label>' +
+      '</div>';
   }
 
   // ── #1454 Show-encrypted-channels toggle ──
@@ -2084,7 +2105,7 @@
       '</details>' +
       '<p class="cust-section-title" style="margin-top:20px">Tools</p>' +
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:10px">Server-side configuration helpers.</p>' +
-      '<a href="/geofilter-builder.html" target="_blank" style="display:inline-block;padding:7px 14px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;color:var(--accent);font-size:13px;text-decoration:none;font-weight:500"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> GeoFilter Builder →</a>' +
+      '<a href="/geofilter-builder.html" target="_blank" style="display:inline-block;padding:7px 14px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;color:var(--link-color);font-size:13px;text-decoration:none;font-weight:500"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> GeoFilter Builder →</a>' +
       '<p style="font-size:11px;color:var(--text-muted);margin-top:6px">Draw a polygon on the map to generate a <code style="font-family:var(--mono)">geo_filter</code> block for <code style="font-family:var(--mono)">config.json</code>.</p>' +
     '</div>';
   }
@@ -2244,6 +2265,23 @@
         window.dispatchEvent(new CustomEvent('mc-channels-show-encrypted-changed', {
           detail: { value: on }
         }));
+      });
+    });
+
+    // #1633 Hide-1-byte-path-hops checkbox — persists + fires
+    // mc-hide-1byte-hops-changed; consumers re-render or rely on the next
+    // navigation refresh (analytics tab, packets list).
+    container.querySelectorAll('[data-cv2-hide-1byte-hops]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var on = !!cb.checked;
+        if (typeof window.MC_setHide1ByteHops === 'function') {
+          window.MC_setHide1ByteHops(on);
+        } else {
+          try {
+            if (on) localStorage.setItem('meshcore-hide-1byte-hops', 'true');
+            else localStorage.removeItem('meshcore-hide-1byte-hops');
+          } catch (_e) {}
+        }
       });
     });
 
@@ -2725,6 +2763,7 @@
       STORAGE_KEY,                 // 'cs-theme-overrides'
       'meshcore-cb-preset',        // #1361 CB preset id
       'channels-show-encrypted',   // #1454 encrypted-channel toggle
+      'meshcore-hide-1byte-hops',  // #1633 hide 1-byte path hops toggle
       'mc-dark-tile-provider'      // #1430 dark-tile provider pick
     ];
     for (var i = 0; i < CUSTOMIZER_LS_KEYS.length; i++) {

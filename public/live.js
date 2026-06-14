@@ -2497,7 +2497,7 @@
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Adverts</td><td>${n.advert_count || 0}</td></tr>
             ${'default_scope' in n ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Scope</td><td>${n.default_scope === null ? '<span style="color:var(--text-muted)">—</span>'
   : n.default_scope === '' ? '<span style="color:var(--text-muted)">unknown scope</span>'
-  : `<code style="color:var(--accent)">${escapeHtml(n.default_scope)}</code>`
+  : `<code style="color:var(--link-color)">${escapeHtml(n.default_scope)}</code>`
 }</td></tr>` : ''}
             ${hasLoc ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Location</td><td>${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}</td></tr>` : ''}
             ${stats.avgSnr != null ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Avg SNR</td><td>${stats.avgSnr.toFixed(1)} dB</td></tr>` : ''}
@@ -2509,7 +2509,7 @@
         const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))];
         html += `<h4 style="font-size:12px;margin:12px 0 6px;color:var(--text-muted);">Heard By${regions.length ? ' — Regions: ' + regions.join(', ') : ''}</h4>
           <div style="font-size:11px;">` +
-          observers.map(o => `<div style="padding:2px 0;"><a href="#/observers/${encodeURIComponent(o.observer_id)}" style="color:var(--accent);text-decoration:none;">${escapeHtml(o.observer_name || o.observer_id.slice(0, 12))}${o.iata ? ' (' + escapeHtml(o.iata) + ')' : ''}</a> — ${o.packetCount || o.count || 0} pkts</div>`).join('') +
+          observers.map(o => `<div style="padding:2px 0;"><a href="#/observers/${encodeURIComponent(o.observer_id)}" style="color:var(--link-color);text-decoration:none;">${escapeHtml(o.observer_name || o.observer_id.slice(0, 12))}${o.iata ? ' (' + escapeHtml(o.iata) + ')' : ''}</a> — ${o.packetCount || o.count || 0} pkts</div>`).join('') +
           '</div>';
       }
 
@@ -2517,7 +2517,7 @@
         html += `<h4 style="font-size:12px;margin:12px 0 6px;color:var(--text-muted);">Recent Packets</h4>
           <div style="font-size:11px;max-height:200px;overflow-y:auto;">` +
           recent.slice(0, 10).map(p => `<div style="padding:2px 0;display:flex;justify-content:space-between;">
-            <a href="#/packets/${encodeURIComponent(p.hash || '')}" style="color:var(--accent);text-decoration:none;">${escapeHtml(p.payload_type || '?')}${transportBadge(p.route_type)}${p.observation_count > 1 ? ' <span class="badge badge-obs" style="font-size:9px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + p.observation_count + '</span>' : ''}</a>
+            <a href="#/packets/${encodeURIComponent(p.hash || '')}" style="color:var(--link-color);text-decoration:none;">${escapeHtml(p.payload_type || '?')}${transportBadge(p.route_type)}${p.observation_count > 1 ? ' <span class="badge badge-obs" style="font-size:9px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + p.observation_count + '</span>' : ''}</a>
             <span style="color:var(--text-muted)">${formatLiveTimestampHtml(p.timestamp)}</span>
           </div>`).join('') +
           '</div>';
@@ -2526,8 +2526,8 @@
       html += `<div id="liveNodePaths" style="margin-top:8px;"><div style="font-size:11px;color:var(--text-muted);padding:4px 0;"><span class="spinner" style="font-size:10px"></span> Loading paths…</div></div>`;
 
       html += `<div style="margin-top:12px;display:flex;gap:8px;">
-        <a href="#/nodes/${encodeURIComponent(n.public_key)}" style="font-size:12px;color:var(--accent);">Full Detail →</a>
-        <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" style="font-size:12px;color:var(--accent);"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
+        <a href="#/nodes/${encodeURIComponent(n.public_key)}" style="font-size:12px;color:var(--link-color);">Full Detail →</a>
+        <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" style="font-size:12px;color:var(--link-color);"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
       </div></div>`;
 
       content.innerHTML = html;
@@ -2541,12 +2541,27 @@
           return;
         }
         const COLLAPSE = 5;
+        // #1689 r1 (adv #3): respect the customizer "hide 1-byte path hops"
+        // toggle in the live-pane "Paths Through" widget. /api/.../paths
+        // returns hops as objects {prefix,pubkey,name}; the byte-length is
+        // derived from the hex prefix.
+        function _filterHopObjs(hopObjs) {
+          if (typeof window === 'undefined' || !window.MC_isVisibleHop) return hopObjs;
+          if (!window.MC_getHide1ByteHops || !window.MC_getHide1ByteHops()) return hopObjs;
+          return (hopObjs || []).filter(function (h) {
+            return window.MC_isVisibleHop(h && h.prefix ? String(h.prefix) : '');
+          });
+        }
         function renderPathList(paths) {
           return paths.map(p => {
-            const chain = p.hops.map(h => {
+            const filteredHops = _filterHopObjs(p.hops || []);
+            if (!filteredHops.length) {
+              return `<div style="padding:3px 0;font-size:11px;line-height:1.4;color:var(--text-muted)">— (1-byte filtered) <span style="color:var(--text-muted)">(${p.count}×)</span></div>`;
+            }
+            const chain = filteredHops.map(h => {
               const isThis = h.pubkey === n.public_key || (h.prefix && n.public_key.toLowerCase().startsWith(h.prefix.toLowerCase()));
               const name = escapeHtml(h.name || h.prefix);
-              if (isThis) return `<strong style="color:var(--accent)">${name}</strong>`;
+              if (isThis) return `<strong style="color:var(--link-color)">${name}</strong>`;
               return h.pubkey ? `<a href="#/nodes/${h.pubkey}" style="color:var(--text);text-decoration:none">${name}</a>` : name;
             }).join(' → ');
             return `<div style="padding:3px 0;font-size:11px;line-height:1.4">${chain} <span style="color:var(--text-muted)">(${p.count}×)</span></div>`;
@@ -2555,7 +2570,7 @@
         pathEl.innerHTML = `<h4 style="font-size:12px;margin:8px 0 4px;color:var(--text-muted);">Paths Through (${pathData.totalPaths})</h4>` +
           `<div id="livePathsList" style="max-height:200px;overflow-y:auto;">` +
           renderPathList(pathData.paths.slice(0, COLLAPSE)) +
-          (pathData.paths.length > COLLAPSE ? `<button id="showMorePaths" style="font-size:11px;color:var(--accent);background:none;border:none;cursor:pointer;padding:4px 0;">Show all ${pathData.paths.length} paths</button>` : '') +
+          (pathData.paths.length > COLLAPSE ? `<button id="showMorePaths" style="font-size:11px;color:var(--link-color);background:none;border:none;cursor:pointer;padding:4px 0;">Show all ${pathData.paths.length} paths</button>` : '') +
           '</div>';
         const moreBtn = document.getElementById('showMorePaths');
         if (moreBtn) moreBtn.addEventListener('click', () => {
@@ -2680,6 +2695,13 @@
 
   function packetInvolvesFilterNode(pkt, filterKeys) {
     if (!filterKeys.length) return true;
+    // #1689 r2 MAJOR: node-filter search semantics MUST be independent of
+    // the customizer's hide-1-byte-hops display preference. Letting the
+    // display toggle change search results silently fails the principle
+    // of least astonishment (operator searches for a node, hides 1-byte
+    // hops for chart readability, suddenly matches disappear). Chip
+    // rendering filters hops separately via MC_filterPathHops at the
+    // render boundary — see feedHops below.
     const hops = (pkt.decoded?.path?.hops) || [];
     for (const hop of hops) {
       const h = (hop.id || hop.public_key || hop).toString().toLowerCase();
@@ -3186,6 +3208,20 @@
           fpHops = fp.decoded.path.hops;
         }
         if (fpHops.length > feedHops.length) feedHops = fpHops;
+      }
+      // #1689 r1 (adv #3): apply the customizer "hide 1-byte path hops"
+      // toggle to the feed-item hop count + chip rendering. feedHops here
+      // is an array of raw hex tokens (from path_json) or hop-objects (from
+      // decoded.path.hops) — MC_filterPathHops only knows about hex strings
+      // so we branch on shape.
+      if (typeof window !== 'undefined' && window.MC_getHide1ByteHops && window.MC_getHide1ByteHops()) {
+        if (feedHops.length && typeof feedHops[0] === 'string') {
+          feedHops = window.MC_filterPathHops(feedHops);
+        } else if (feedHops.length && window.MC_isVisibleHop) {
+          feedHops = feedHops.filter(function (h) {
+            return window.MC_isVisibleHop(h && h.prefix ? String(h.prefix) : (h && h.id ? String(h.id) : ''));
+          });
+        }
       }
       addFeedItem(icon, typeName, payload, feedHops, color, consolidated);
       // Store all observation packets in dedup entry for replay tree

@@ -139,6 +139,10 @@
   // columns and removing the pill mutate layout and re-trigger ResizeObserver,
   // which would otherwise immediately stomp on the reveal the user just asked for.
   const lastWrapW = new WeakMap();
+  // Parallel map of tbody MutationObservers per wired table. Separate from
+  // `wired` (which stores the ResizeObserver) so the existing sweep/dispose
+  // contract on `wired` stays unchanged for callers reading its shape.
+  const wiredMO = new WeakMap();
   // Sweep tables that have been detached from the DOM (e.g. SPA destroyed
   // their page) and release their ResizeObserver. Called opportunistically on
   // every register() — cheap O(n) over wired tables, n is tiny in practice.
@@ -146,6 +150,8 @@
     wired.forEach((ro, t) => {
       if (!t || !t.isConnected) {
         if (ro) { try { ro.disconnect(); } catch (_) {} }
+        const mo = wiredMO.get(t);
+        if (mo) { try { mo.disconnect(); } catch (_) {} wiredMO.delete(t); }
         wired.delete(t);
       }
     });
@@ -171,6 +177,29 @@
         });
         ro.observe(wrap);
       }
+    }
+    // #1693 r3: re-apply on tbody mutations SYNCHRONOUSLY. Incremental
+    // renderTableRows() calls (observer-decorated re-render, HopResolver
+    // re-render, etc.) add fresh <td>s after register() ran. Without
+    // re-running apply() those new cells miss the `col-hidden` class until
+    // the next resize/window event, which made the mobile E2E flake
+    // (`td.col-observer` visible at 375px).
+    //
+    // r2 used a 100ms setTimeout debounce; the mobile E2E test
+    // (test-observer-iata-1188) reads `td.col-observer` display IMMEDIATELY
+    // after waitForSelector(first row) — the debounce hadn't fired yet, so
+    // the test still saw the unhidden column. Run apply() synchronously on
+    // each mutation: apply() is cheap (single pass over header + cells,
+    // toggling a class) and idempotent, so consecutive mutations in a
+    // render burst just re-run the same cheap loop.
+    const tbody = table.querySelector('tbody');
+    if (tbody && typeof MutationObserver !== 'undefined') {
+      const mo = new MutationObserver(() => {
+        if (!table.isConnected) return;
+        apply(table);
+      });
+      mo.observe(tbody, { childList: true });
+      wiredMO.set(table, mo);
     }
     wired.set(table, ro);
     apply(table);
@@ -683,6 +712,10 @@
   let pauseBuffer = [];
   let observers = [];
   let observerMap = new Map(); // id → observer for O(1) lookups (#383)
+  // #1693 — hook set by renderLeft() so loadObservers() can refresh the
+  // observer-filter dropdown when observers resolve after the filter UI is
+  // already built (decouples observer fetch from row render).
+  let _rebuildObserverMenu = null;
   let regionMap = {};
   const TYPE_NAMES = { 0:'Request', 1:'Response', 2:'Direct Msg', 3:'ACK', 4:'Advert', 5:'Channel Msg', 6:'Group Data', 7:'Anon Req', 8:'Path', 9:'Trace', 10:'Multipart', 11:'Control', 15:'Raw Custom' };
   function typeName(t) { return TYPE_NAMES[t] ?? `Type ${t}`; }
@@ -963,7 +996,14 @@
 
   function renderPath(hops, observerId) {
     if (!hops || !hops.length) return '—';
-    return hops.map(h => renderHop(h, observerId)).join('<span class="arrow">→</span>');
+    // #1633 — render-time filter (default OFF). Applies at every consumer
+    // because every site funnels through this function (group header, child
+    // observation, packet detail dt/dd, byop overlay).
+    var filtered = (typeof window !== 'undefined' && window.MC_filterPathHops)
+      ? window.MC_filterPathHops(hops)
+      : hops;
+    if (!filtered.length) return '— <span class="text-muted" title="All path hops were 1-byte and are hidden by the customizer toggle">(1-byte filtered)</span>';
+    return filtered.map(h => renderHop(h, observerId)).join('<span class="arrow">→</span>');
   }
 
   let directPacketId = null;
@@ -1005,6 +1045,18 @@
 
   async function init(app, routeParam) {
     const gen = ++initGeneration;
+    // #1689 r1 (adv #4): subscribe to the customizer hide-1-byte-hops toggle
+    // so the packets table re-renders LIVE when operators flip it (the
+    // toggle promised "applies everywhere" — without a listener it only
+    // took effect on next navigation, which the inline comment lied about).
+    // The listener is idempotent via a flag on `window` so re-entering the
+    // route doesn't stack handlers.
+    if (typeof window !== 'undefined' && !window.__mc_packets_hide1byte_wired) {
+      window.__mc_packets_hide1byte_wired = true;
+      window.addEventListener('mc-hide-1byte-hops-changed', function () {
+        try { renderTableRows(); } catch (e) { console.warn('[packets] hide-1byte re-render failed', e); }
+      });
+    }
     // Parse ?obs=OBSERVER_ID from routeParam
     if (routeParam && routeParam.includes('?')) {
       const qIdx = routeParam.indexOf('?');
@@ -1067,8 +1119,13 @@
     document.getElementById('pktRight').addEventListener('click', function(e) {
       if (e.target.closest('.panel-close-btn')) closeDetailPanel();
     });
-    await loadObservers();
-    loadPackets();
+    // #1692 — parallelize loadObservers + loadPackets. Both hit independent
+    // API endpoints (/api/observers, /api/packets) and have no data
+    // dependency between the two fetches; only the post-fetch renderLeft()
+    // code reads `observers` (for the observer filter dropdown), so awaiting
+    // them together rather than in series halves worst-case time-to-first-row
+    // on slow links / loaded CI runners without changing render contracts.
+    await Promise.all([loadObservers(), loadPackets()]);
 
     // Auto-select packet detail when arriving via hash URL
     if (directPacketHash) {
@@ -1308,6 +1365,13 @@
       const data = await api('/observers', { ttl: CLIENT_TTL.observers });
       observers = data.observers || [];
       observerMap = new Map(observers.map(o => [o.id, o]));
+      // #1693 — observers now resolve asynchronously relative to row render.
+      // If the filter UI was already built with an empty observer list,
+      // re-populate the observer-multi-select dropdown so the filter is
+      // usable as soon as observers arrive.
+      if (typeof _rebuildObserverMenu === 'function') {
+        try { _rebuildObserverMenu(); } catch {}
+      }
     } catch {}
   }
 
@@ -1382,31 +1446,32 @@
         totalCount = flat.length;
       }
 
-      // Pre-resolve from server-side resolved_path (preferred, no client-side disambiguation needed)
-      await cacheResolvedPaths(packets);
-
-      // Pre-resolve all path hops to node names (fallback for packets without resolved_path)
-      const allHops = new Set();
-      for (const p of packets) {
-        try { getParsedPath(p).forEach(h => allHops.add(h)); } catch {}
-      }
-      if (allHops.size) await resolveHops([...allHops]);
-
-      // Per-observer batch resolve for ambiguous hops (context-aware disambiguation)
-      const hopsByObserver = {};
-      for (const p of packets) {
-        if (!p.observer_id) continue;
+      // #1693 — hop resolution is OFF the critical path. Previously
+      // cacheResolvedPaths() + resolveHops() each chained through
+      // ensureHopResolver(), which calls api('/observers'). Under the
+      // packets-init race (#1692) the observers fetch is still in-flight
+      // (parallelised but slow), and the api() in-flight dedupe maps the
+      // hop-resolver's /observers call onto the same pending promise.
+      // Result: rows can't render until observers resolves, defeating the
+      // #1692 parallelisation. Hop *names* are a presentation enhancement
+      // (paths render as hex prefixes until names arrive), so resolve them
+      // in the background and re-render rows when done.
+      const hopJob = (async () => {
         try {
-          const path = getParsedPath(p);
-          const ambiguous = path.filter(h => hopNameCache[h]?.ambiguous);
-          if (ambiguous.length) {
-            if (!hopsByObserver[p.observer_id]) hopsByObserver[p.observer_id] = new Set();
-            ambiguous.forEach(h => hopsByObserver[p.observer_id].add(h));
+          await cacheResolvedPaths(packets);
+          const allHops = new Set();
+          for (const p of packets) {
+            try { getParsedPath(p).forEach(h => allHops.add(h)); } catch {}
           }
-        } catch {}
-      }
-      // Ambiguous hops are already resolved by HopResolver client-side
-      // No need for per-observer server API calls
+          if (allHops.size) await resolveHops([...allHops]);
+          // Re-render rows so resolved hop names replace hex prefixes.
+          if (filtersBuilt) renderTableRows();
+        } catch (e) {
+          console.warn('[packets] background hop resolution failed:', e);
+        }
+      })();
+      // Don't await — let rows render with hex hops, then upgrade in place.
+      void hopJob;
 
       // Restore expanded group children (parallel fetch, Map lookup)
       if (groupByHash && expandedHashes.size > 0) {
@@ -1633,12 +1698,21 @@
     function buildObserverMenu() {
       const allChecked = selectedObservers.size === 0;
       let html = `<label class="multi-select-item"><input type="checkbox" data-obs-id="__all__" ${allChecked ? 'checked' : ''}> All Observers</label>`;
-      for (const o of observers) {
-        const checked = selectedObservers.has(String(o.id)) ? 'checked' : '';
-        html += `<label class="multi-select-item"><input type="checkbox" data-obs-id="${o.id}" ${checked}> ${escapeHtml(o.name || o.id)}</label>`;
+      if (observers.length === 0) {
+        // #1693 — observers fetch may still be in flight (decoupled from
+        // packet row render). Show a disabled placeholder until loadObservers
+        // resolves and calls _rebuildObserverMenu().
+        html += `<label class="multi-select-item" style="opacity:0.6"><input type="checkbox" disabled> Loading observers…</label>`;
+      } else {
+        for (const o of observers) {
+          const checked = selectedObservers.has(String(o.id)) ? 'checked' : '';
+          html += `<label class="multi-select-item"><input type="checkbox" data-obs-id="${o.id}" ${checked}> ${escapeHtml(o.name || o.id)}</label>`;
+        }
       }
       obsMenu.innerHTML = html;
     }
+    // #1693 — expose for loadObservers() to refresh on resolve.
+    _rebuildObserverMenu = () => { buildObserverMenu(); updateObsTrigger(); };
     function updateObsTrigger() {
       if (selectedObservers.size === 0 || selectedObservers.size === observers.length) {
         obsTrigger.textContent = 'All Observers ▾';
@@ -3739,7 +3813,7 @@
         if (newHops.length) await resolveHops(newHops);
         const container = document.createElement('div');
         container.style.cssText = 'max-width:800px;margin:0 auto;padding:20px';
-        container.innerHTML = `<div style="margin-bottom:16px"><a href="#/packets" style="color:var(--accent);text-decoration:none">← Back to packets</a></div>`;
+        container.innerHTML = `<div style="margin-bottom:16px"><a href="#/packets" style="color:var(--link-color);text-decoration:none">← Back to packets</a></div>`;
         const detail = document.createElement('div');
         container.appendChild(detail);
         await renderDetail(detail, data);
