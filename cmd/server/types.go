@@ -1017,6 +1017,7 @@ type ClientConfigResponse struct {
 	DebugAffinity       bool            `json:"debugAffinity,omitempty"`
 	MapDarkTileProvider string          `json:"mapDarkTileProvider,omitempty"` // deprecated. TODO: remove after v3.5.0
 	Customizer          CustomizerClientConfig `json:"customizer"`
+	ClientRxCoverage    bool                   `json:"clientRxCoverage"`
 }
 
 // CustomizerClientConfig is the operator-side customizer-modal knobs that

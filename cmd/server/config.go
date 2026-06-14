@@ -161,6 +161,12 @@ type Config struct {
 	obsBlacklistOnce      sync.Once
 
 	Compression   *CompressionConfig   `json:"compression,omitempty"`
+
+	// ClientRxCoverage gates the opt-in mobile client-RX coverage feature
+	// (corescope-rx companions publishing GPS-tagged receptions). Absent/nil
+	// ⇒ off; see ClientRxCoverageEnabled.
+	ClientRxCoverage *ClientRxCoverageConfig `json:"clientRxCoverage,omitempty"`
+
 	ResolvedPath  *ResolvedPathConfig  `json:"resolvedPath,omitempty"`
 	NeighborGraph *NeighborGraphConfig `json:"neighborGraph,omitempty"`
 
@@ -248,6 +254,17 @@ type CompressionConfig struct {
 // GZipEnabled returns true when HTTP gzip compression is explicitly enabled.
 func (c *Config) GZipEnabled() bool {
 	return c.Compression != nil && c.Compression.GZip
+}
+
+// ClientRxCoverageConfig gates the opt-in mobile client-RX coverage feature.
+type ClientRxCoverageConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ClientRxCoverageEnabled reports whether the opt-in mobile client-RX coverage
+// feature is on. Absent/nil ⇒ off (the safe default).
+func (c *Config) ClientRxCoverageEnabled() bool {
+	return c.ClientRxCoverage != nil && c.ClientRxCoverage.Enabled
 }
 
 // WSCompressionEnabled returns true when WebSocket permessage-deflate is explicitly enabled.
