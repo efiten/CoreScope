@@ -1,30 +1,43 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
+	"golang.org/x/sync/singleflight"
 )
 
-// advertPayloadType mirrors MeshCore ADVERT (0x04). Local const so this file
-// stays independent of decoder internals.
-const advertPayloadType = 4
+// reachScanRowLimit hard-caps the windowed observation scan so a hot relay node
+// with weeks of traffic can't pull an unbounded result set into memory. A node
+// with >200k matching observations in the window is far past dashboard scale;
+// beyond the cap the counts are a (still representative) truncation. The LIKE
+// filter is unavoidably a text scan of path_json over the timestamp-narrowed
+// window — an indexed path-token column would need an ingestor-side schema
+// migration (the server is read-only by invariant), so it's a follow-up.
+// var (not const) so tests can lower the cap to exercise the truncation path
+// without inserting 200k rows.
+var reachScanRowLimit = 200000
 
 // pathRow is one observation fed to attributeDirections. path tokens are
-// uppercase hex hop prefixes (as stored in observations.path_json).
+// uppercase hex hop prefixes (as stored in observations.path_json). SNR is a
+// value + validity flag (not *float64) to avoid a heap escape per row.
 type pathRow struct {
 	observerPK  string // lowercase pubkey of the observer (may be "")
 	fromPubkey  string // lowercase originator pubkey (may be "")
 	payloadType int
 	path        []string
-	snr         *float64
+	snr         float64
+	snrValid    bool
 }
 
 type obsAgg struct {
@@ -36,7 +49,7 @@ type obsAgg struct {
 type dirCounts struct {
 	we    map[string]int
 	they  map[string]int
-	obs   map[string]*obsAgg
+	obs   map[string]obsAgg // value map — no per-observer heap alloc
 	relay int
 }
 
@@ -45,7 +58,16 @@ type dirCounts struct {
 // token → a unique relay pubkey ("" when ambiguous/unknown → skipped). ourPK is
 // the target's own pubkey (lowercase) so self-edges are ignored.
 func attributeDirections(rows []pathRow, ourTokens map[string]bool, ourPK string, resolve func(string) string) dirCounts {
-	d := dirCounts{we: map[string]int{}, they: map[string]int{}, obs: map[string]*obsAgg{}}
+	// Size hint: a small constant covers typical neighbour fan-out (dozens)
+	// without over-allocating ~12.5k buckets on a 100k-row scan. Independent
+	// r2 #4: the old `len(rows)/8+1` was ~250× too large for relays with
+	// modest fan-out.
+	const hint = 64
+	d := dirCounts{
+		we:   make(map[string]int, hint),
+		they: make(map[string]int, hint),
+		obs:  make(map[string]obsAgg, hint),
+	}
 	for _, r := range rows {
 		n := len(r.path)
 		if n == 0 {
@@ -62,7 +84,7 @@ func attributeDirections(rows []pathRow, ourTokens map[string]bool, ourPK string
 				if pk := resolve(r.path[i-1]); pk != "" && pk != ourPK {
 					d.we[pk]++
 				}
-			} else if r.payloadType == advertPayloadType && r.fromPubkey != "" && r.fromPubkey != ourPK {
+			} else if r.payloadType == PayloadADVERT && r.fromPubkey != "" && r.fromPubkey != ourPK {
 				d.we[r.fromPubkey]++
 			}
 			// successor → it heard us; or if we're the last hop, the observer did
@@ -72,16 +94,13 @@ func attributeDirections(rows []pathRow, ourTokens map[string]bool, ourPK string
 				}
 			} else if r.observerPK != "" && r.observerPK != ourPK {
 				d.they[r.observerPK]++
-				a := d.obs[r.observerPK]
-				if a == nil {
-					a = &obsAgg{}
-					d.obs[r.observerPK] = a
-				}
+				a := d.obs[r.observerPK] // value copy; read-modify-write
 				a.count++
-				if r.snr != nil {
-					a.snrSum += *r.snr
+				if r.snrValid {
+					a.snrSum += r.snr
 					a.snrN++
 				}
+				d.obs[r.observerPK] = a
 			}
 		}
 		if hit {
@@ -92,8 +111,11 @@ func attributeDirections(rows []pathRow, ourTokens map[string]bool, ourPK string
 }
 
 // reliableTokens returns the uppercase hex prefixes (1, 2, 3 byte) of pubkey
-// that are UNIQUE among relay-capable nodes in pm. 1-byte prefixes almost always
-// collide and are excluded; only unique prefixes can identify a node in a path.
+// that are UNIQUE among relay-capable nodes in pm AND resolve to pubkey itself.
+// 1-byte prefixes almost always collide and are excluded. The self-check matters
+// for non-relay targets (companion/sensor): pm only holds path-capable roles, so
+// a companion's prefix could otherwise be "unique" while pointing at an unrelated
+// relay — which would then credit that relay's traffic to the companion.
 func reliableTokens(pubkey string, pm *prefixMap) map[string]bool {
 	out := map[string]bool{}
 	lpk := strings.ToLower(pubkey)
@@ -102,7 +124,7 @@ func reliableTokens(pubkey string, pm *prefixMap) map[string]bool {
 			continue
 		}
 		p := lpk[:l]
-		if pm != nil && len(pm.m[p]) == 1 {
+		if pm != nil && len(pm.m[p]) == 1 && strings.EqualFold(pm.m[p][0].PublicKey, pubkey) {
 			out[strings.ToUpper(p)] = true
 		}
 	}
@@ -111,6 +133,8 @@ func reliableTokens(pubkey string, pm *prefixMap) map[string]bool {
 
 // uniqueResolve returns the single relay pubkey (lowercase) for a hop token, or
 // "" when the token resolves to zero or multiple candidates (conservative).
+// Callers should memoize across a request (see newResolver) so the per-hop
+// ToLower + map lookup runs once per distinct token, not once per row.
 func uniqueResolve(pm *prefixMap, token string) string {
 	if pm == nil {
 		return ""
@@ -120,6 +144,47 @@ func uniqueResolve(pm *prefixMap, token string) string {
 		return strings.ToLower(cands[0].PublicKey)
 	}
 	return ""
+}
+
+// parsePathTokens extracts the quoted hex hop tokens from a path_json array
+// (e.g. `["AA","01FA","BB"]`) in a single pass, uppercased. Avoids the
+// json.Unmarshal reflection + per-row interface allocations on the hot scan
+// path. Tokens slice into pj (no copy) except where ToUpper must rewrite a
+// lowercase hop; path_json holds only hex strings, so there are no escapes to
+// worry about. Returns nil for an empty/degenerate array.
+func parsePathTokens(pj string) []string {
+	out := make([]string, 0, 8) // paths are short (a handful of hops)
+	i := 0
+	for {
+		q1 := strings.IndexByte(pj[i:], '"')
+		if q1 < 0 {
+			break
+		}
+		q1 += i
+		rel := strings.IndexByte(pj[q1+1:], '"')
+		if rel < 0 {
+			break
+		}
+		q2 := q1 + 1 + rel
+		out = append(out, strings.ToUpper(pj[q1+1:q2]))
+		i = q2 + 1
+	}
+	return out
+}
+
+// newResolver returns a memoized hop-token → pubkey resolver. Paths reuse the
+// same hop tokens across thousands of rows, so caching collapses the repeated
+// ToLower + prefix-map lookups to once per distinct token.
+func newResolver(pm *prefixMap) func(string) string {
+	cache := make(map[string]string)
+	return func(tok string) string {
+		if pk, ok := cache[tok]; ok {
+			return pk
+		}
+		pk := uniqueResolve(pm, tok)
+		cache[tok] = pk
+		return pk
+	}
 }
 
 type NodeReachInfo struct {
@@ -170,25 +235,16 @@ type NodeReachResponse struct {
 	Importance      NodeReachImportance `json:"importance"`
 	DirectObservers []NodeReachObserver `json:"direct_observers"`
 	Links           []NodeReachLink     `json:"links"`
-	MobileRxCount   int                 `json:"mobile_rx_count"`   // total mobile-client receptions of this node (all-time)
-	MobileRxClients int                 `json:"mobile_rx_clients"` // distinct mobile clients that heard it
 }
 
 func fptr(v float64) *float64 { return &v }
 
-// gpsPtrs returns (lat,lon) pointers, nil when the node has no GPS (0,0).
-func gpsPtrs(info nodeInfo, ok bool) (*float64, *float64) {
-	if !ok || !info.HasGPS {
+// gpsPtrs returns (lat,lon) pointers, nil when the node has no GPS.
+func gpsPtrs(info nodeInfo) (*float64, *float64) {
+	if !info.HasGPS {
 		return nil, nil
 	}
 	return fptr(info.Lat), fptr(info.Lon)
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // clampDays bounds the lookback window to [1,30]; default callers pass 7.
@@ -202,8 +258,12 @@ func clampDays(d int) int {
 	return d
 }
 
-// --- bounded TTL cache (perf is gated by the time window; this just avoids
-// recompute under dashboard polling). Keyed "pubkey|days". ---
+// --- bounded TTL cache. perf is gated by the time window; this just avoids
+// recompute under dashboard polling. Keyed "pubkey|days". ---
+//
+// reachCacheMax bounds entry count; at ~2KB of marshalled JSON per entry the
+// worst case is well under 1MB, so an entry cap (rather than a byte budget)
+// keeps the bookkeeping trivial while staying memory-safe.
 const (
 	reachCacheTTL = 5 * time.Minute
 	reachCacheMax = 256
@@ -214,33 +274,133 @@ type reachCacheEntry struct {
 	raw []byte
 }
 
-var (
-	reachCacheMu sync.Mutex
-	reachCache   = map[string]reachCacheEntry{}
-)
+// reachState bundles per-server reach caches. Was a set of package-level
+// globals — moved onto *Server so two Server instances (tests, future
+// per-listener) don't share observable state (Independent r2 #2).
+type reachState struct {
+	cacheMu sync.RWMutex
+	cache   map[string]reachCacheEntry
+	// sf dedups concurrent cold-cache requests for the same key so N
+	// simultaneous callers run the scan + attribution once, not N times.
+	sf singleflight.Group
 
-func reachCacheGet(key string) ([]byte, bool) {
-	reachCacheMu.Lock()
-	defer reachCacheMu.Unlock()
-	e, ok := reachCache[key]
+	// lastSeenBlacklistGen is the BlacklistGeneration() value that the cache
+	// was last reconciled with. When the live generation moves past this
+	// value, the cache is purged wholesale on the next request to prevent
+	// prior-gen entries from accumulating until their TTL expires (#1629
+	// round-2, adversarial #5).
+	lastSeenBlacklistGen atomic.Uint64
+
+	degreeMu   sync.Mutex
+	degreeSnap *degreeSnapshot
+}
+
+// reachCacheGet returns the cached marshalled JSON for key. The returned slice
+// is shared (not copied): it is treated as immutable — only ever handed to
+// w.Write — so callers MUST NOT mutate it.
+func (s *Server) reachCacheGet(key string) ([]byte, bool) {
+	s.reach.cacheMu.RLock()
+	defer s.reach.cacheMu.RUnlock()
+	e, ok := s.reach.cache[key]
 	if !ok || time.Since(e.at) > reachCacheTTL {
 		return nil, false
 	}
 	return e.raw, true
 }
 
-func reachCachePut(key string, raw []byte) {
-	reachCacheMu.Lock()
-	defer reachCacheMu.Unlock()
-	if len(reachCache) >= reachCacheMax {
-		reachCache = map[string]reachCacheEntry{} // crude bounded reset
+// reachCacheLen returns the current entry count in the reach response cache.
+// Test helper — exposes the size without leaking the internal mutex/map.
+func (s *Server) reachCacheLen() int {
+	s.reach.cacheMu.RLock()
+	defer s.reach.cacheMu.RUnlock()
+	return len(s.reach.cache)
+}
+
+// reachPurgeIfBlacklistGenChanged drops every cached entry when the live
+// blacklist generation has advanced past the cache's last-seen value. CAS
+// gates the purge so concurrent callers only do the work once per gen bump
+// (#1629 round-2, adversarial #5).
+func (s *Server) reachPurgeIfBlacklistGenChanged(gen uint64) {
+	seen := s.reach.lastSeenBlacklistGen.Load()
+	if gen == seen {
+		return
 	}
-	reachCache[key] = reachCacheEntry{at: time.Now(), raw: raw}
+	// CAS gates the actual purge to a single winner on a given gen bump.
+	if !s.reach.lastSeenBlacklistGen.CompareAndSwap(seen, gen) {
+		// Another goroutine already advanced (and purged). Done.
+		return
+	}
+	s.reach.cacheMu.Lock()
+	s.reach.cache = nil
+	s.reach.cacheMu.Unlock()
+}
+
+// isHexPubkey reports whether s is a full 64-char lowercase-hex public key.
+// The handler lowercases input first, so we only accept [0-9a-f].
+func isHexPubkey(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) reachCachePut(key string, raw []byte) {
+	s.reach.cacheMu.Lock()
+	defer s.reach.cacheMu.Unlock()
+	if s.reach.cache == nil {
+		s.reach.cache = map[string]reachCacheEntry{}
+	}
+	if _, exists := s.reach.cache[key]; !exists && len(s.reach.cache) >= reachCacheMax {
+		s.evictReachLocked()
+	}
+	s.reach.cache[key] = reachCacheEntry{at: time.Now(), raw: raw}
+}
+
+// evictReachLocked drops expired entries first; if still at the cap it evicts
+// the single oldest entry. Avoids the full-map wipe that thrashed every cached
+// key once the cap was reached. Caller holds s.reach.cacheMu (write).
+func (s *Server) evictReachLocked() {
+	now := time.Now()
+	for k, e := range s.reach.cache {
+		if now.Sub(e.at) > reachCacheTTL {
+			delete(s.reach.cache, k)
+		}
+	}
+	if len(s.reach.cache) < reachCacheMax {
+		return
+	}
+	var oldestKey string
+	var oldestAt time.Time
+	first := true
+	for k, e := range s.reach.cache {
+		if first || e.at.Before(oldestAt) {
+			oldestKey, oldestAt, first = k, e.at, false
+		}
+	}
+	if !first {
+		delete(s.reach.cache, oldestKey)
+	}
 }
 
 func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 	pubkey := strings.ToLower(mux.Vars(r)["pubkey"])
+	// Reject malformed pubkeys up front (cheap defense against cache-key
+	// pollution + wasted work on bogus IDs).
+	if !isHexPubkey(pubkey) {
+		writeError(w, 400, "invalid pubkey: expected 64 hex chars")
+		return
+	}
 	if s.cfg != nil && s.cfg.IsBlacklisted(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
+	if s.isPubkeyHidden(pubkey) {
 		writeError(w, 404, "Not found")
 		return
 	}
@@ -252,34 +412,78 @@ func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 	}
 	days = clampDays(days)
 
-	cacheKey := pubkey + "|" + strconv.Itoa(days)
-	if raw, ok := reachCacheGet(cacheKey); ok {
+	// cacheKey includes the blacklist generation so any mutation via
+	// SetNodeBlacklist invalidates all prior reach cache entries on the
+	// next request (#1629). Without the generation suffix a node added
+	// to the blacklist post-warm would keep being served the cached
+	// non-blacklisted response until the TTL expires.
+	var gen uint64
+	if s.cfg != nil {
+		gen = s.cfg.BlacklistGeneration()
+	}
+	// Purge prior-gen entries wholesale when the generation advances so a
+	// steady stream of operator blacklist edits cannot leak cache entries
+	// up to the TTL. Cheap: one map reset under the cache mutex, only when
+	// the gen actually moved (#1629 round-2, adversarial #5).
+	s.reachPurgeIfBlacklistGenChanged(gen)
+	cacheKey := pubkey + "|" + strconv.Itoa(days) + "|g" + strconv.FormatUint(gen, 10)
+	if raw, ok := s.reachCacheGet(cacheKey); ok {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(raw)
 		return
 	}
 
-	resp, ok := s.computeNodeReach(pubkey, days)
-	if !ok {
+	// singleflight: collapse a thundering herd on a cold key to one scan. The
+	// shared computation uses the triggering request's context; a disconnect
+	// there can cancel the in-flight scan for all waiters (acceptable — the
+	// next request recomputes).
+	v, err, _ := s.reach.sf.Do(cacheKey, func() (interface{}, error) {
+		if raw, ok := s.reachCacheGet(cacheKey); ok {
+			return raw, nil
+		}
+		resp, ok, cErr := s.computeNodeReach(r.Context(), pubkey, days)
+		if cErr != nil {
+			// Real backend failure (e.g. DB scan exploded) — propagate so the
+			// caller renders 500 instead of the misleading empty-reach
+			// response. Do NOT cache. (#1631)
+			return nil, cErr
+		}
+		if !ok {
+			return []byte(nil), nil
+		}
+		raw, mErr := json.Marshal(resp)
+		if mErr != nil {
+			log.Printf("[reach] marshal failed for %s: %v", cacheKey, mErr)
+			return nil, mErr
+		}
+		s.reachCachePut(cacheKey, raw)
+		return raw, nil
+	})
+	if err != nil {
+		writeError(w, 500, "reach computation failed")
+		return
+	}
+	raw, _ := v.([]byte)
+	if len(raw) == 0 {
 		writeError(w, 404, "Not found")
 		return
 	}
-	resp.MobileRxCount, resp.MobileRxClients = s.mobileRxStats(pubkey)
-	raw, _ := json.Marshal(resp)
-	reachCachePut(cacheKey, raw)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
 }
 
-// computeNodeReach does the read-only scan + assembly. ok=false → 404.
-func (s *Server) computeNodeReach(pubkey string, days int) (NodeReachResponse, bool) {
+// computeNodeReach does the read-only scan + assembly. ok=false → 404
+// (target node not present / inputs unavailable). A non-nil error signals a
+// real backend failure (e.g. DB scan exploded) — caller should render 500,
+// not 404 (issue #1631).
+func (s *Server) computeNodeReach(ctx context.Context, pubkey string, days int) (NodeReachResponse, bool, error) {
 	if s.store == nil || s.db == nil || s.db.conn == nil {
-		return NodeReachResponse{}, false
+		return NodeReachResponse{}, false, nil
 	}
 	nodeMap := s.buildNodeInfoMap()
 	self, found := nodeMap[pubkey]
 	if !found {
-		return NodeReachResponse{}, false
+		return NodeReachResponse{}, false, nil
 	}
 	_, pm := s.store.getCachedNodesAndPM()
 	tokens := reliableTokens(pubkey, pm)
@@ -289,33 +493,29 @@ func (s *Server) computeNodeReach(pubkey string, days int) (NodeReachResponse, b
 
 	var d dirCounts
 	if len(tokens) > 0 {
-		rows := s.scanReachRows(tokens, sinceEpoch)
-		d = attributeDirections(rows, tokens, pubkey, func(tok string) string {
-			return uniqueResolve(pm, tok)
-		})
+		rows, err := s.scanReachRows(ctx, tokens, sinceEpoch)
+		if err != nil {
+			return NodeReachResponse{}, false, err
+		}
+		d = attributeDirections(rows, tokens, pubkey, newResolver(pm))
 	} else {
-		d = dirCounts{we: map[string]int{}, they: map[string]int{}, obs: map[string]*obsAgg{}}
+		d = dirCounts{we: map[string]int{}, they: map[string]int{}, obs: map[string]obsAgg{}}
 	}
 
-	// importance: neighbor_edges degree + rank (all-time)
-	var degree, rank, nodesWithEdges int
-	s.db.conn.QueryRow(`
-		WITH dd AS (SELECT node_a pk, count c FROM neighbor_edges
-		            UNION ALL SELECT node_b, count FROM neighbor_edges),
-		     aa AS (SELECT pk, COUNT(*) neigh FROM dd GROUP BY pk)
-		SELECT (SELECT COUNT(*) FROM aa),
-		       COALESCE((SELECT neigh FROM aa WHERE pk=?),0),
-		       (SELECT 1+COUNT(*) FROM aa WHERE neigh > COALESCE((SELECT neigh FROM aa WHERE pk=?),0))
-	`, pubkey, pubkey).Scan(&nodesWithEdges, &degree, &rank)
+	// importance: neighbor_edges degree + rank (all-time). Served from a
+	// coarse-TTL snapshot so the full UNION+GROUP-BY aggregate runs at most
+	// once per snapshotTTL, not on every cache miss.
+	degree, rank, nodesWithEdges := s.reachDegreeRank(ctx, pubkey)
 
-	// node first_seen (nodeInfo only carries last_seen; the contract wants first_seen)
-	var firstSeen sql.NullString
-	s.db.conn.QueryRow(`SELECT first_seen FROM nodes WHERE LOWER(public_key)=?`, pubkey).Scan(&firstSeen)
+	// node first_seen comes from nodeInfo (buildNodeInfoMap folds it in via a
+	// single bulk SELECT). Missing → empty string (the node may be
+	// observer-only or pre-first_seen-schema).
+	firstSeen := self.FirstSeen
 
 	// assemble links
-	links := []NodeReachLink{}
+	links := make([]NodeReachLink, 0, len(d.we)+len(d.they))
 	bidir := 0
-	seen := map[string]bool{}
+	seen := make(map[string]bool, len(d.we)+len(d.they))
 	for pk := range d.we {
 		seen[pk] = true
 	}
@@ -325,7 +525,7 @@ func (s *Server) computeNodeReach(pubkey string, days int) (NodeReachResponse, b
 	for pk := range seen {
 		we, they := d.we[pk], d.they[pk]
 		info := nodeMap[pk]
-		lat, lon := gpsPtrs(info, true)
+		lat, lon := gpsPtrs(info)
 		var dist *float64
 		if self.HasGPS && info.HasGPS {
 			dist = fptr(haversineKm(self.Lat, self.Lon, info.Lat, info.Lon))
@@ -336,7 +536,7 @@ func (s *Server) computeNodeReach(pubkey string, days int) (NodeReachResponse, b
 		}
 		links = append(links, NodeReachLink{
 			Pubkey: pk, Name: info.Name, Role: info.Role, Lat: lat, Lon: lon,
-			WeHear: we, TheyHear: they, Bottleneck: minInt(we, they), Bidir: b, DistanceKm: dist,
+			WeHear: we, TheyHear: they, Bottleneck: min(we, they), Bidir: b, DistanceKm: dist,
 		})
 	}
 	sort.Slice(links, func(i, j int) bool {
@@ -350,10 +550,10 @@ func (s *Server) computeNodeReach(pubkey string, days int) (NodeReachResponse, b
 	})
 
 	// direct observers
-	directObs := []NodeReachObserver{}
+	directObs := make([]NodeReachObserver, 0, len(d.obs))
 	for pk, a := range d.obs {
 		info := nodeMap[pk]
-		lat, lon := gpsPtrs(info, true)
+		lat, lon := gpsPtrs(info)
 		var avg, dist *float64
 		if a.snrN > 0 {
 			avg = fptr(a.snrSum / float64(a.snrN))
@@ -373,10 +573,10 @@ func (s *Server) computeNodeReach(pubkey string, days int) (NodeReachResponse, b
 	}
 	sort.Strings(toks)
 
-	selfLat, selfLon := gpsPtrs(self, true)
+	selfLat, selfLon := gpsPtrs(self)
 	return NodeReachResponse{
 		Node: NodeReachInfo{Pubkey: pubkey, Name: self.Name, Role: self.Role,
-			Lat: selfLat, Lon: selfLon, FirstSeen: firstSeen.String},
+			Lat: selfLat, Lon: selfLon, FirstSeen: firstSeen},
 		Window:         NodeReachWindow{Days: days, Since: since.Format(time.RFC3339)},
 		ReliableTokens: toks,
 		Importance: NodeReachImportance{
@@ -385,51 +585,154 @@ func (s *Server) computeNodeReach(pubkey string, days int) (NodeReachResponse, b
 		},
 		DirectObservers: directObs,
 		Links:           links,
-	}, true
+	}, true, nil
+}
+
+// --- neighbor-degree snapshot ---------------------------------------------
+// The degree/rank importance is identical across all reach requests except the
+// pubkey match, so the full neighbor_edges aggregate is computed once and shared
+// behind a coarse TTL. Rank is a binary search over the descending degree list.
+const reachDegreeTTL = 60 * time.Second
+
+type degreeSnapshot struct {
+	at         time.Time
+	total      int            // nodes that have any edge
+	deg        map[string]int // lowercase pubkey → neighbour count
+	sortedDesc []int          // degrees sorted descending, for rank
+}
+
+func (s *Server) reachDegreeRank(ctx context.Context, pubkey string) (degree, rank, total int) {
+	snap := s.getDegreeSnapshot(ctx)
+	if snap == nil {
+		return 0, 0, 0
+	}
+	degree = snap.deg[pubkey]
+	if degree == 0 {
+		// No edges → not ranked. rank=0 is the documented "off-the-list" value;
+		// avoids the nonsensical "#N+1 / N" the binary search would produce.
+		return 0, 0, snap.total
+	}
+	// rank = 1 + (number of nodes with strictly higher degree). sortedDesc is
+	// descending, so the count of entries > degree is the first index whose
+	// value is <= degree.
+	rank = 1 + sort.Search(len(snap.sortedDesc), func(i int) bool { return snap.sortedDesc[i] <= degree })
+	return degree, rank, snap.total
+}
+
+func (s *Server) getDegreeSnapshot(ctx context.Context) *degreeSnapshot {
+	// Fast path: serve a fresh snapshot under a short lock.
+	s.reach.degreeMu.Lock()
+	if s.reach.degreeSnap != nil && time.Since(s.reach.degreeSnap.at) < reachDegreeTTL {
+		snap := s.reach.degreeSnap
+		s.reach.degreeMu.Unlock()
+		return snap
+	}
+	stale := s.reach.degreeSnap
+	s.reach.degreeMu.Unlock()
+
+	// Rebuild WITHOUT holding the lock so concurrent reach requests aren't
+	// serialized behind the aggregate query. A brief cold-start herd may run a
+	// few redundant queries; the last writer wins.
+	rows, err := s.db.conn.QueryContext(ctx, `
+		SELECT pk, COUNT(*) neigh FROM (
+			SELECT node_a pk FROM neighbor_edges
+			UNION ALL SELECT node_b FROM neighbor_edges
+		) GROUP BY pk`)
+	if err != nil {
+		log.Printf("[reach] degree snapshot query failed: %v (serving stale)", err)
+		return stale // serve stale on error rather than zeroing
+	}
+	defer rows.Close()
+	deg := make(map[string]int)
+	var sortedDesc []int
+	for rows.Next() {
+		var pk string
+		var neigh int
+		if rows.Scan(&pk, &neigh) != nil {
+			continue
+		}
+		deg[strings.ToLower(pk)] = neigh
+		sortedDesc = append(sortedDesc, neigh)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(sortedDesc)))
+	snap := &degreeSnapshot{at: time.Now(), total: len(deg), deg: deg, sortedDesc: sortedDesc}
+	s.reach.degreeMu.Lock()
+	s.reach.degreeSnap = snap
+	s.reach.degreeMu.Unlock()
+	return snap
 }
 
 // scanReachRows reads windowed observations whose path contains any reliable
-// token, with the originator + observer + snr needed for attribution.
-func (s *Server) scanReachRows(tokens map[string]bool, sinceEpoch int64) []pathRow {
+// token, with the originator + observer + snr needed for attribution. Observer
+// id and originator pubkey are lowercased in SQL (not per row), the path slice
+// is uppercased in place (no second allocation), and the result is hard-capped
+// at reachScanRowLimit.
+//
+// Returns a non-nil error if the underlying QueryContext or rows.Err() fails;
+// callers MUST treat that as a 500 (issue #1631 — previously the error was
+// swallowed, surfacing a transient DB failure as a misleading 404 / empty
+// reach to operators).
+func (s *Server) scanReachRows(ctx context.Context, tokens map[string]bool, sinceEpoch int64) ([]pathRow, error) {
+	if len(tokens) == 0 {
+		return nil, nil // defensive: an empty LIKE chain would render `AND ()` (SQL error)
+	}
 	likes := make([]string, 0, len(tokens))
 	args := []interface{}{sinceEpoch}
+	// Sort tokens so the generated SQL text is byte-stable across requests
+	// with the same token set — preserves the driver's prepared-statement
+	// cache and keeps query plans reproducible (Independent r2 #3).
+	toks := make([]string, 0, len(tokens))
 	for tok := range tokens {
+		toks = append(toks, tok)
+	}
+	sort.Strings(toks)
+	for _, tok := range toks {
 		likes = append(likes, "o.path_json LIKE ?")
 		args = append(args, "%\""+tok+"\"%")
 	}
-	q := `SELECT COALESCE(obs.id,''), COALESCE(t.from_pubkey,''), COALESCE(t.payload_type,0), o.path_json, o.snr
+	q := `SELECT LOWER(COALESCE(obs.id,'')), LOWER(COALESCE(t.from_pubkey,'')), COALESCE(t.payload_type,0), o.path_json, o.snr
 	      FROM observations o
 	      JOIN transmissions t ON t.id = o.transmission_id
 	      LEFT JOIN observers obs ON obs.rowid = o.observer_idx
-	      WHERE o.timestamp >= ? AND (` + strings.Join(likes, " OR ") + `)`
-	rows, err := s.db.conn.Query(q, args...)
+	      WHERE o.timestamp >= ? AND (` + strings.Join(likes, " OR ") + `)
+	      LIMIT ?`
+	args = append(args, reachScanRowLimit)
+	rows, err := s.db.conn.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil
+		log.Printf("[reach] scan query failed: %v", err)
+		return nil, err
 	}
 	defer rows.Close()
-	var out []pathRow
+	// Modest preallocation: most nodes return far fewer than the cap, so seed a
+	// reasonable capacity rather than reserving reachScanRowLimit up front.
+	out := make([]pathRow, 0, 2048)
+	var skipped int // malformed/empty rows discarded — surfaced below so ingest bugs aren't silent
 	for rows.Next() {
 		var oid, fpk, pj string
 		var pt int
 		var snr sql.NullFloat64
 		if err := rows.Scan(&oid, &fpk, &pt, &pj, &snr); err != nil {
+			skipped++
 			continue
 		}
-		var raw []string
-		if json.Unmarshal([]byte(pj), &raw) != nil || len(raw) == 0 {
+		path := parsePathTokens(pj)
+		if len(path) == 0 {
+			skipped++
 			continue
 		}
-		path := make([]string, len(raw))
-		for i, h := range raw {
-			path[i] = strings.ToUpper(h)
-		}
-		pr := pathRow{observerPK: strings.ToLower(oid), fromPubkey: strings.ToLower(fpk),
-			payloadType: pt, path: path}
+		pr := pathRow{observerPK: oid, fromPubkey: fpk, payloadType: pt, path: path}
 		if snr.Valid {
-			v := snr.Float64
-			pr.snr = &v
+			pr.snr = snr.Float64
+			pr.snrValid = true
 		}
 		out = append(out, pr)
 	}
-	return out
+	if skipped > 0 {
+		log.Printf("[reach] scan discarded %d malformed/empty rows (kept %d)", skipped, len(out))
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[reach] scan rows iteration failed: %v", err)
+		return nil, err
+	}
+	return out, nil
 }

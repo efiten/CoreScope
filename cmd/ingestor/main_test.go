@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -1051,5 +1053,135 @@ func TestHandleMessageObserverIATAWhitelist(t *testing.T) {
 	store.db.QueryRow("SELECT COUNT(*) FROM observers WHERE id='obs2'").Scan(&count)
 	if count != 1 {
 		t.Errorf("observer from whitelisted IATA ARN should be accepted, got count=%d", count)
+	}
+}
+
+// TestBuildPacketDataScopeMatchingNoMatch covers the #1534 regression: a
+// transport-scoped advert from a non-matching region carries
+// IsTransportScoped=true and ScopeName="". The default_scope update guard
+// must skip these packets so previously-correct scopes aren't overwritten
+// with the empty string.
+func TestBuildPacketDataScopeMatchingNoMatch(t *testing.T) {
+	// Code1=2AB5 is the precomputed code for region "#test" (payload="hello",
+	// payloadType=5). Build a region-key map for a DIFFERENT region so
+	// matchScope() finds no match and returns "".
+	const rawHex = "142AB500000068656C6C6F"
+	otherKey, _ := hex.DecodeString("aabbccddeeff00112233445566778899")
+	regionKeys := map[string][]byte{"#other": otherKey}
+
+	decoded, err := DecodePacket(rawHex, nil, false)
+	if err != nil {
+		t.Fatalf("DecodePacket: %v", err)
+	}
+	msg := &MQTTPacketMessage{Raw: rawHex}
+	pktData := BuildPacketData(msg, decoded, "obs1", "region1", regionKeys)
+
+	if !pktData.IsTransportScoped {
+		t.Fatalf("precondition: IsTransportScoped should be true (Code1 != 0000)")
+	}
+	if pktData.ScopeName != "" {
+		t.Fatalf("precondition: ScopeName should be empty (no region match), got %q", pktData.ScopeName)
+	}
+
+	// Regression assertion: when ScopeName is empty, the guard must skip the
+	// UpdateNodeDefaultScope call so an empty value never overwrites a
+	// previously-correct default_scope (#1534).
+	if shouldUpdateDefaultScope(pktData) {
+		t.Errorf("shouldUpdateDefaultScope = true for empty ScopeName; want false (would overwrite default_scope with \"\")")
+	}
+}
+
+// TestHandleMessageAdvert_EmptyScopeSkipsDefaultScopeUpdate is the call-site
+// regression test for #1534. It drives a transport-scoped ADVERT whose
+// region key does NOT match any configured region (so ScopeName=="") through
+// handleMessage end-to-end and asserts that a pre-existing default_scope on
+// the node is NOT overwritten with the empty string. This anchors the
+// call-site guard at main.go:720 — a future refactor that drops the
+// `if shouldUpdateDefaultScope(...)` wrapper and calls
+// `store.UpdateNodeDefaultScope(pubkey, pktData.ScopeName)` unconditionally
+// would re-introduce the #1534 bug and fail this test.
+func TestHandleMessageAdvert_EmptyScopeSkipsDefaultScopeUpdate(t *testing.T) {
+	store := newTestStore(t)
+	source := MQTTSource{Name: "test"}
+
+	// A transport-scoped ADVERT: header byte 0x10 = route_type 0
+	// (TRANSPORT_FLOOD) + payload_type 4 (ADVERT). Code1=AABB (non-zero, so
+	// IsTransportScoped becomes true), Code2=0000, path_byte=00, then a
+	// 100-byte ADVERT payload (32-byte pubkey starting 46D62D… + 4-byte ts
+	// + 64-byte signature) reused from TestHandleMessageAdvertWithTelemetry.
+	const rawHex = "10AABB00000046D62DE27D4C5194D7821FC5A34A45565DCC2537B300B9AB6275255CEFB65D840CE5C169C94C9AED39E8BCB6CB6EB0335497A198B33A1A610CD3B03D8DCFC160900E5244280323EE0B44CACAB8F02B5B38B91CFA18BD067B0B5E63E94CFC85F758A8530B9240933402E0E6B8F84D5252322D52"
+	const pubkey = "46d62de27d4c5194d7821fc5a34a45565dcc2537b300b9ab6275255cefb65d84"
+
+	// Pre-seed the node with a non-empty default_scope so we can detect an
+	// erroneous overwrite with "".
+	if _, err := store.db.Exec(`INSERT INTO nodes (public_key, name, default_scope) VALUES (?, 'Node1', '#belgium')`, pubkey); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	// Empty regionKeys → matchScope() returns "" for any Code1 → ScopeName "".
+	msg := &mockMessage{
+		topic:   "meshcore/SJC/obs1/packets",
+		payload: []byte(`{"raw":"` + rawHex + `"}`),
+	}
+	handleMessage(store, "test", source, msg, nil, map[string][]byte{}, &Config{})
+
+	var got sql.NullString
+	if err := store.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey).Scan(&got); err != nil {
+		t.Fatalf("read default_scope: %v", err)
+	}
+	if !got.Valid || got.String != "#belgium" {
+		t.Errorf("default_scope after empty-scope advert = %q (valid=%v), want #belgium — call-site guard at main.go:720 is missing or broken (#1534)", got.String, got.Valid)
+	}
+}
+
+// TestHandleMessageAdvert_MatchedScopeUpdatesDefaultScope is the positive
+// counterpart: a transport-scoped ADVERT whose Code1 matches a configured
+// region key MUST cause default_scope to be updated to the matched region
+// name. Together with the empty-scope test above this proves the call-site
+// branch routes correctly for both ScopeName states.
+func TestHandleMessageAdvert_MatchedScopeUpdatesDefaultScope(t *testing.T) {
+	store := newTestStore(t)
+	source := MQTTSource{Name: "test"}
+
+	// Same ADVERT bytes; this time we compute the matching region key for
+	// the (payloadType=4, payload=<advert bytes>) tuple so matchScope() will
+	// return "#de".
+	const advertBytes = "46D62DE27D4C5194D7821FC5A34A45565DCC2537B300B9AB6275255CEFB65D840CE5C169C94C9AED39E8BCB6CB6EB0335497A198B33A1A610CD3B03D8DCFC160900E5244280323EE0B44CACAB8F02B5B38B91CFA18BD067B0B5E63E94CFC85F758A8530B9240933402E0E6B8F84D5252322D52"
+	const pubkey = "46d62de27d4c5194d7821fc5a34a45565dcc2537b300b9ab6275255cefb65d84"
+
+	advertRaw, _ := hex.DecodeString(advertBytes)
+	// Derive the region key whose HMAC produces Code1 we can plant in the
+	// header. Choose key = first 16 bytes of HMAC-SHA256(zeros, advertBytes)
+	// is non-deterministic to find; instead pick an arbitrary key and
+	// compute Code1 from it, then build the packet around that Code1.
+	regionKey, _ := hex.DecodeString("0123456789abcdef0123456789abcdef")
+	mac := hmacSHA256(regionKey, append([]byte{4}, advertRaw...))
+	// Per firmware (#1534 helper logic): Code1 is the first 2 bytes of the
+	// HMAC, sentinel-shifted so 0x0000 → 0x0001 and 0xFFFF → 0xFFFE.
+	code := uint16(mac[0]) | (uint16(mac[1]) << 8)
+	if code == 0x0000 {
+		code = 0x0001
+	} else if code == 0xFFFF {
+		code = 0xFFFE
+	}
+	code1 := fmt.Sprintf("%02X%02X", byte(code&0xFF), byte(code>>8))
+	rawHex := "10" + code1 + "000000" + advertBytes
+
+	if _, err := store.db.Exec(`INSERT INTO nodes (public_key, name, default_scope) VALUES (?, 'Node1', '#old')`, pubkey); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	msg := &mockMessage{
+		topic:   "meshcore/SJC/obs1/packets",
+		payload: []byte(`{"raw":"` + rawHex + `"}`),
+	}
+	handleMessage(store, "test", source, msg, nil, map[string][]byte{"#de": regionKey}, &Config{})
+
+	var got sql.NullString
+	if err := store.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey).Scan(&got); err != nil {
+		t.Fatalf("read default_scope: %v", err)
+	}
+	if !got.Valid || got.String != "#de" {
+		t.Errorf("default_scope after matched-scope advert = %q (valid=%v), want #de", got.String, got.Valid)
 	}
 }

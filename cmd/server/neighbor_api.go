@@ -104,6 +104,10 @@ func (s *Server) handleNodeNeighbors(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
+	if s.isPubkeyHidden(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
 
 	minCount := 1
 	if v := r.URL.Query().Get("min_count"); v != "" {
@@ -334,6 +338,10 @@ func (s *Server) computeNeighborGraphResponse(minCount int, minScore float64, re
 		if s.cfg != nil && (s.cfg.IsBlacklisted(e.NodeA) || s.cfg.IsBlacklisted(e.NodeB)) {
 			continue
 		}
+		// #1181: also drop edges touching a hidden-prefix node.
+		if s.isPubkeyHidden(e.NodeA) || s.isPubkeyHidden(e.NodeB) {
+			continue
+		}
 
 		ge := GraphEdge{
 			Source:        e.NodeA,
@@ -429,6 +437,9 @@ func (s *Server) buildNodeInfoMap() map[string]nodeInfo {
 	if s.store == nil {
 		return nil
 	}
+	// FirstSeen is folded into getAllNodes (and therefore into the 30s
+	// node cache) so callers like /api/nodes/{pk}/reach get the field
+	// without a per-request SELECT — fixes #1627 r3 regression.
 	nodes, _ := s.store.getCachedNodesAndPM()
 	m := make(map[string]nodeInfo, len(nodes))
 	for _, n := range nodes {

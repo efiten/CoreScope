@@ -53,6 +53,12 @@ async function run() {
     args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
   });
   const context = await browser.newContext();
+  // #1532 — `.live-controls` defaults collapsed; pre-seed the user's pin
+  // preference so toggle children (#liveHeatToggle, etc.) are visible in
+  // tests that pre-date the change.
+  await context.addInitScript(() => {
+    try { localStorage.setItem('live-controls-expanded', 'true'); } catch (_) {}
+  });
   const page = await context.newPage();
   page.setDefaultTimeout(10000);
 
@@ -871,34 +877,46 @@ async function run() {
     assert(options.length >= 2, `Need >=2 observers, got ${options.length}`);
     await page.selectOption('#compareObsA', options[0]);
     await page.selectOption('#compareObsB', options[1]);
-    await page.waitForFunction(() => {
-      const btn = document.getElementById('compareBtn');
-      return btn && !btn.disabled;
-    }, { timeout: 3000 });
-    await page.click('#compareBtn');
+    // #1646 — comparison auto-runs once both observers are chosen; the
+    // legacy explicit Compare button has been removed entirely. The
+    // picker collapses (.is-collapsed) once the run kicks off.
     await page.waitForFunction(() => {
       const c = document.getElementById('compareContent');
       return c && c.textContent.trim().length > 20;
     }, { timeout: 15000 });
     const hasResults = await page.$eval('#compareContent', el => el.textContent.trim().length > 0);
     assert(hasResults, 'Comparison should produce results');
+    // And the picker should have collapsed (.is-collapsed class).
+    const collapsed = await page.$eval('#compareControls', el => el.classList.contains('is-collapsed'));
+    assert(collapsed, 'Picker should collapse once both observers chosen (.is-collapsed missing)');
+    // The legacy Compare button must NOT exist in the DOM (#1646).
+    const btnExists = await page.$('#compareBtn');
+    assert(btnExists === null, 'Legacy #compareBtn must be removed — auto-run replaces it');
   });
 
   // Test: Compare results show shared/unique breakdown (#129)
   await test('Compare results show shared/unique cards', async () => {
-    // Results should be visible from previous test
-    const cardBoth = await page.$('.compare-card-both');
-    assert(cardBoth, 'Should have "shared" card (.compare-card-both)');
-    const cardA = await page.$('.compare-card-a');
-    assert(cardA, 'Should have "only A" card (.compare-card-a)');
-    const cardB = await page.$('.compare-card-b');
-    assert(cardB, 'Should have "only B" card (.compare-card-b)');
-    // Verify counts are rendered (may be locale-formatted with commas)
-    const counts = await page.$$eval('.compare-card-count', els => els.map(e => e.textContent.trim()));
-    assert(counts.length >= 3, `Expected >=3 summary counts, got ${counts.length}`);
-    counts.forEach((c, i) => {
-      assert(/^[\d,]+$/.test(c), `Count ${i} should be a number but got "${c}"`);
+    // Results should be visible from previous test.
+    // Redesign (#1644) replaced the 3-card layout with a proportional strip
+    // (shared-axis small-multiples): two side segments (A-only / B-only)
+    // flanking a middle segment (shared).
+    const stripMid = await page.$('.compare-strip-mid');
+    assert(stripMid, 'Should have "shared" strip middle (.compare-strip-mid)');
+    const sides = await page.$$('.compare-strip-side');
+    assert(sides.length >= 2, `Should have >=2 side strips (A-only + B-only), got ${sides.length}`);
+    // All three cells now lead with a percentage (#1646 Tufte): two
+    // .compare-strip-side-pct on the sides + one .compare-strip-mid-pct
+    // in the middle. The raw shared count still hangs underneath.
+    const sidePcts = await page.$$eval('.compare-strip-side-pct', els => els.map(e => e.textContent.trim()));
+    const midPct = await page.$eval('.compare-strip-mid-pct', el => el.textContent.trim());
+    assert(sidePcts.length >= 2, `Expected >=2 side pct cells, got ${sidePcts.length}`);
+    assert(/\d+%/.test(midPct), `Mid pct should look like a percentage, got "${midPct}"`);
+    sidePcts.concat([midPct]).forEach((c, i) => {
+      assert(/\d+\s*%/.test(c), `Pct ${i} should contain a % value but got "${c}"`);
     });
+    // The raw shared count exists and is purely numeric (no embedded label).
+    const midCount = await page.$eval('.compare-strip-mid-count', el => el.textContent.trim());
+    assert(/^[\d,]+$/.test(midCount), `Shared count should be a bare number, got "${midCount}"`);
     // Verify tab buttons exist for both/onlyA/onlyB
     const tabs = await page.$$eval('[data-cview]', els => els.map(e => e.getAttribute('data-cview')));
     assert(tabs.includes('both'), 'Should have "both" tab');
@@ -3293,6 +3311,121 @@ async function run() {
       assert(bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent',
         `Expected dropdown item background to be transparent, got ${bg}`);
     }
+  });
+
+  // === Live page Fullscreen tests (#1532) ===
+  await test('Live page: Fullscreen hides unpinned nav and live-header', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+    
+    // Ensure we are not pinned
+    await page.evaluate(() => localStorage.setItem('live-nav-pinned', 'false'));
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+
+    const isFullscreen = await page.evaluate(() => document.body.classList.contains('live-fullscreen'));
+    if (isFullscreen) {
+      await page.click('#liveFullscreenToggle');
+      await page.waitForTimeout(500);
+    }
+
+    // Enter fullscreen
+    await page.click('#liveFullscreenToggle');
+    await page.waitForTimeout(500);
+
+    // Verify fullscreen class is on body
+    assert(await page.evaluate(() => document.body.classList.contains('live-fullscreen')), 'Body should have live-fullscreen class');
+
+    // Verify top nav is hidden
+    const navHidden = await page.evaluate(() => {
+      const nav = document.querySelector('.top-nav');
+      return window.getComputedStyle(nav).display === 'none';
+    });
+    assert(navHidden, 'Top nav should be hidden in fullscreen when unpinned');
+
+    // Verify live header body is hidden
+    const headerBodyHidden = await page.evaluate(() => {
+      const headerBody = document.querySelector('.live-header-body');
+      return !headerBody || window.getComputedStyle(headerBody).display === 'none';
+    });
+    assert(headerBodyHidden, 'Live header body should be hidden in fullscreen');
+
+    // Verify stats row is visible
+    const statsVisible = await page.evaluate(() => {
+      const stats = document.querySelector('.live-stats-row');
+      return stats && window.getComputedStyle(stats).display !== 'none';
+    });
+    assert(statsVisible, 'Live stats row should be visible in fullscreen');
+
+    // Exit fullscreen
+    await page.click('#liveFullscreenToggle');
+    await page.waitForTimeout(500);
+    
+    const navVisible = await page.evaluate(() => {
+      const nav = document.querySelector('.top-nav');
+      return window.getComputedStyle(nav).display !== 'none';
+    });
+    assert(navVisible, 'Top nav should be visible again after exiting fullscreen');
+  });
+
+  // === Live page Controls Cog tests (#1532) ===
+  await test('Live page: Controls cog persistence across reloads', async () => {
+    // Clear state first
+    await page.evaluate(() => localStorage.removeItem('live-controls-expanded'));
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+
+    // Expand the cog menu
+    const cog = await page.$('#liveControlsToggle');
+    if (cog) {
+      let isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      if (!isExpanded) {
+        await cog.click();
+        await page.waitForTimeout(500);
+      }
+      
+      // Verify it's expanded
+      isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      assert(isExpanded, 'Controls should have is-expanded class after clicking cog');
+      
+      // Reload page and verify persistence
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(1000);
+      
+      // Should STILL be expanded
+      isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      assert(isExpanded, 'Controls should persist is-expanded class across reload');
+
+      // Click it again, it should immediately close
+      await page.click('#liveControlsToggle');
+      await page.waitForTimeout(500);
+      isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      assert(!isExpanded, 'Controls should collapse on the first click after a reload');
+    }
+  });
+
+  await test('#1528 .vcr-scope-btn.active background tracks --accent-bg (token swap, not blue literal)', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.vcr-scope-btn.active', { timeout: 8000 });
+    const result = await page.evaluate(() => {
+      const el = document.querySelector('.vcr-scope-btn.active');
+      // Override --accent-bg with a clearly non-blue sentinel so we can detect
+      // whether the rule actually consumes the token (good) or a hardcoded
+      // rgba(59,130,246,...) literal (bad — the theming illusion this fix targets).
+      // Use !important so we beat any customizer-injected :root override.
+      document.documentElement.style.setProperty('--accent-bg', 'rgb(255, 0, 0)', 'important');
+      document.documentElement.style.setProperty('--accent-border', 'rgb(0, 200, 0)', 'important');
+      const bg = window.getComputedStyle(el).backgroundColor;
+      const border = window.getComputedStyle(el).borderColor;
+      document.documentElement.style.removeProperty('--accent-bg');
+      document.documentElement.style.removeProperty('--accent-border');
+      return { bg, border };
+    });
+    // Background should reflect our sentinel red, not blue.
+    assert(/^rgb\(255,\s*0,\s*0\)/.test(result.bg),
+      `.vcr-scope-btn.active bg should track --accent-bg, got ${result.bg}`);
+    assert(/^rgb\(0,\s*200,\s*0\)/.test(result.border),
+      `.vcr-scope-btn.active border should track --accent-border, got ${result.border}`);
   });
 
   await browser.close();

@@ -44,9 +44,9 @@
   };
   // MB_GLYPHS prefix the hash text with a non-color status carrier.
   var MB_GLYPHS = {
-    confirmed: '\u2713', // ✓
+    confirmed: '\u2713', // check
     suspected: '?',
-    unknown:   '\u2717', // ✗
+    unknown:   '\u2717', // x-mark
   };
   // Per-status CSS class (drives the colored 3px left-border in style.css).
   var MB_STATUS_CLASS = {
@@ -149,7 +149,7 @@
                             : ('repeater hash ' + shortHash);
     // Observer indicator stays a star — it is an orthogonal signal, not a status color.
     var obsIndicator = isAlsoObserver
-      ? ' <span aria-hidden="true" style="color:' + (ROLE_COLORS.observer || '#f1c40f') + ';font-size:13px;line-height:1;" title="Also an observer">★</span>'
+      ? ' <span aria-hidden="true" style="color:' + (ROLE_COLORS.observer || '#f1c40f') + ';font-size:13px;line-height:1;" title="Also an observer"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span>'
       : '';
     // Glyph + thin-space (U+2009) + hash. Visible content is aria-hidden so AT
     // reads the aria-label only (avoids "check mark 3 E" literal announcements).
@@ -170,7 +170,7 @@
       <div id="map-wrap" style="position:relative;width:100%;height:100%;display:flex;">
         <div id="leaflet-map" style="flex:1 1 0%;height:100%;"></div>
         <div class="map-side-pane" id="mapSidePane">
-          <div class="pane-toggle" id="mapPaneToggle" title="Path Inspector">◀</div>
+          <div class="pane-toggle" id="mapPaneToggle" title="Path Inspector"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-left"/></svg></div>
           <div class="pane-content">
             <h3 style="margin:0 0 8px 0;font-size:14px;">Path Inspector</h3>
             <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px 0;">Hex prefixes (1-3 bytes), comma or space separated.</p>
@@ -182,9 +182,9 @@
             <div id="mapPiResults"></div>
           </div>
         </div>
-        <button class="map-controls-toggle" id="mapControlsToggle" aria-label="Toggle map controls" aria-expanded="true">⚙️</button>
+        <button class="map-controls-toggle" id="mapControlsToggle" aria-label="Toggle map controls" aria-expanded="true"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-gear"/></svg></button>
         <div class="map-controls" id="mapControls" role="region" aria-label="Map controls">
-          <h3>🗺️ Map Controls</h3>
+          <h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Map Controls</h3>
           <fieldset class="mc-section">
             <legend class="mc-label">Node Types</legend>
             <div id="mcRoleChecks"></div>
@@ -220,7 +220,7 @@
             <label for="mcNeighbors"><input type="checkbox" id="mcNeighbors"> Show direct neighbors</label>
             <div id="mcNeighborRef" style="display:none;font-size:11px;color:var(--text-muted);margin-top:2px;padding-left:20px;">Ref: <span id="mcNeighborRefName">—</span></div>
             <div id="mcNeighborHint" style="display:none;font-size:11px;color:var(--text-muted);margin-top:2px;padding-left:20px;">Click a node marker to set the reference node</div>
-            <label id="mcAffinityDebugLabel" for="mcAffinityDebug" style="display:none"><input type="checkbox" id="mcAffinityDebug"> 🔍 Affinity Debug</label>
+            <label id="mcAffinityDebugLabel" for="mcAffinityDebug" style="display:none"><input type="checkbox" id="mcAffinityDebug"> <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Affinity Debug</label>
           </fieldset>
           <fieldset class="mc-section">
             <legend class="mc-label">Last Heard</legend>
@@ -271,16 +271,25 @@
     // #1420 — multi-provider dark-tile picker. Light mode unchanged.
     let _darkRefLayer = null;  // Esri-only: labels overlay
     function _resolveTileUrl(dark) {
-      if (!dark) return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
       const reg = window.MC_TILE_PROVIDERS || {};
+      if (!dark) {
+        const lightId = (typeof window.MC_getLightTileProvider === 'function') ? window.MC_getLightTileProvider() : null;
+        const lp = lightId ? (reg[lightId] || null) : null;
+        if (lp && lp.url) {
+          return { url: (typeof lp.url === 'function' ? lp.url() : lp.url), attribution: lp.attribution || '© OpenStreetMap © CartoDB', refUrl: null };
+        }
+        return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
+      }
       const id  = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
       const p   = reg[id] || reg['carto-dark'] || {};
       return {
-        url: p.url || p.baseUrl || TILE_DARK,
+        url: (typeof p.url === 'function' ? p.url() : p.url) || (typeof p.baseUrl === 'function' ? p.baseUrl() : p.baseUrl) || TILE_DARK,
         attribution: p.attribution || '© OpenStreetMap © CartoDB',
         refUrl: p.refUrl || null
       };
     }
+    const autoLayerGroup = L.layerGroup().addTo(map);
+    
     function _syncDarkTiles(dark) {
       const r = _resolveTileUrl(dark);
       tileLayer.setUrl(r.url);
@@ -288,16 +297,18 @@
       // Esri reference (labels) overlay: add when needed, remove otherwise.
       if (dark && r.refUrl) {
         if (!_darkRefLayer) {
-          _darkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(map);
+          _darkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(autoLayerGroup);
         } else {
           _darkRefLayer.setUrl(r.refUrl);
+          if (!autoLayerGroup.hasLayer(_darkRefLayer)) _darkRefLayer.addTo(autoLayerGroup);
         }
       } else if (_darkRefLayer) {
-        map.removeLayer(_darkRefLayer);
+        autoLayerGroup.removeLayer(_darkRefLayer);
         _darkRefLayer = null;
       }
       if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
-      if (map.attributionControl) {
+      // Make sure the map is loaded before trying to update the ui
+      if (map && map.attributionControl) {
         try { map.attributionControl._update && map.attributionControl._update(); } catch (_) {}
       }
     }
@@ -305,11 +316,17 @@
     const tileLayer = L.tileLayer(_initTile.url, {
       attribution: _initTile.attribution,
       maxZoom: 19,
-    }).addTo(map);
+    }).addTo(autoLayerGroup);
     if (isDark && _initTile.refUrl) {
-      _darkRefLayer = L.tileLayer(_initTile.refUrl, { maxZoom: 19, attribution: _initTile.attribution }).addTo(map);
+      _darkRefLayer = L.tileLayer(_initTile.refUrl, { maxZoom: 19, attribution: _initTile.attribution }).addTo(autoLayerGroup);
     }
     if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
+    
+    // Add Layer Control, passing 'topleft' to put it on the left
+    if (typeof window.MC_createLayerControl === 'function') {
+      window.MC_createLayerControl(map, autoLayerGroup, 'topleft');
+    }
+
     const _mapThemeObs = new MutationObserver(function () {
       const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
         (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -317,9 +334,10 @@
     });
     _mapThemeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     // #1420 — re-render when the user picks a different dark provider in the customizer.
-    window.addEventListener('mc-tile-provider-changed', function () {
+    window.addEventListener('mc-tile-provider-changed', function (e) {
       const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
         (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (e && e.detail && e.detail.type && e.detail.type !== (dark ? 'dark' : 'light')) return;
       _syncDarkTiles(dark);
     });
 
@@ -619,7 +637,7 @@
     const closeBtn = L.control({ position: 'topright' });
     closeBtn.onAdd = function () {
       const div = L.DomUtil.create('div', 'leaflet-bar');
-      div.innerHTML = '<a href="#" title="Close route" style="font-size:18px;font-weight:bold;text-decoration:none;display:block;width:36px;height:36px;line-height:36px;text-align:center;background:var(--input-bg,#1e293b);color:var(--text,#e2e8f0);border-radius:4px">✕</a>';
+      div.innerHTML = '<a href="#" title="Close route" style="font-size:18px;font-weight:bold;text-decoration:none;display:block;width:36px;height:36px;line-height:36px;text-align:center;background:var(--input-bg,#1e293b);color:var(--text,#e2e8f0);border-radius:4px" aria-label="Close route"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></a>';
       L.DomEvent.on(div, 'click', function (e) {
         L.DomEvent.preventDefault(e);
         routeLayer.clearLayers();
@@ -649,7 +667,7 @@
     // the hop wasn't in the server response. When a node MATCHES by
     // prefix/pubkey but has no GPS coords, we still want its name/role/pubkey
     // for the sidebar — flag it as {resolved:false, gpsless:true} so the
-    // renderer can label it "📍 no GPS" instead of "unresolved prefix".
+    // renderer can label it "no GPS" instead of "unresolved prefix".
     const raw = hopKeys.map(hop => {
       const hopLower = String(hop).toLowerCase();
       // Try server resolution first
@@ -1198,9 +1216,9 @@
       try { REGION_NAMES = await api('/config/regions', { ttl: 3600 }); } catch {}
 
       const aqs = AreaFilter.areaQueryString();
-      // Paginate past the server's 500-row /api/nodes cap so actively-relaying
-      // repeaters that last advertised hours ago still appear instead of being
-      // truncated by the top-500 window. See fetchAllNodes.
+      // Paginate past the server's per-request node cap (listLimits.nodesMax)
+      // so actively-relaying repeaters that last advertised hours ago still
+      // appear instead of being truncated by the top-N window. See fetchAllNodes.
       const data = await fetchAllNodes(`&lastHeard=${filters.lastHeard}${aqs}`, { ttl: CLIENT_TTL.nodeList });
       nodes = data.nodes || [];
 
@@ -1279,7 +1297,7 @@
     const nodePubkeys = new Set(nodes.map(n => (n.public_key || '').toLowerCase()));
     const obsCount = observers.filter(o => o.lat && o.lon && !(o.id && nodePubkeys.has(o.id.toLowerCase()))).length;
     const roles = ['repeater', 'companion', 'room', 'sensor', 'observer'];
-    const shapeMap = { repeater: '◆', companion: '●', room: '■', sensor: '▲', observer: '★' };
+    const shapeMap = { repeater: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-diamond"/></svg>', companion: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg>', room: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-square-fill"/></svg>', sensor: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-triangle"/></svg>', observer: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg>' };
 
     // Count active/stale per role from loaded nodes
     const roleCounts = {};
@@ -1298,7 +1316,7 @@
       const cbId = 'mcRole_' + role;
       const lbl = document.createElement('label');
       lbl.setAttribute('for', cbId);
-      const shape = shapeMap[role] || '●';
+      const shape = shapeMap[role] || '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg>';
       let countStr;
       if (role === 'observer') {
         countStr = `(${obsCount})`;
@@ -1486,7 +1504,10 @@
   }
 
   function _renderMarkersInner() {
-    markerLayer.clearLayers();
+    // Don't clear what doesn't exist (map first loading will throw null error)
+    if (markerLayer) {
+      markerLayer.clearLayers();
+    }
     if (clusterGroup) clusterGroup.clearLayers();
     _currentMarkerData = [];
 
@@ -1689,7 +1710,7 @@
     // Multi-byte support indicator for repeaters
     var mbRow = '';
     if (node.role === 'repeater' && node.multi_byte_status) {
-      var mbLabel = { confirmed: '✅ Confirmed', suspected: '⚠️ Suspected', unknown: '❌ Unknown' }[node.multi_byte_status] || node.multi_byte_status;
+      var mbLabel = { confirmed: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Confirmed', suspected: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Suspected', unknown: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x-circle"/></svg> Unknown' }[node.multi_byte_status] || node.multi_byte_status;
       var mbEvidence = node.multi_byte_evidence ? ' (' + node.multi_byte_evidence + ')' : '';
       mbRow = '<dt style="color:var(--text-muted);float:left;clear:left;width:80px;padding:2px 0;">Multi-byte</dt>' +
         '<dd style="margin-left:88px;padding:2px 0;font-size:12px;">' + mbLabel + mbEvidence + '</dd>';
@@ -1739,7 +1760,9 @@
 
     toggle.addEventListener('click', function () {
       pane.classList.toggle('expanded');
-      toggle.textContent = pane.classList.contains('expanded') ? '▶' : '◀';
+      // #1648 M4: Phosphor sprite glyph for pane toggle (was ▶/◀). // EMOJI-OK: comment
+      toggle.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#' +
+        (pane.classList.contains('expanded') ? 'ph-caret-right' : 'ph-caret-left') + '"/></svg>';
       // Invalidate map size after transition.
       setTimeout(function () { if (map) map.invalidateSize(); }, 220);
     });
@@ -1756,7 +1779,7 @@
     var prefixParam = params.get('prefixes');
     if (prefixParam && input) {
       pane.classList.add('expanded');
-      toggle.textContent = '▶';
+      toggle.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-right"/></svg>';
       input.value = prefixParam;
       setTimeout(function () { if (map) map.invalidateSize(); }, 220);
       mapPiSubmit(prefixParam);
@@ -1802,9 +1825,9 @@
       var rowClass = c.speculative ? 'speculative-row' : '';
       html += '<tr class="' + rowClass + '">';
       html += '<td>' + (i + 1) + '</td>';
-      html += '<td class="' + (c.speculative ? 'speculative-warning' : '') + '">' + c.score.toFixed(2) + (c.speculative ? ' ⚠' : '') + '</td>';
+      html += '<td class="' + (c.speculative ? 'speculative-warning' : '') + '">' + c.score.toFixed(2) + (c.speculative ? ' <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg>' : '') + '</td>';
       html += '<td title="' + safeEsc(c.names.join(' → ')) + '">' + safeEsc(c.names.slice(0, 3).join('→')) + (c.names.length > 3 ? '…' : '') + '</td>';
-      html += '<td><button class="btn btn-sm" data-idx="' + i + '" title="Show on Map">📍</button></td>';
+      html += '<td><button class="btn btn-sm" data-idx="' + i + '" title="Show on Map" aria-label="Show on Map"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg></button></td>';
       html += '</tr>';
       // Per-hop evidence (collapsed).
       html += '<tr class="evidence-row collapsed" data-evidence="' + i + '"><td colspan="4"><div class="evidence-detail" style="font-size:10px;">';
@@ -1941,11 +1964,11 @@
 
       if (!posA) return;
 
-      // Unresolved prefix — show ❓ marker near nodeA
+      // Unresolved prefix - show question marker near nodeA
       if (e.unresolved || (!posB && e.ambiguous)) {
         if (posA) {
           var marker = L.marker([posA[0] + 0.001, posA[1] + 0.001], {
-            icon: L.divIcon({ html: '❓', className: 'affinity-unresolved', iconSize: [20, 20] })
+            icon: L.divIcon({ html: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-question"/></svg>', className: 'affinity-unresolved', iconSize: [20, 20] })
           });
           marker.bindPopup('<b>Unresolved prefix:</b> ' + escapeHtml(e.prefix) + '<br>Observations: ' + e.weight);
           affinityLayer.addLayer(marker);

@@ -297,6 +297,41 @@ type IngestorStats struct {
 	// ProcIO is the ingestor's own /proc/self/io rates (since its previous
 	// sample). Optional — older ingestor builds don't publish this. See #1120.
 	ProcIO *PerfIOSample `json:"procIO,omitempty"`
+	// WriterPerf is the per-component SQLite writer-lock latency
+	// snapshot (#1340). Optional — older ingestor builds don't
+	// publish this. Surfaced under .writer_perf by
+	// handlePerfWriteSources.
+	WriterPerf map[string]WriterStatsSnapshot `json:"writer_perf,omitempty"`
+	// SourceLiveness (PR #1609 M1) is the per-MQTT-source two-clock
+	// snapshot: lastReceiptUnix (broker liveness, stamped at receipt)
+	// vs lastMessageUnix (write-path liveness, stamped post-write).
+	// Surfaced by /api/healthz under .ingest_liveness so operators can
+	// distinguish "broker alive, write path stuck" from "everything
+	// stalled". Optional — older ingestor builds don't publish this.
+	SourceLiveness map[string]SourceLivenessSnapshot `json:"source_liveness,omitempty"`
+}
+
+// SourceLivenessSnapshot mirrors the ingestor's per-MQTT-source liveness
+// pair (PR #1609 M1). Both fields are unix seconds; 0 means "never".
+type SourceLivenessSnapshot struct {
+	LastReceiptUnix int64 `json:"lastReceiptUnix"`
+	LastMessageUnix int64 `json:"lastMessageUnix"`
+}
+
+// WriterStatsSnapshot mirrors the ingestor's per-component writer-lock
+// latency snapshot (#1340). Times are milliseconds. Server-side decode
+// uses this type to keep the JSON contract stable across processes.
+type WriterStatsSnapshot struct {
+	Count           int64   `json:"count"`
+	ContentionTotal int64   `json:"contention_total"`
+	WaitMsP50       float64 `json:"wait_ms_p50"`
+	WaitMsP95       float64 `json:"wait_ms_p95"`
+	WaitMsP99       float64 `json:"wait_ms_p99"`
+	WaitMsMax       float64 `json:"wait_ms_max"`
+	HoldMsP50       float64 `json:"hold_ms_p50"`
+	HoldMsP95       float64 `json:"hold_ms_p95"`
+	HoldMsP99       float64 `json:"hold_ms_p99"`
+	HoldMsMax       float64 `json:"hold_ms_max"`
 }
 
 // IngestorStatsPath is the well-known location where the ingestor writes its
@@ -306,6 +341,111 @@ func IngestorStatsPath() string {
 		return p
 	}
 	return "/tmp/corescope-ingestor-stats.json"
+}
+
+// readIngestorSourceLiveness returns the per-source receipt/write-path
+// liveness map from the ingestor stats file, or nil on any error / older
+// ingestor that doesn't publish the field. PR #1609 M1 — surfaced by
+// /api/healthz under .ingest_liveness so operators can spot "broker
+// alive, write path stuck".
+//
+// /healthz is a hot path (LB / k8s / uptime monitors), so the result
+// is memoized with a short TTL (sourceLivenessCacheTTL) and refreshed
+// whenever the underlying file mtime changes (PR #1623 round-1
+// finding 4). The lock is held briefly; the costly Unmarshal happens
+// at most once per refresh window.
+func readIngestorSourceLiveness() map[string]SourceLivenessSnapshot {
+	path := IngestorStatsPath()
+	now := time.Now()
+
+	sourceLivenessCache.mu.RLock()
+	if sourceLivenessCache.path == path &&
+		now.Sub(sourceLivenessCache.cachedAt) < sourceLivenessCacheTTL {
+		// Cheap mtime probe: if the file moved since we cached, fall
+		// through to the refresh path. Stat is cheap relative to
+		// ReadFile+Unmarshal.
+		info, err := os.Stat(path)
+		fresh := err == nil && info.ModTime().Equal(sourceLivenessCache.mtime)
+		if fresh || (err != nil && sourceLivenessCache.mtime.IsZero()) {
+			out := sourceLivenessCache.value
+			sourceLivenessCache.mu.RUnlock()
+			return out
+		}
+	}
+	sourceLivenessCache.mu.RUnlock()
+
+	sourceLivenessCache.mu.Lock()
+	defer sourceLivenessCache.mu.Unlock()
+	// Re-check under the write lock — another goroutine may have just
+	// refreshed.
+	if sourceLivenessCache.path == path &&
+		time.Since(sourceLivenessCache.cachedAt) < sourceLivenessCacheTTL {
+		info, err := os.Stat(path)
+		fresh := err == nil && info.ModTime().Equal(sourceLivenessCache.mtime)
+		if fresh || (err != nil && sourceLivenessCache.mtime.IsZero()) {
+			return sourceLivenessCache.value
+		}
+	}
+
+	data, err := sourceLivenessReadFile(path)
+	if err != nil {
+		// Cache the negative result too, so a missing file doesn't
+		// hammer the disk under /healthz pressure.
+		sourceLivenessCache.path = path
+		sourceLivenessCache.value = nil
+		sourceLivenessCache.cachedAt = now
+		sourceLivenessCache.mtime = time.Time{}
+		return nil
+	}
+	var st IngestorStats
+	if err := json.Unmarshal(data, &st); err != nil {
+		sourceLivenessCache.path = path
+		sourceLivenessCache.value = nil
+		sourceLivenessCache.cachedAt = now
+		sourceLivenessCache.mtime = time.Time{}
+		return nil
+	}
+	sourceLivenessCache.path = path
+	sourceLivenessCache.value = st.SourceLiveness
+	sourceLivenessCache.cachedAt = now
+	if info, err := os.Stat(path); err == nil {
+		sourceLivenessCache.mtime = info.ModTime()
+	} else {
+		sourceLivenessCache.mtime = time.Time{}
+	}
+	return st.SourceLiveness
+}
+
+// sourceLivenessReadFile is the file-reader used by
+// readIngestorSourceLiveness. Swappable for tests so call counts can
+// be asserted (PR #1623 round-1 finding 4 TTL cache test).
+var sourceLivenessReadFile = os.ReadFile
+
+// sourceLivenessCacheTTL caps how long a parsed liveness map is reused
+// across /healthz probes. 1s is short enough that operators see stale
+// data only briefly during incidents, but long enough to coalesce
+// hundreds of probes/sec from LBs.
+var sourceLivenessCacheTTL = time.Second
+
+// sourceLivenessCache memoizes the parsed liveness map keyed by file
+// path + mtime. See readIngestorSourceLiveness.
+var sourceLivenessCache struct {
+	mu       sync.RWMutex
+	path     string
+	value    map[string]SourceLivenessSnapshot
+	cachedAt time.Time
+	mtime    time.Time
+}
+
+// resetSourceLivenessCache clears the memo. Test-only helper; callable
+// from production code is harmless (next call just re-reads).
+func resetSourceLivenessCache() {
+	sourceLivenessCache.mu.Lock()
+	defer sourceLivenessCache.mu.Unlock()
+	sourceLivenessCache.path = ""
+	sourceLivenessCache.value = nil
+	sourceLivenessCache.cachedAt = time.Time{}
+	sourceLivenessCache.mtime = time.Time{}
 }
 
 // handlePerfWriteSources reads the ingestor's stats file and returns a flat
@@ -342,5 +482,14 @@ func (s *Server) handlePerfWriteSources(w http.ResponseWriter, r *http.Request) 
 	}
 	out["sources"] = sources
 	out["sampleAt"] = st.SampledAt
+	// Surface per-component SQLite writer-lock latency histograms
+	// (#1340) under .writer_perf so operators can see when a
+	// component (e.g. neighbor_builder) is starving the writer.
+	// Empty map when the ingestor is too old to publish this field.
+	if len(st.WriterPerf) > 0 {
+		out["writer_perf"] = st.WriterPerf
+	} else {
+		out["writer_perf"] = map[string]WriterStatsSnapshot{}
+	}
 	writeJSON(w, out)
 }

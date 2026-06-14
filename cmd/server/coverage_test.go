@@ -2289,6 +2289,10 @@ func TestSubpathPrecomputedIndex(t *testing.T) {
 	defer db.Close()
 	store := NewPacketStore(db, nil)
 	store.Load()
+	// #1008: indexes built in background goroutine; wait before reading.
+	if !store.WaitIndexesReady(5 * time.Second) {
+		t.Fatal("indexes never became ready")
+	}
 
 	// After Load(), the precomputed index must be populated.
 	if len(store.spIndex) == 0 {
@@ -2343,6 +2347,10 @@ func TestSubpathTxIndexPopulated(t *testing.T) {
 	defer db.Close()
 	store := NewPacketStore(db, nil)
 	store.Load()
+	// #1008: indexes built in background goroutine; wait before reading.
+	if !store.WaitIndexesReady(5 * time.Second) {
+		t.Fatal("indexes never became ready")
+	}
 
 	// spTxIndex must be populated alongside spIndex
 	if len(store.spTxIndex) == 0 {
@@ -2387,6 +2395,10 @@ func TestSubpathDetailMixedCaseHops(t *testing.T) {
 	defer db.Close()
 	store := NewPacketStore(db, nil)
 	store.Load()
+	// #1008: indexes built in background goroutine; wait before reading.
+	if !store.WaitIndexesReady(5 * time.Second) {
+		t.Fatal("indexes never became ready")
+	}
 
 	// Query with lowercase hops to establish baseline
 	lower := store.GetSubpathDetail([]string{"eeff", "0011"})
@@ -2700,6 +2712,17 @@ func TestHandleAnalyticsDistanceWithStore(t *testing.T) {
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
+
+	// #1011: lazy distance index — first request returns 202; trigger
+	// the build and wait for it before asserting the 200 shape.
+	store.TriggerDistanceIndexBuild()
+	deadline := time.Now().Add(5 * time.Second)
+	for !store.DistanceIndexBuilt() {
+		if time.Now().After(deadline) {
+			t.Fatal("distance index did not finish building within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	req := httptest.NewRequest("GET", "/api/analytics/distance", nil)
 	w := httptest.NewRecorder()

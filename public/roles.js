@@ -374,7 +374,12 @@
         var id = window.MC_getDarkTileProvider();
         var p = window.MC_TILE_PROVIDERS[id];
         if (p && (p.url || p.baseUrl)) {
-          return p.url || p.baseUrl;
+          // #1614: providers added in #1533 (carto/osm/stamen) declare
+          // `url` as a function for lazy config resolution. Invoke it so
+          // we always return a string URL template; L.tileLayer otherwise
+          // stringifies the function source and every tile request 404s.
+          var u = p.url || p.baseUrl;
+          return (typeof u === 'function') ? u() : u;
         }
       }
     } catch (_e) {}
@@ -429,6 +434,11 @@
   // ─── Cache invalidation debounce (ms) ───
   window.CACHE_INVALIDATE_MS = 5000;
 
+  // #1574 — operator-configurable cap on /live map node fetch (overridden
+  // from /api/config/client below). Default mirrors the historical
+  // hardcoded literal in public/live.js.
+  window.LIVE_MAP_MAX_NODES = 2000;
+
   // ─── External URLs ───
   window.EXTERNAL_URLS = {
     flasher: 'https://flasher.meshcore.io/'
@@ -452,14 +462,21 @@
       if (cfg.roles.sort) window.ROLE_SORT = cfg.roles.sort;
     }
     if (cfg.healthThresholds) Object.assign(HEALTH_THRESHOLDS, cfg.healthThresholds);
+    if (cfg.map) {
+      window.MC_MAP_CFG = cfg.map;
+    } else {
+      // Fallback for older configs
+      window.MC_MAP_CFG = { tiles: { providers: {} } };
+    }
+    // Backward compat for older tile URL overrides
     if (cfg.tiles) {
       if (cfg.tiles.dark) window.TILE_DARK = cfg.tiles.dark;
       if (cfg.tiles.light) window.TILE_LIGHT = cfg.tiles.light;
+    } else if (cfg.map && cfg.map.tiles) {
+      if (cfg.map.tiles.darkUrl) window.TILE_DARK = cfg.map.tiles.darkUrl;
+      if (cfg.map.tiles.lightUrl) window.TILE_LIGHT = cfg.map.tiles.lightUrl;
     }
-    // #1420 — server default for dark-tile provider picker.
-    if (typeof cfg.mapDarkTileProvider === 'string' && typeof window.MC_setServerDefaultTileProvider === 'function') {
-      window.MC_setServerDefaultTileProvider(cfg.mapDarkTileProvider);
-    }
+    if (typeof window.MC_initTileRegistry === 'function') window.MC_initTileRegistry(true);
     if (cfg.snrThresholds) Object.assign(SNR_THRESHOLDS, cfg.snrThresholds);
     if (cfg.distThresholds) Object.assign(DIST_THRESHOLDS, cfg.distThresholds);
     if (cfg.maxHopDist != null) window.MAX_HOP_DIST = cfg.maxHopDist;
@@ -469,6 +486,14 @@
     if (cfg.cacheInvalidateMs != null) window.CACHE_INVALIDATE_MS = cfg.cacheInvalidateMs;
     if (cfg.externalUrls) Object.assign(EXTERNAL_URLS, cfg.externalUrls);
     if (cfg.propagationBufferMs != null) window.PROPAGATION_BUFFER_MS = cfg.propagationBufferMs;
+    // #1508 — expose operator-side customizer knobs to customize-v2.js.
+    // Default to an empty disabledTabs list so the .indexOf() guard in
+    // _renderTabs is a no-op when the field is absent.
+    window.MC_CUSTOMIZER_CFG = (cfg.customizer && typeof cfg.customizer === 'object')
+      ? { disabledTabs: Array.isArray(cfg.customizer.disabledTabs) ? cfg.customizer.disabledTabs : [] }
+      : { disabledTabs: [] };
+    // #1574 — operator-configurable cap on /live map node count.
+    if (cfg.liveMapMaxNodes != null) window.LIVE_MAP_MAX_NODES = cfg.liveMapMaxNodes;
     // Sync ROLE_STYLE colors with ROLE_COLORS
     // #1407 — both are now live getters; no manual sync needed. Kept as no-op for clarity.
   }).catch(function () { /* use defaults */ });
@@ -746,7 +771,7 @@
     if (!severity) return '';
     var cls = 'skew-badge skew-badge--' + severity;
     if (severity === 'no_clock') {
-      return '<span class="' + cls + '" title="Uninitialized RTC — no valid clock">🚫 No Clock</span>';
+      return '<span class="' + cls + '" title="Uninitialized RTC — no valid clock"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-prohibit"/></svg> No Clock</span>';
     }
     if (severity === 'bimodal_clock' && cs) {
       var badPct = cs.goodFraction != null ? Math.round((1 - cs.goodFraction) * 100) : '?';

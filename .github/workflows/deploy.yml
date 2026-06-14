@@ -57,7 +57,7 @@ jobs:
           go build .
           # -race gates PR #1208's atomic.Pointer migration: the race-detector
           # is what makes path_inspect_atomic_race_test.go actually assert.
-          go test -race -coverprofile=server-coverage.out ./... 2>&1 | tee server-test.log
+          go test -timeout 15m -race -coverprofile=server-coverage.out ./... 2>&1 | tee server-test.log
           echo "--- Go Server Coverage ---"
           go tool cover -func=server-coverage.out | tail -1
 
@@ -66,7 +66,7 @@ jobs:
           set -e -o pipefail
           cd cmd/ingestor
           go build .
-          go test -coverprofile=ingestor-coverage.out ./... 2>&1 | tee ingestor-test.log
+          go test -timeout 15m -coverprofile=ingestor-coverage.out ./... 2>&1 | tee ingestor-test.log
           echo "--- Go Ingestor Coverage ---"
           go tool cover -func=ingestor-coverage.out | tail -1
 
@@ -96,6 +96,7 @@ jobs:
           node test-packet-filter.js
           node test-packet-filter-time.js
           node test-channels-merge-1498-unit.js
+          node test-issue-1518-home-url.js
           node test-channel-decrypt-insecure-context.js
           node test-live-region-filter.js
           node test-issue-1136-observer-iata-map.js
@@ -116,6 +117,8 @@ jobs:
           node test-issue-1364-pill-no-clamp.js
           node test-issue-1375-scope-stats-fetch.js
           node test-issue-1361-cb-presets.js
+          node test-issue-1380-cb-sim-overlay.js
+          node test-issue-1380-cb-reset-button.js
           node test-issue-1407-cb-preset-propagation.js
           node test-issue-1412-customizer-no-override.js
           node test-issue-1418-raw-hex-extraction.js
@@ -125,11 +128,19 @@ jobs:
           node test-issue-1418-deeplink-hops-channels.js
           node test-issue-1418-polish-review.js
           node test-issue-1420-tile-providers.js
+          node test-issue-1614-tile-url-function.js
           node test-issue-1438-marker-css-vars.js
+          node test-issue-1562-observers-summary.js
+          node test-issue-1509-nav-active-bg.js
+          node test-issue-1509-detect-preset.js
           node test-live.js
           node test-fetch-all-nodes-pagination.js
+          node test-issue-1532-live-fullscreen.js
+          node test-issue-1619-feed-detail-card-draggable.js
           node test-xss-escape-sinks.js
           node test-preflight-xss-gate.js
+          node test-traces.js
+          node test-issue-1648-m4-emoji-scan.js
 
       - name: 🛡️ Preflight XSS gate — actual --diff check (PR only)
         # The fixture self-test above (test-preflight-xss-gate.js) only
@@ -347,6 +358,7 @@ jobs:
           BASE_URL=http://localhost:13581 node test-map-modal-fluid-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-map-nodes-pagination-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-observer-iata-1188-e2e.js 2>&1 | tee -a e2e-output.txt
+          BASE_URL=http://localhost:13581 node test-issue-1639-observers-sort-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-fluid-1055-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-priority-1102-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-priority-1311-e2e.js 2>&1 | tee -a e2e-output.txt
@@ -386,6 +398,13 @@ jobs:
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1206-vcr-overlap-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1244-live-vcr-row-hints-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1510-live-nav-pin-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-live-fullscreen-1572-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1599-replay-freeze-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1648-m1-icons-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1648-m2-icons-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1648-m3-icons-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1648-m4-icons-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1657-analytics-channels-group-sprites-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1224-channels-mobile-ux-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1367-channels-chat-app-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1236-map-mobile-e2e.js 2>&1 | tee -a e2e-output.txt
@@ -407,6 +426,7 @@ jobs:
           BASE_URL=http://localhost:13581 node test-customize-display-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-customize-export-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-drag-manager-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1567-corner-clears-drag-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1306-collisions-terminology-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1374-route-map-a11y-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-list-render-e2e.js 2>&1 | tee -a e2e-output.txt
@@ -416,6 +436,28 @@ jobs:
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-ws-batch-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-ws-race-1498-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1487-byop-modal-layout-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1630-reach-mobile-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1640-compare-discovery-e2e.js 2>&1 | tee -a e2e-output.txt
+
+      # #1616: slide-over focus-restore flake-gate. Runs the slide-over
+      # E2E 20 consecutive times against the SAME backend instance so
+      # the Chromium-headless focus race documented in #1172/#1616 has
+      # a 20× shot at firing. Any single non-zero exit aborts. This is
+      # the architectural-fix gate — if it ever turns red post-merge,
+      # the focused-but-hidden state has crept back in.
+      #
+      # PERMANENT step. Adds ~3-4 min to the e2e-test job in exchange
+      # for closing out a flake family that was blocking ~8 unrelated
+      # PRs at a time. If profiling pressures the budget later, drop
+      # repeat count first; do not delete.
+      - name: Slide-over E2E flake-gate (#1616, --repeat-each=20)
+        run: |
+          set -e
+          for i in $(seq 1 20); do
+            echo "--- slide-over E2E run $i/20 ---"
+            BASE_URL=http://localhost:13581 node test-slideover-1056-e2e.js 2>&1 | tee -a slideover-repeat-output.txt
+          done
+          echo "20 passed"
 
       - name: Collect frontend coverage (parallel)
         if: success() && github.event_name == 'push'

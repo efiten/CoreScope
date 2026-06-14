@@ -27,6 +27,12 @@ func setupTestServer(t *testing.T) (*Server, *mux.Router) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	// #1008: Load() now defers subpath + path-hop index builds to a
+	// background goroutine. Wait for them before handlers go live so
+	// the existing assertions (which expect 200, not 503) hold.
+	if !store.WaitIndexesReady(5 * time.Second) {
+		t.Fatalf("background indexes never became ready")
+	}
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -43,6 +49,10 @@ func setupTestServerWithAPIKey(t *testing.T, apiKey string) (*Server, *mux.Route
 	store := NewPacketStore(db, nil)
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
+	}
+	// #1008: see setupTestServer comment.
+	if !store.WaitIndexesReady(5 * time.Second) {
+		t.Fatalf("background indexes never became ready")
 	}
 	srv.store = store
 	router := mux.NewRouter()
@@ -229,6 +239,19 @@ func TestStatsEndpoint(t *testing.T) {
 	}
 	if bt, ok := body["buildTime"]; !ok || bt == nil {
 		t.Error("expected non-nil buildTime field in stats response")
+	}
+	// Regression (#1546): server-side async backfill was removed in #1289
+	// (backfill moved to the ingestor). The dead "backfilling"/"backfillProgress"
+	// fields had no writer and reported backfilling:true forever. They must not
+	// reappear in the response, and the X-CoreScope-Status header is gone with them.
+	if _, ok := body["backfilling"]; ok {
+		t.Error("stats response must not carry the removed backfilling flag (#1546)")
+	}
+	if _, ok := body["backfillProgress"]; ok {
+		t.Error("stats response must not carry the removed backfillProgress field (#1546)")
+	}
+	if got := w.Header().Get("X-CoreScope-Status"); got != "" {
+		t.Errorf("X-CoreScope-Status header must not be set (#1546), got %q", got)
 	}
 }
 
@@ -613,7 +636,17 @@ func TestContentTypeJSON(t *testing.T) {
 }
 
 func TestAllEndpointsReturn200(t *testing.T) {
-	_, router := setupTestServer(t)
+	srv, router := setupTestServer(t)
+	// #1011: ensure /api/analytics/distance returns 200 (not the
+	// lazy-build 202) by pre-warming the index.
+	srv.store.TriggerDistanceIndexBuild()
+	deadline := time.Now().Add(5 * time.Second)
+	for !srv.store.DistanceIndexBuilt() {
+		if time.Now().After(deadline) {
+			t.Fatal("distance index did not finish building within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	endpoints := []struct {
 		path   string
 		status int
@@ -1056,6 +1089,7 @@ func TestChannelMessagesWithRegion(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -1141,7 +1175,17 @@ func TestAnalyticsChannels(t *testing.T) {
 }
 
 func TestAnalyticsDistance(t *testing.T) {
-	_, router := setupTestServer(t)
+	srv, router := setupTestServer(t)
+	// #1011: lazy distance index — trigger build and wait for it
+	// before asserting 200 shape.
+	srv.store.TriggerDistanceIndexBuild()
+	deadline := time.Now().Add(5 * time.Second)
+	for !srv.store.DistanceIndexBuilt() {
+		if time.Now().After(deadline) {
+			t.Fatal("distance index did not finish building within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	req := httptest.NewRequest("GET", "/api/analytics/distance", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -1299,6 +1343,7 @@ func TestResolveHopsAmbiguous(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -1545,6 +1590,7 @@ func TestNodeAnalyticsNoNameNode(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -1581,6 +1627,7 @@ func TestNodeHealthForNoNameNode(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -1862,7 +1909,6 @@ func TestHandlerErrorPaths(t *testing.T) {
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
 
-
 	t.Run("stats error", func(t *testing.T) {
 		db.conn.Exec("DROP TABLE IF EXISTS transmissions")
 		req := httptest.NewRequest("GET", "/api/stats", nil)
@@ -2083,220 +2129,221 @@ func TestHandlerErrorBulkHealth(t *testing.T) {
 	}
 }
 
-
 func TestAnalyticsChannelsNoNullArrays(t *testing.T) {
-_, router := setupTestServer(t)
-req := httptest.NewRequest("GET", "/api/analytics/channels", nil)
-w := httptest.NewRecorder()
-router.ServeHTTP(w, req)
+	_, router := setupTestServer(t)
+	req := httptest.NewRequest("GET", "/api/analytics/channels", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
 
-if w.Code != 200 {
-t.Fatalf("expected 200, got %d", w.Code)
-}
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
 
-raw := w.Body.String()
-var body map[string]interface{}
-if err := json.Unmarshal([]byte(raw), &body); err != nil {
-t.Fatalf("invalid JSON: %v", err)
-}
+	raw := w.Body.String()
+	var body map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
 
-arrayFields := []string{"channels", "topSenders", "channelTimeline", "msgLengths"}
-for _, field := range arrayFields {
-val, exists := body[field]
-if !exists {
-t.Errorf("missing field %q", field)
-continue
-}
-if val == nil {
-t.Errorf("field %q is null, expected empty array []", field)
-continue
-}
-if _, ok := val.([]interface{}); !ok {
-t.Errorf("field %q is not an array, got %T", field, val)
-}
-}
+	arrayFields := []string{"channels", "topSenders", "channelTimeline", "msgLengths"}
+	for _, field := range arrayFields {
+		val, exists := body[field]
+		if !exists {
+			t.Errorf("missing field %q", field)
+			continue
+		}
+		if val == nil {
+			t.Errorf("field %q is null, expected empty array []", field)
+			continue
+		}
+		if _, ok := val.([]interface{}); !ok {
+			t.Errorf("field %q is not an array, got %T", field, val)
+		}
+	}
 }
 
 func TestAnalyticsChannelsNoStoreFallbackNoNulls(t *testing.T) {
-db := setupTestDB(t)
-seedTestData(t, db)
-cfg := &Config{Port: 3000}
-hub := NewHub()
-srv := NewServer(db, cfg, hub)
-router := mux.NewRouter()
-srv.RegisterRoutes(router)
+	db := setupTestDB(t)
+	seedTestData(t, db)
+	cfg := &Config{Port: 3000}
+	hub := NewHub()
+	srv := NewServer(db, cfg, hub)
+	router := mux.NewRouter()
+	srv.RegisterRoutes(router)
 
-req := httptest.NewRequest("GET", "/api/analytics/channels", nil)
-w := httptest.NewRecorder()
-router.ServeHTTP(w, req)
+	req := httptest.NewRequest("GET", "/api/analytics/channels", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
 
-if w.Code != 200 {
-t.Fatalf("expected 200, got %d", w.Code)
-}
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
 
-var body map[string]interface{}
-json.Unmarshal(w.Body.Bytes(), &body)
+	var body map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &body)
 
-arrayFields := []string{"channels", "topSenders", "channelTimeline", "msgLengths"}
-for _, field := range arrayFields {
-if body[field] == nil {
-t.Errorf("field %q is null in DB fallback, expected []", field)
-}
-}
+	arrayFields := []string{"channels", "topSenders", "channelTimeline", "msgLengths"}
+	for _, field := range arrayFields {
+		if body[field] == nil {
+			t.Errorf("field %q is null in DB fallback, expected []", field)
+		}
+	}
 }
 
 func TestNodeHashSizeEnrichment(t *testing.T) {
-t.Run("nil info leaves defaults", func(t *testing.T) {
-node := map[string]interface{}{
-"public_key":             "abc123",
-"hash_size":              nil,
-"hash_size_inconsistent": false,
-}
-EnrichNodeWithHashSize(node, nil)
-if node["hash_size"] != nil {
-t.Error("expected hash_size to remain nil with nil info")
-}
-})
+	t.Run("nil info leaves defaults", func(t *testing.T) {
+		node := map[string]interface{}{
+			"public_key":             "abc123",
+			"hash_size":              nil,
+			"hash_size_inconsistent": false,
+		}
+		EnrichNodeWithHashSize(node, nil)
+		if node["hash_size"] != nil {
+			t.Error("expected hash_size to remain nil with nil info")
+		}
+	})
 
-t.Run("enriches with computed data", func(t *testing.T) {
-node := map[string]interface{}{
-"public_key":             "abc123",
-"hash_size":              nil,
-"hash_size_inconsistent": false,
-}
-info := &hashSizeNodeInfo{
-HashSize:     2,
-AllSizes:     map[int]bool{1: true, 2: true},
-Seq:          []int{1, 2, 1, 2},
-Inconsistent: true,
-}
-EnrichNodeWithHashSize(node, info)
-if node["hash_size"] != 2 {
-t.Errorf("expected hash_size 2, got %v", node["hash_size"])
-}
-if node["hash_size_inconsistent"] != true {
-t.Error("expected hash_size_inconsistent true")
-}
-sizes, ok := node["hash_sizes_seen"].([]int)
-if !ok {
-t.Fatal("expected hash_sizes_seen to be []int")
-}
-if len(sizes) != 2 || sizes[0] != 1 || sizes[1] != 2 {
-t.Errorf("expected [1,2], got %v", sizes)
-}
-})
+	t.Run("enriches with computed data", func(t *testing.T) {
+		node := map[string]interface{}{
+			"public_key":             "abc123",
+			"hash_size":              nil,
+			"hash_size_inconsistent": false,
+		}
+		info := &hashSizeNodeInfo{
+			HashSize:     2,
+			AllSizes:     map[int]bool{1: true, 2: true},
+			Seq:          []int{1, 2, 1, 2},
+			Inconsistent: true,
+		}
+		EnrichNodeWithHashSize(node, info)
+		if node["hash_size"] != 2 {
+			t.Errorf("expected hash_size 2, got %v", node["hash_size"])
+		}
+		if node["hash_size_inconsistent"] != true {
+			t.Error("expected hash_size_inconsistent true")
+		}
+		sizes, ok := node["hash_sizes_seen"].([]int)
+		if !ok {
+			t.Fatal("expected hash_sizes_seen to be []int")
+		}
+		if len(sizes) != 2 || sizes[0] != 1 || sizes[1] != 2 {
+			t.Errorf("expected [1,2], got %v", sizes)
+		}
+	})
 
-t.Run("single size omits sizes_seen", func(t *testing.T) {
-node := map[string]interface{}{
-"public_key":             "abc123",
-"hash_size":              nil,
-"hash_size_inconsistent": false,
-}
-info := &hashSizeNodeInfo{
-HashSize: 3,
-AllSizes: map[int]bool{3: true},
-Seq:      []int{3, 3, 3},
-}
-EnrichNodeWithHashSize(node, info)
-if node["hash_size"] != 3 {
-t.Errorf("expected hash_size 3, got %v", node["hash_size"])
-}
-if node["hash_size_inconsistent"] != false {
-t.Error("expected hash_size_inconsistent false")
-}
-if _, exists := node["hash_sizes_seen"]; exists {
-t.Error("hash_sizes_seen should not be set for single size")
-}
-})
+	t.Run("single size omits sizes_seen", func(t *testing.T) {
+		node := map[string]interface{}{
+			"public_key":             "abc123",
+			"hash_size":              nil,
+			"hash_size_inconsistent": false,
+		}
+		info := &hashSizeNodeInfo{
+			HashSize: 3,
+			AllSizes: map[int]bool{3: true},
+			Seq:      []int{3, 3, 3},
+		}
+		EnrichNodeWithHashSize(node, info)
+		if node["hash_size"] != 3 {
+			t.Errorf("expected hash_size 3, got %v", node["hash_size"])
+		}
+		if node["hash_size_inconsistent"] != false {
+			t.Error("expected hash_size_inconsistent false")
+		}
+		if _, exists := node["hash_sizes_seen"]; exists {
+			t.Error("hash_sizes_seen should not be set for single size")
+		}
+	})
 }
 
 func TestGetNodeHashSizeInfoFlipFlop(t *testing.T) {
-db := setupTestDB(t)
-seedTestData(t, db)
-store := NewPacketStore(db, nil)
-if err := store.Load(); err != nil {
-	t.Fatalf("store.Load failed: %v", err)
-}
+	db := setupTestDB(t)
+	seedTestData(t, db)
+	store := NewPacketStore(db, nil)
+	if err := store.Load(); err != nil {
+		t.Fatalf("store.Load failed: %v", err)
+	}
+	store.WaitIndexesReady(5 * time.Second)
 
-pk := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'TestNode', 'repeater')", pk)
+	pk := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'TestNode', 'repeater')", pk)
 
-decoded := `{"name":"TestNode","pubKey":"` + pk + `"}`
-raw1 := "11" + "01" + "aabb"
-raw2 := "11" + "41" + "aabb"
+	decoded := `{"name":"TestNode","pubKey":"` + pk + `"}`
+	raw1 := "11" + "01" + "aabb"
+	raw2 := "11" + "41" + "aabb"
 
-payloadType := 4
-for i := 0; i < 3; i++ {
-rawHex := raw1
-if i%2 == 1 {
-rawHex = raw2
-}
-tx := &StoreTx{
-ID:          9000 + i,
-RawHex:      rawHex,
-Hash:        "testhash" + strconv.Itoa(i),
-FirstSeen:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
-PayloadType: &payloadType,
-DecodedJSON: decoded,
-}
-store.packets = append(store.packets, tx)
-store.byPayloadType[4] = append(store.byPayloadType[4], tx)
-}
+	payloadType := 4
+	for i := 0; i < 3; i++ {
+		rawHex := raw1
+		if i%2 == 1 {
+			rawHex = raw2
+		}
+		tx := &StoreTx{
+			ID:          9000 + i,
+			RawHex:      rawHex,
+			Hash:        "testhash" + strconv.Itoa(i),
+			FirstSeen:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			PayloadType: &payloadType,
+			DecodedJSON: decoded,
+		}
+		store.packets = append(store.packets, tx)
+		store.byPayloadType[4] = append(store.byPayloadType[4], tx)
+	}
 
-info := store.GetNodeHashSizeInfo()
-ni := info[pk]
-if ni == nil {
-t.Fatal("expected hash info for test node")
-}
-if len(ni.AllSizes) != 2 {
-t.Errorf("expected 2 unique sizes, got %d", len(ni.AllSizes))
-}
-if !ni.Inconsistent {
-t.Error("expected inconsistent flag to be true for flip-flop pattern")
-}
+	info := store.GetNodeHashSizeInfo()
+	ni := info[pk]
+	if ni == nil {
+		t.Fatal("expected hash info for test node")
+	}
+	if len(ni.AllSizes) != 2 {
+		t.Errorf("expected 2 unique sizes, got %d", len(ni.AllSizes))
+	}
+	if !ni.Inconsistent {
+		t.Error("expected inconsistent flag to be true for flip-flop pattern")
+	}
 }
 
 func TestGetNodeHashSizeInfoDominant(t *testing.T) {
-// A node with mostly 2-byte adverts and an occasional 1-byte advert; the
-// latest advert (2-byte) determines the reported hash size.
-db := setupTestDB(t)
-seedTestData(t, db)
-store := NewPacketStore(db, nil)
-if err := store.Load(); err != nil {
-	t.Fatalf("store.Load failed: %v", err)
-}
-
-pk := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'Repeater2B', 'repeater')", pk)
-
-decoded := `{"name":"Repeater2B","pubKey":"` + pk + `"}`
-raw1byte := "11" + "01" + "aabb" // FLOOD, pathByte=0x01 → hashSize=1
-raw2byte := "11" + "41" + "aabb" // FLOOD, pathByte=0x41 → hashSize=2
-
-payloadType := 4
-// 1 packet with hashSize=1, 4 packets with hashSize=2 (latest is 2-byte)
-raws := []string{raw1byte, raw2byte, raw2byte, raw2byte, raw2byte}
-for i, raw := range raws {
-	tx := &StoreTx{
-		ID:          8000 + i,
-		RawHex:      raw,
-		Hash:        "dominant" + strconv.Itoa(i),
-		FirstSeen:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
-		PayloadType: &payloadType,
-		DecodedJSON: decoded,
+	// A node with mostly 2-byte adverts and an occasional 1-byte advert; the
+	// latest advert (2-byte) determines the reported hash size.
+	db := setupTestDB(t)
+	seedTestData(t, db)
+	store := NewPacketStore(db, nil)
+	if err := store.Load(); err != nil {
+		t.Fatalf("store.Load failed: %v", err)
 	}
-	store.packets = append(store.packets, tx)
-	store.byPayloadType[4] = append(store.byPayloadType[4], tx)
-}
+	store.WaitIndexesReady(5 * time.Second)
 
-info := store.GetNodeHashSizeInfo()
-ni := info[pk]
-if ni == nil {
-	t.Fatal("expected hash info for test node")
-}
-if ni.HashSize != 2 {
-	t.Errorf("HashSize=%d, want 2 (latest advert should determine hash size)", ni.HashSize)
-}
+	pk := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'Repeater2B', 'repeater')", pk)
+
+	decoded := `{"name":"Repeater2B","pubKey":"` + pk + `"}`
+	raw1byte := "11" + "01" + "aabb" // FLOOD, pathByte=0x01 → hashSize=1
+	raw2byte := "11" + "41" + "aabb" // FLOOD, pathByte=0x41 → hashSize=2
+
+	payloadType := 4
+	// 1 packet with hashSize=1, 4 packets with hashSize=2 (latest is 2-byte)
+	raws := []string{raw1byte, raw2byte, raw2byte, raw2byte, raw2byte}
+	for i, raw := range raws {
+		tx := &StoreTx{
+			ID:          8000 + i,
+			RawHex:      raw,
+			Hash:        "dominant" + strconv.Itoa(i),
+			FirstSeen:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			PayloadType: &payloadType,
+			DecodedJSON: decoded,
+		}
+		store.packets = append(store.packets, tx)
+		store.byPayloadType[4] = append(store.byPayloadType[4], tx)
+	}
+
+	info := store.GetNodeHashSizeInfo()
+	ni := info[pk]
+	if ni == nil {
+		t.Fatal("expected hash info for test node")
+	}
+	if ni.HashSize != 2 {
+		t.Errorf("HashSize=%d, want 2 (latest advert should determine hash size)", ni.HashSize)
+	}
 }
 
 func TestGetNodeHashSizeInfoLatestWins(t *testing.T) {
@@ -2308,6 +2355,7 @@ func TestGetNodeHashSizeInfoLatestWins(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	pk := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'LatestWins', 'repeater')", pk)
@@ -2357,6 +2405,7 @@ func TestGetNodeHashSizeInfoIgnoreDirectZeroHop(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	pk := "dddd111122223333444455556666777788889999aaaabbbbccccddddeeee3333"
 	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'DirIgnore', 'repeater')", pk)
@@ -2404,6 +2453,7 @@ func TestGetNodeHashSizeInfoOnlyDirectZeroHopIgnored(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	pk := "eeee111122223333444455556666777788889999aaaabbbbccccddddeeee4444"
 	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'OnlyDirect', 'repeater')", pk)
@@ -2438,6 +2488,7 @@ func TestGetNodeHashSizeInfoDirectNonZeroHopCounted(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	pk := "ffff111122223333444455556666777788889999aaaabbbbccccddddeeee5555"
 	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'DirNonZero', 'repeater')", pk)
@@ -2477,6 +2528,7 @@ func TestGetNodeHashSizeInfoNoAdverts(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	pk := "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'NoAdverts', 'repeater')", pk)
@@ -2510,6 +2562,7 @@ func TestHashAnalyticsZeroHopAdvert(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	// Capture baseline from seed data (bypass cache via computeAnalyticsHashSizes)
 	baseline := store.computeAnalyticsHashSizes("", "")
@@ -2569,6 +2622,7 @@ func TestAnalyticsHashSizeSameNameDifferentPubkey(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	pk1 := "aaaa111122223333444455556666777788889999aaaabbbbccccddddeeee1111"
 	pk2 := "aaaa111122223333444455556666777788889999aaaabbbbccccddddeeee2222"
@@ -2610,23 +2664,23 @@ func TestAnalyticsHashSizeSameNameDifferentPubkey(t *testing.T) {
 }
 
 func TestAnalyticsHashSizesNoNullArrays(t *testing.T) {
-_, router := setupTestServer(t)
-req := httptest.NewRequest("GET", "/api/analytics/hash-sizes", nil)
-w := httptest.NewRecorder()
-router.ServeHTTP(w, req)
+	_, router := setupTestServer(t)
+	req := httptest.NewRequest("GET", "/api/analytics/hash-sizes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
 
-if w.Code != 200 {
-t.Fatalf("expected 200, got %d", w.Code)
-}
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
 
-var body map[string]interface{}
-json.Unmarshal(w.Body.Bytes(), &body)
+	var body map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &body)
 
-arrayFields := []string{"hourly", "topHops", "multiByteNodes"}
-for _, field := range arrayFields {
-if body[field] == nil {
-t.Errorf("field %q is null, expected []", field)
-}
+	arrayFields := []string{"hourly", "topHops", "multiByteNodes"}
+	for _, field := range arrayFields {
+		if body[field] == nil {
+			t.Errorf("field %q is null, expected []", field)
+		}
 	}
 }
 func TestInconsistentNodesExcludesCompanions(t *testing.T) {
@@ -2637,6 +2691,7 @@ func TestInconsistentNodesExcludesCompanions(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	payloadType := 4
@@ -2720,6 +2775,7 @@ func TestHashSizeInfoTimeWindow(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	pk := "dd44444444444444444444444444444444444444444444444444444444444444"
 	db.conn.Exec("INSERT OR IGNORE INTO nodes (public_key, name, role) VALUES (?, 'OldNode', 'repeater')", pk)
@@ -2891,6 +2947,7 @@ func TestLatestSeenMaintained(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	store.mu.RLock()
 	defer store.mu.RUnlock()
@@ -2955,6 +3012,7 @@ func TestQueryGroupedPacketsSortedByLatest(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	result := store.QueryGroupedPackets(PacketQuery{Limit: 50})
 	if result.Total < 2 {
@@ -2992,6 +3050,7 @@ func TestQueryGroupedPacketsCacheReturnsConsistentResult(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	q := PacketQuery{Limit: 50}
 	r1 := store.QueryGroupedPackets(q)
@@ -3021,6 +3080,7 @@ func TestGetChannelsCacheReturnsConsistentResult(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	r1 := store.GetChannels("")
 	r2 := store.GetChannels("")
@@ -3059,6 +3119,7 @@ func TestGetChannelsNotBlockedByLargeLock(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	channels := store.GetChannels("")
 
@@ -3295,6 +3356,7 @@ func TestHashCollisionsCacheTTL(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 
 	if store.collisionCacheTTL != 3600*time.Second {
 		t.Errorf("expected collisionCacheTTL=3600s, got %v", store.collisionCacheTTL)
@@ -3339,6 +3401,7 @@ func TestHashCollisionsEmptyStore(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -3391,6 +3454,7 @@ func TestHashCollisionsWithCollision(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	// Inject hash_size=1 for both nodes so they appear in the 1-byte bucket
 	store.hashSizeInfoMu.Lock()
 	store.hashSizeInfoCache = map[string]*hashSizeNodeInfo{
@@ -3457,6 +3521,7 @@ func TestHashCollisionsShortPublicKey(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -3489,6 +3554,7 @@ func TestHashCollisionsMissingCoordinates(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
 	}
+	store.WaitIndexesReady(5 * time.Second)
 	srv.store = store
 	router := mux.NewRouter()
 	srv.RegisterRoutes(router)
@@ -3552,7 +3618,7 @@ func TestHashCollisionsOnlyRepeaters(t *testing.T) {
 	store.hashSizeInfoCache = map[string]*hashSizeNodeInfo{
 		"aa11223344556677": {HashSize: 1, AllSizes: map[int]bool{1: true}},
 		"aa00112233445566": {HashSize: 1, AllSizes: map[int]bool{1: true}},
-		"aa99887766554433": {HashSize: 0, AllSizes: map[int]bool{}},       // unknown
+		"aa99887766554433": {HashSize: 0, AllSizes: map[int]bool{}},        // unknown
 		"aadeadbeefcafe01": {HashSize: 1, AllSizes: map[int]bool{1: true}}, // companion
 		"aabbcc1122334455": {HashSize: 1, AllSizes: map[int]bool{1: true}}, // room
 		"aabbcc9988776655": {HashSize: 1, AllSizes: map[int]bool{1: true}}, // sensor
@@ -3594,6 +3660,80 @@ func TestHashCollisionsOnlyRepeaters(t *testing.T) {
 	}
 	if len(collisions) == 1 && len(collisions[0].Nodes) != 2 {
 		t.Errorf("expected 2 nodes in collision, got %d", len(collisions[0].Nodes))
+	}
+}
+
+// TestHashCollisionsOneByteIncludesMultiBytePrefixRepeaters verifies that the
+// 1-byte Hash Usage Matrix view includes the first byte of repeaters configured
+// for 2-byte and 3-byte prefixes. In MeshCore, a multi-byte hash repeater still
+// occupies its first byte in the 1-byte hash space, so any 1-byte path-matching
+// collides on that first byte regardless of the configured prefix size. Omitting
+// these under-reports real conflicts in the 1-byte space. (#1218)
+func TestHashCollisionsOneByteIncludesMultiBytePrefixRepeaters(t *testing.T) {
+	db := setupTestDB(t)
+
+	// Three repeaters with first byte "CC":
+	//   - cc11... (hash_size=1) — already counted in 1-byte view
+	//   - cc22aa... (hash_size=2) — must now be counted in 1-byte view's CC cell
+	//   - cc33bbdd... (hash_size=3) — must now be counted in 1-byte view's CC cell
+	// One unrelated repeater with first byte "DD" must NOT appear in CC cell.
+	now := time.Now().Format("2006-01-02 15:04:05")
+	db.conn.Exec(`INSERT INTO nodes (public_key, name, role, last_seen) VALUES
+		('cc11223344556677', 'Rep1B',  'repeater', ?),
+		('cc22aabbccddeeff', 'Rep2B',  'repeater', ?),
+		('cc33bbddeeff0011', 'Rep3B',  'repeater', ?),
+		('dd44556677889900', 'RepDD',  'repeater', ?)`, now, now, now, now)
+
+	cfg := &Config{Port: 3000}
+	hub := NewHub()
+	srv := NewServer(db, cfg, hub)
+	store := NewPacketStore(db, nil)
+	store.Load()
+	srv.store = store
+
+	store.hashSizeInfoMu.Lock()
+	store.hashSizeInfoCache = map[string]*hashSizeNodeInfo{
+		"cc11223344556677": {HashSize: 1, AllSizes: map[int]bool{1: true}},
+		"cc22aabbccddeeff": {HashSize: 2, AllSizes: map[int]bool{2: true}},
+		"cc33bbddeeff0011": {HashSize: 3, AllSizes: map[int]bool{3: true}},
+		"dd44556677889900": {HashSize: 1, AllSizes: map[int]bool{1: true}},
+	}
+	store.hashSizeInfoAt = time.Now()
+	store.hashSizeInfoMu.Unlock()
+
+	result := store.computeHashCollisions("", "")
+	bySize := result["by_size"].(map[string]interface{})
+	size1 := bySize["1"].(map[string]interface{})
+
+	cells, ok := size1["one_byte_cells"].(map[string][]collisionNode)
+	if !ok {
+		t.Fatalf("one_byte_cells has unexpected type %T", size1["one_byte_cells"])
+	}
+
+	ccNodes := cells["CC"]
+	if len(ccNodes) != 3 {
+		t.Errorf("expected 3 nodes in one_byte_cells[CC] (1B + 2B + 3B repeaters), got %d", len(ccNodes))
+	}
+	seen := map[string]bool{}
+	for _, n := range ccNodes {
+		seen[strings.ToLower(n.PublicKey)] = true
+	}
+	for _, pk := range []string{"cc11223344556677", "cc22aabbccddeeff", "cc33bbddeeff0011"} {
+		if !seen[pk] {
+			t.Errorf("expected one_byte_cells[CC] to include %s, missing", pk)
+		}
+	}
+	// Sanity: DD repeater must not be in CC cell.
+	if seen["dd44556677889900"] {
+		t.Errorf("one_byte_cells[CC] unexpectedly contains DD repeater")
+	}
+
+	// Sanity: the same multi-byte repeaters must NOT be added to the 2/3-byte
+	// view's repeater roster (that view continues to bucket by configured size).
+	size2 := bySize["2"].(map[string]interface{})
+	stats2 := size2["stats"].(map[string]interface{})
+	if n, _ := stats2["nodes_for_byte"].(int); n != 1 {
+		t.Errorf("expected 2-byte view nodes_for_byte=1, got %v", stats2["nodes_for_byte"])
 	}
 }
 
@@ -3666,6 +3806,11 @@ func TestNodePathsPrefixCollisionFilter(t *testing.T) {
 	store := NewPacketStore(srv.db, nil)
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load failed: %v", err)
+	}
+	// #1008: wait for the background index build to complete before
+	// hitting the handler (otherwise it returns 503 index-loading).
+	if !store.WaitIndexesReady(5 * time.Second) {
+		t.Fatal("indexes never became ready")
 	}
 	srv.store = store
 
@@ -4021,7 +4166,7 @@ func TestHandleScopeStats(t *testing.T) {
 	}{
 		{"h1", "#belgium", 0},
 		{"h2", "#belgium", 3},
-		{"h3", "", 0},    // transport-scoped, no region match
+		{"h3", "", 0},      // transport-scoped, no region match
 		{"h4_null", "", 0}, // will be inserted with NULL scope_name
 	}
 	for i, r := range rows {
@@ -4541,4 +4686,35 @@ func TestGetNodesForGeoPrune(t *testing.T) {
 
 // TestDeleteNodesByPubkeys was removed in PR #738 follow-up: the DELETE has
 // been relocated to the ingestor (cmd/ingestor/prune_geofilter.go). End-to-end
-// coverage of the prune flow now lives in cmd/ingestor/*_test.go.
+// TestListLimitsConfigurable verifies that list limits are driven by the configuration.
+func TestListLimitsConfigurable(t *testing.T) {
+	srv, router := setupTestServer(t)
+
+	// Inject a custom config
+	srv.cfg.ListLimits = &ListLimitsConfig{
+		PacketsMax: 1234,
+	}
+
+	// Request with a limit larger than the configured max
+	req := httptest.NewRequest("GET", "/api/packets?limit=999999", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+
+	limit, ok := body["limit"].(float64)
+	if !ok {
+		t.Fatal("expected limit field in response")
+	}
+
+	if limit != 1234 {
+		t.Errorf("expected limit to be capped at 1234, got %v", limit)
+	}
+}

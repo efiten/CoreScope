@@ -73,7 +73,7 @@
   function setObserverIataMap(m) { observerIataMap = m || {}; }
 
   // #1189 R2 mesh-operator fix: live feed must show the observer's IATA pill
-  // alongside the existing 👁 N badge so operators on /live can tell SAME-
+  // alongside the existing observation-count badge so operators on /live can tell SAME-
   // region from CROSS-region reception at a glance (same affordance as the
   // /packets table). Mirrors `obsIataBadge` in public/packets.js — kept as a
   // local helper for now (live.js and packets.js are separate IIFEs with no
@@ -137,6 +137,11 @@
     timelineFetchedScope: 0, // last fetched scope to avoid redundant fetches
     replayGen: 0,            // generation counter — incremented on each replay/rewind to discard stale async results
   };
+  // #1599 — drop live WS packets during a manual replay handoff without
+  // entering VCR PAUSED (which freezes the canvas engine and kills the very
+  // animation we want to play). The handoff sets this true, then clears it
+  // after the replay window has elapsed.
+  let suppressLive = false;
 
   // ROLE_COLORS loaded from shared roles.js (includes 'unknown')
 
@@ -148,8 +153,8 @@
   };
 
   const PAYLOAD_ICONS = {
-    ADVERT: '📡', GRP_TXT: '💬', TXT_MSG: '✉️', ACK: '✓',
-    REQUEST: '❓', RESPONSE: '📨', TRACE: '🔍', PATH: '🛤️'
+    ADVERT: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg>', GRP_TXT: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chat-circle"/></svg>', TXT_MSG: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg>', ACK: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check"/></svg>',
+    REQUEST: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-question"/></svg>', RESPONSE: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg>', TRACE: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg>', PATH: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-path"/></svg>'
   };
 
   /* ---- Panel Corner Positioning (#608 M0) ---- */
@@ -215,6 +220,14 @@
     var nextIdx = (CORNER_CYCLE.indexOf(current) + 1) % 4;
     var next = nextAvailableCorner(panelId, CORNER_CYCLE[nextIdx], positions);
     try { localStorage.setItem('panel-corner-' + panelId, next); } catch (_) { /* quota */ }
+    // #1567: corner button must clear any prior free-form drag state, or
+    // the inline top/left from drag-manager.js wins the cascade over the
+    // corner anchors and the panel silently no-ops on click.
+    // #1568 round-1 MAJOR 2: shared cleaner — keeps Escape revert,
+    // responsive gate, corner-click, and reset paths in sync.
+    if (window.DragManager && DragManager.clearPanel) {
+      DragManager.clearPanel(document.getElementById(panelId), panelId);
+    }
     applyPanelPosition(panelId, next);
     // Announce for screen readers
     var announce = document.getElementById('panelPositionAnnounce');
@@ -224,6 +237,11 @@
   function resetPanelPositions() {
     for (var id in PANEL_DEFAULTS) {
       try { localStorage.removeItem('panel-corner-' + id); } catch (_) { /* ignore */ }
+      // #1568 round-1 MAJOR 1: clear drag state before applying defaults,
+      // otherwise a dragged panel's inline coords win the cascade.
+      if (window.DragManager && DragManager.clearPanel) {
+        DragManager.clearPanel(document.getElementById(id), id);
+      }
       applyPanelPosition(id, PANEL_DEFAULTS[id]);
     }
   }
@@ -246,7 +264,7 @@
     const iso = d && isFinite(d.getTime()) ? d.toISOString() : null;
     const f = formatTimestampWithTooltip(iso, getTimestampMode());
     const warn = f.isFuture
-      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed">⚠️</span>'
+      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
       : '';
     return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
   }
@@ -326,6 +344,12 @@
     function publish() {
       var h = Math.ceil(bar.getBoundingClientRect().height) || 58;
       page.style.setProperty('--vcr-bar-height', h + 'px');
+      // #1568 round-2: also publish on :root so JS reading
+      // getComputedStyle(document.documentElement).getPropertyValue(
+      // '--vcr-bar-height') sees the measured value (E2E assertions,
+      // future global consumers). CSS resolution unchanged — the
+      // .live-page-scoped var still wins for live-overlay rules.
+      try { document.documentElement.style.setProperty('--vcr-bar-height', h + 'px'); } catch (_) {}
     }
     publish();
     var ro = null;
@@ -458,7 +482,7 @@
     // Fetch packets from DB for the time window
     const now = Date.now();
     const from = new Date(now - ms).toISOString();
-    fetch(`/api/packets?limit=2000&grouped=false&expand=observations&since=${encodeURIComponent(from)}`)
+    fetch(`/api/packets?limit=${window.LIVE_MAP_MAX_NODES}&grouped=false&expand=observations&since=${encodeURIComponent(from)}`)
       .then(r => r.json())
       .then(data => {
         const pkts = (data.packets || []).reverse(); // oldest first
@@ -880,6 +904,10 @@
       if (_tabHidden) {
         return;
       }
+      // #1599 — manual replay handoff sets suppressLive=true so incoming live
+      // WS packets don't clutter the replay animation. We still want the
+      // timeline to tick so the UI shows traffic continuing.
+      if (suppressLive) { updateTimeline(); return; }
       if (realisticPropagation && pkt.hash) {
         const hash = pkt.hash;
         if (propagationBuffer.has(hash)) {
@@ -1035,6 +1063,11 @@
       <div class="live-page">
         <div id="liveMap" style="width:100%;height:100%;position:absolute;top:0;left:0;z-index:1"></div>
         <div class="live-overlay live-header" id="liveHeader">
+          <div class="live-header-body" data-live-header-body id="liveHeaderBody">
+            <div class="live-title">
+              MESH LIVE
+            </div>
+          </div>
           <div class="live-header-critical" data-live-header-critical>
             <span class="live-beacon" aria-label="WebSocket connection beacon"></span>
             <div class="live-stat-pill live-stat-pill--critical"><span id="livePktCount">0</span> pkts</div>
@@ -1050,12 +1083,8 @@
           </div>
           <button class="live-header-toggle" data-live-header-toggle id="liveHeaderToggle"
                   aria-expanded="false" aria-controls="liveHeaderBody"
-                  aria-label="Show live stats">📊</button>
-          <div class="live-header-body" data-live-header-body id="liveHeaderBody">
-            <div class="live-title">
-              MESH LIVE
-            </div>
-          </div>
+                  aria-label="Show live stats"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg></button>
+
         <!-- #1205: settings toggles are children of the MESH LIVE panel
              (#liveHeader), not a free-floating .live-overlay. PR #1180
              detached them; this restores the pre-regression structure. -->
@@ -1074,18 +1103,22 @@
             <span id="matrixDesc" class="sr-only">Animate packet hex bytes flowing along paths like the Matrix</span>
             <label><input type="checkbox" id="liveMatrixRainToggle" aria-describedby="rainDesc"> Rain</label>
             <span id="rainDesc" class="sr-only">Matrix rain overlay — packets fall as hex columns</span>
-            <label><input type="checkbox" id="liveAudioToggle" aria-describedby="audioDesc"> 🎵 Audio</label>
+            <label><input type="checkbox" id="liveAudioToggle" aria-describedby="audioDesc"> <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-music-note"/></svg> Audio</label>
             <span id="audioDesc" class="sr-only">Sonify packets — turn raw bytes into generative music</span>
             <label><input type="checkbox" id="liveFavoritesToggle" aria-describedby="favDesc"> ⭐ Favorites</label>
             <span id="favDesc" class="sr-only">Show only favorited and claimed nodes</span>
             <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
             </div>
-            <div class="live-node-filter-wrap" style="position:relative">
-              <input type="text" id="liveNodeFilterInput" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input" role="combobox" aria-expanded="false" aria-owns="liveNodeFilterDropdown" aria-autocomplete="list" aria-activedescendant="">
-              <div id="liveNodeFilterDropdown" class="live-node-filter-dropdown hidden" role="listbox"></div>
-              <button id="liveNodeFilterClear" class="vcr-btn" title="Clear node filter" style="display:none">×</button>
+            <div class="live-toggles">
+              <div class="live-node-filter-wrap" style="position:relative">
+                <label class="live-node-filter-hitarea" style="display:inline-flex; align-items:center; min-height:44px; cursor:text;">
+                  <input type="text" id="liveNodeFilterInput" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input" role="combobox" aria-expanded="false" aria-owns="liveNodeFilterDropdown" aria-autocomplete="list" aria-activedescendant="">
+                </label>
+                <div id="liveNodeFilterDropdown" class="live-node-filter-dropdown hidden" role="listbox"></div>
+                <button id="liveNodeFilterClear" class="vcr-btn" title="Clear node filter" style="display:none">×</button>
+              </div>
+              <div id="liveNodeFilterCount" class="live-filter-count hidden"></div>
             </div>
-            <div id="liveNodeFilterCount" class="live-filter-count hidden"></div>
             <div id="liveRegionFilter" class="region-filter-container live-region-filter-container" aria-label="Filter live packets by IATA region"></div>
             <div id="liveAreaFilter" class="live-area-filter-container"></div>
             <div class="audio-controls hidden" id="audioControls">
@@ -1094,30 +1127,27 @@
               <label class="audio-slider-label">Vol <input type="range" id="audioVolSlider" min="0" max="100" value="30" class="audio-slider"><span id="audioVolVal">30</span></label>
             </div>
           </div>
-          <button class="live-controls-toggle" data-live-controls-toggle id="liveControlsToggle"
-                  aria-expanded="false" aria-controls="liveControlsBody"
-                  aria-label="Show live controls">⚙</button>
         </div>
         </div><!-- /#liveHeader -->
         <div class="live-overlay live-feed" id="liveFeed">
           <div class="panel-header">
             <button class="panel-corner-btn" data-panel="liveFeed" title="Move panel to next corner" aria-label="Move panel to next corner">◫</button>
-            <button class="feed-hide-btn" id="feedHideBtn" title="Hide feed">✕</button>
+            <button class="feed-hide-btn" id="feedHideBtn" title="Hide feed" aria-label="Hide feed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>
           </div>
           <div class="panel-content" aria-live="polite" aria-relevant="additions" role="log">
             <div class="live-feed-empty" aria-hidden="true">Waiting for packets…</div>
           </div>
         </div>
-        <button class="feed-show-btn hidden" id="feedShowBtn" title="Show feed">📋</button>
+        <button class="feed-show-btn hidden" id="feedShowBtn" title="Show feed" aria-label="Show feed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-clipboard-text"/></svg></button>
         <div id="nodeDetailBackdrop" class="node-detail-backdrop"></div>
         <div class="live-overlay live-node-detail hidden" id="liveNodeDetail">
           <div class="panel-header">
             <button class="panel-corner-btn" data-panel="liveNodeDetail" title="Move panel to next corner" aria-label="Move panel to next corner">◫</button>
-            <button class="feed-hide-btn" id="nodeDetailClose" title="Close">✕</button>
+            <button class="feed-hide-btn" id="nodeDetailClose" title="Close" aria-label="Close"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>
           </div>
           <div class="panel-content" id="nodeDetailContent"></div>
         </div>
-        <button class="legend-toggle-btn" id="legendToggleBtn" aria-label="Show legend" title="Show legend">🎨</button>
+        <button class="legend-toggle-btn" id="legendToggleBtn" aria-label="Show legend" title="Show legend"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-palette"/></svg></button>
         <div class="live-overlay live-legend" id="liveLegend" role="region" aria-label="Map legend">
           <div class="panel-header">
             <button class="panel-corner-btn" data-panel="liveLegend" title="Move panel to next corner" aria-label="Move panel to next corner">◫</button>
@@ -1331,42 +1361,103 @@
     // #1420 — multi-provider dark-tile picker. Light mode unchanged.
     let _liveDarkRefLayer = null;
     function _liveResolveTile(dark) {
-      if (!dark) return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
       const reg = window.MC_TILE_PROVIDERS || {};
+      if (!dark) {
+        const lightId = (typeof window.MC_getLightTileProvider === 'function') ? window.MC_getLightTileProvider() : null;
+        const lp = lightId ? (reg[lightId] || null) : null;
+        if (lp && lp.url) {
+          return { url: (typeof lp.url === 'function' ? lp.url() : lp.url), attribution: lp.attribution || '© OpenStreetMap © CartoDB', refUrl: null };
+        }
+        return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
+      }
       const id  = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
       const p   = reg[id] || reg['carto-dark'] || {};
       return {
-        url: p.url || p.baseUrl || TILE_DARK,
+        url: (typeof p.url === 'function' ? p.url() : p.url) || (typeof p.baseUrl === 'function' ? p.baseUrl() : p.baseUrl) || TILE_DARK,
         attribution: p.attribution || '© OpenStreetMap © CartoDB',
         refUrl: p.refUrl || null
       };
     }
+    const liveAutoLayerGroup = L.layerGroup().addTo(map);
+
     function _liveSyncDarkTiles(dark) {
       const r = _liveResolveTile(dark);
       tileLayer.setUrl(r.url);
       if (tileLayer.options) tileLayer.options.attribution = r.attribution;
       if (dark && r.refUrl) {
         if (!_liveDarkRefLayer) {
-          _liveDarkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(map);
+          _liveDarkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(liveAutoLayerGroup);
         } else {
           _liveDarkRefLayer.setUrl(r.refUrl);
+          if (!liveAutoLayerGroup.hasLayer(_liveDarkRefLayer)) _liveDarkRefLayer.addTo(liveAutoLayerGroup);
         }
       } else if (_liveDarkRefLayer) {
-        map.removeLayer(_liveDarkRefLayer);
+        liveAutoLayerGroup.removeLayer(_liveDarkRefLayer);
         _liveDarkRefLayer = null;
       }
       if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
       // #1420 parity with map.js — refresh visible attribution credit after provider swap.
-      if (map.attributionControl) {
+      // Make sure the map is loaded before trying to update the ui
+      if (map && map.attributionControl) {
         try { map.attributionControl._update && map.attributionControl._update(); } catch (_) {}
       }
     }
     const _liveInitTile = _liveResolveTile(isDark);
-    let tileLayer = L.tileLayer(_liveInitTile.url, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(map);
+    let tileLayer = L.tileLayer(_liveInitTile.url, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
     if (isDark && _liveInitTile.refUrl) {
-      _liveDarkRefLayer = L.tileLayer(_liveInitTile.refUrl, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(map);
+      _liveDarkRefLayer = L.tileLayer(_liveInitTile.refUrl, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
     }
     if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
+  
+    // Add Zoom Control
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    // Add Layer Control, passing 'topright' to put it on the right
+    if (typeof window.MC_createLayerControl === 'function') {
+      window.MC_createLayerControl(map, liveAutoLayerGroup, 'topright');
+    }
+
+    // Add custom Leaflet Control for Fullscreen
+    const LiveFullscreenControl = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function() {
+        const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control live-leaflet-toggle');
+        const btn = L.DomUtil.create('a', '', container);
+        btn.href = 'javascript:void(0)';
+        btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-arrows-out"/></svg>';
+        btn.id = 'liveFullscreenToggle';
+        btn.title = 'Fullscreen (F)';
+        btn.setAttribute('aria-label', 'Toggle fullscreen');
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('aria-pressed', 'false');
+        L.DomEvent.disableClickPropagation(btn);
+        return container;
+      }
+    });
+    map.addControl(new LiveFullscreenControl());
+
+    // Add custom Leaflet Control for Settings
+    const LiveSettingsControl = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function() {
+        const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control live-leaflet-toggle');
+        const btn = L.DomUtil.create('a', 'live-controls-toggle', container);
+        btn.href = 'javascript:void(0)';
+        btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-gear"/></svg>';
+        btn.id = 'liveControlsToggle';
+        btn.setAttribute('data-live-controls-toggle', '');
+        btn.title = 'Settings';
+        btn.setAttribute('aria-label', 'Show live controls');
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('aria-expanded', 'false');
+        btn.setAttribute('aria-controls', 'liveControlsBody');
+        L.DomEvent.disableClickPropagation(btn);
+        return container;
+      }
+    });
+    map.addControl(new LiveSettingsControl());
+
+
 
     // Swap tiles when theme changes
     const _themeObs = new MutationObserver(function () {
@@ -1376,12 +1467,12 @@
     });
     _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     // #1420 — re-render on customizer change.
-    window.addEventListener('mc-tile-provider-changed', function () {
+    window.addEventListener('mc-tile-provider-changed', function (e) {
       const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
         (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (e && e.detail && e.detail.type && e.detail.type !== (dark ? 'dark' : 'light')) return;
       _liveSyncDarkTiles(dark);
     });
-    L.control.zoom({ position: 'topright' }).addTo(map);
 
     // #1485 — animations + trails need their own pane above markerPane.
     // PR #1334 moved node markers from L.circleMarker (overlayPane @ 400)
@@ -1417,8 +1508,15 @@
       try {
         const parsed = JSON.parse(replayData);
         const packets = Array.isArray(parsed) ? parsed : [parsed];
-        vcrPause(); // suppress live packets
+        // #1599 — mute live WS traffic but keep VCR in LIVE so the canvas
+        // engine keeps advancing animation progress. Using vcrPause() here
+        // set VCR.mode='PAUSED' which froze anim.progress in
+        // renderAnimations(), turning the replay into a blank, motionless map.
+        suppressLive = true;
         setTimeout(() => renderPacketTree(packets, true), 1500);
+        // Clear the suppression after the replay window has elapsed (the
+        // longest animation duration plus a margin) so live traffic resumes.
+        setTimeout(() => { suppressLive = false; }, 12000);
       } catch { }
     } else {
       // replayRecent(); // disabled — live page starts empty, fills from WS
@@ -1766,6 +1864,10 @@
       });
       voiceSelect.value = MeshAudio.getVoiceName() || voices[0] || '';
       voiceSelect.addEventListener('change', (e) => MeshAudio.setVoice(e.target.value));
+      
+      if (voices.length <= 1) {
+        voiceSelect.parentElement.style.display = 'none';
+      }
     }
 
     audioToggle.addEventListener('change', (e) => {
@@ -1851,17 +1953,33 @@
       function applyForViewport() {
         for (var i = 0; i < pairs.length; i++) {
           var p = pairs[i];
-          if (narrowMql.matches) {
-            // Default collapsed at narrow viewports
-            setExpanded(p, false);
+          var root = document.getElementById(p.rootId);
+          if (!root) continue;
+          
+          if (p.rootId === 'liveControls') {
+            // #1532 - liveControls is an accordion on all viewports,
+            // persisting state across reloads via localStorage.
+            if (!root.classList.contains('is-expanded') && !root.classList.contains('is-collapsed')) {
+              var startExpanded = false;
+              try {
+                if (localStorage.getItem('live-controls-expanded') === 'true') {
+                  startExpanded = true;
+                }
+              } catch (_) { /* private browsing */ }
+              setExpanded(p, startExpanded);
+            }
           } else {
-            // Always expanded; no hidden attr; no collapse class
-            var root = document.getElementById(p.rootId);
-            var body = document.getElementById(p.bodyId);
-            var tog = document.getElementById(p.togId);
-            if (body) body.removeAttribute('hidden');
-            if (root) { root.classList.remove('is-collapsed'); root.classList.remove('is-expanded'); }
-            if (tog)  { tog.setAttribute('aria-expanded', 'true'); }
+            // liveHeader is collapsible on narrow screens, permanently open on wide
+            if (narrowMql.matches) {
+              if (!root.classList.contains('is-expanded')) setExpanded(p, false);
+            } else {
+              var body = document.getElementById(p.bodyId);
+              var tog = document.getElementById(p.togId);
+              if (body) body.removeAttribute('hidden');
+              root.classList.remove('is-collapsed'); 
+              root.classList.remove('is-expanded');
+              if (tog) tog.setAttribute('aria-expanded', 'true');
+            }
           }
         }
       }
@@ -1872,6 +1990,11 @@
           var root = document.getElementById(p.rootId);
           var nowExpanded = !(root && root.classList.contains('is-expanded'));
           setExpanded(p, nowExpanded);
+          // #1532 — persist controls pin state across reloads.
+          if (p.rootId === 'liveControls') {
+            try { localStorage.setItem('live-controls-expanded', nowExpanded ? 'true' : 'false'); }
+            catch (_) { /* private browsing */ }
+          }
         });
       });
       applyForViewport();
@@ -1888,19 +2011,89 @@
     })();
     // ───────────────────────────────────────────────────────────────────────
 
+    // ── #1532 — Live fullscreen toggle ─────────────────────────────────────
+    // Adds `body.live-fullscreen` which CSS uses to hide header body,
+    // controls body, VCR controls, and bottom-nav while leaving
+    // .live-stats-row pinned top-right. Triggered by:
+    //   * clicking #liveFullscreenToggle (fullscreen button next to gear)
+    //   • pressing the `F` key (when focus is not in an input/textarea)
+    // State persists across reloads via localStorage('live-fullscreen').
+    (function wireLiveFullscreenToggle() {
+      var STORAGE_KEY = 'live-fullscreen';
+      var btn = document.getElementById('liveFullscreenToggle');
+      if (btn) btn.addEventListener('click', function () { toggleFullscreen(); });
+      function setFullscreen(on) {
+        document.body.classList.toggle('live-fullscreen', !!on);
+        if (btn) {
+          btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+          btn.innerHTML = on ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-arrows-out"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-arrows-out"/></svg>';
+          btn.setAttribute('aria-label', on
+            ? 'Exit fullscreen (F)'
+            : 'Toggle fullscreen (F) — hide chrome, keep stats');
+        }
+        try { localStorage.setItem(STORAGE_KEY, on ? 'true' : 'false'); }
+        catch (_) { /* private browsing */ }
+      }
+      function toggleFullscreen() {
+        setFullscreen(!document.body.classList.contains('live-fullscreen'));
+      }
+      // Restore prior choice on mount.
+      try {
+        if (localStorage.getItem(STORAGE_KEY) === 'true') setFullscreen(true);
+      } catch (_) { /* ignore */ }
+
+      // `F` keypress toggles fullscreen — but only when focus is NOT in
+      // a typing surface (node-filter input, audio sliders, etc.).
+      // Escape exits fullscreen (only when currently in fullscreen so we
+      // don't shadow other Escape handlers, e.g. dropdown close on the
+      // node-filter input).
+      if (!window.__liveFullscreenKeyBound) {
+        window.addEventListener('keydown', function (e) {
+          if (e.defaultPrevented) return;
+          if (typeof e.key !== 'string') return;
+          // Only act when on the live page.
+          if (!document.querySelector('.live-page')) return;
+          // Escape: exit fullscreen if currently in fullscreen. Don't
+          // gate on focus-in-input here — exiting fullscreen via Escape
+          // should always work when chrome is hidden. Do NOT fire when
+          // not currently in fullscreen so other handlers see the key.
+          if (e.key === 'Escape') {
+            if (document.body.classList.contains('live-fullscreen')) {
+              e.preventDefault();
+              setFullscreen(false);
+            }
+            return;
+          }
+          if (e.altKey || e.ctrlKey || e.metaKey) return;
+          var isF = (e.key === 'f' || e.key === 'F' || e.key.toLowerCase() === 'f');
+          if (!isF) return;
+          var t = e.target;
+          if (t) {
+            var tag = (t.tagName || '').toUpperCase();
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+            if (t.isContentEditable) return;
+          }
+          e.preventDefault();
+          toggleFullscreen();
+        });
+        window.__liveFullscreenKeyBound = true;
+      }
+    })();
+    // ───────────────────────────────────────────────────────────────────────
+
     if (legendToggleBtn && legendEl) {
       // Restore legend collapsed state from localStorage (#279)
       try {
         if (localStorage.getItem('live-legend-hidden') === 'true') {
           legendEl.classList.add('hidden');
           legendToggleBtn.setAttribute('aria-label', 'Show legend');
-          legendToggleBtn.textContent = '🎨';
+          legendToggleBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-palette"/></svg>';
         }
       } catch (_) { /* private browsing / storage disabled */ }
       legendToggleBtn.addEventListener('click', () => {
         const nowHidden = legendEl.classList.toggle('hidden');
         legendToggleBtn.setAttribute('aria-label', nowHidden ? 'Show legend' : 'Hide legend');
-        legendToggleBtn.textContent = nowHidden ? '🎨' : '✕';
+        legendToggleBtn.innerHTML = nowHidden ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-palette"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg>';
         try { localStorage.setItem('live-legend-hidden', String(nowHidden)); } catch (_) { /* ignore */ }
       });
     }
@@ -1912,6 +2105,9 @@
     // Initialize DragManager for free-form panel dragging (#608 M1)
     if (window.DragManager) {
       var dragMgr = new DragManager();
+      // #1619: expose so the feed-detail-card popup (constructed in a
+      // different scope) can register itself as draggable.
+      window._liveDragMgr = dragMgr;
       var dragPanels = ['liveFeed', 'liveLegend', 'liveNodeDetail'];
       for (var di = 0; di < dragPanels.length; di++) {
         dragMgr.register(document.getElementById(dragPanels[di]));
@@ -1922,14 +2118,12 @@
       var dragMql = window.matchMedia('(pointer: fine) and (min-width: 768px)');
       function onDragMediaChange(e) {
         if (!e.matches) {
-          // Revert dragged panels to corner positions
+          // Revert dragged panels to corner positions. Preserve the
+          // localStorage drag key so widening the viewport restores
+          // the dragged position via dragMgr.restorePositions().
+          // #1568 round-1 MAJOR 2: shared cleaner with clearStorage:false.
           document.querySelectorAll('.live-overlay[data-dragged="true"]').forEach(function (p) {
-            delete p.dataset.dragged;
-            p.style.transform = '';
-            p.style.top = '';
-            p.style.left = '';
-            p.style.right = '';
-            p.style.bottom = '';
+            DragManager.clearPanel(p, p.id, { clearStorage: false });
           });
           initPanelPositions();
           dragMgr.disable();
@@ -2195,12 +2389,13 @@
       pinBtn.className = 'nav-pin-btn';
       pinBtn.setAttribute('aria-label', 'Pin navigation open');
       pinBtn.setAttribute('title', 'Pin navigation open');
-      pinBtn.textContent = '📌';
+      pinBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-push-pin"/></svg>';
       pinBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         _navCleanup.pinned = !_navCleanup.pinned;
         pinBtn.classList.toggle('pinned', _navCleanup.pinned);
         pinBtn.setAttribute('aria-pressed', _navCleanup.pinned);
+        document.body.classList.toggle('nav-pinned', _navCleanup.pinned);
         try { localStorage.setItem('live-nav-pinned', _navCleanup.pinned); } catch (_) {}
         if (_navCleanup.pinned) {
           clearTimeout(_navCleanup.timeout);
@@ -2212,6 +2407,7 @@
         if (_navCleanup.pinned) {
         pinBtn.classList.add('pinned');
         pinBtn.setAttribute('aria-pressed', 'true');
+        document.body.classList.add('nav-pinned');
         topNav.classList.remove('nav-autohide');
       }
       const navRight = topNav.querySelector('.nav-right');
@@ -2286,7 +2482,7 @@
       let html = `
         <div style="padding:16px;">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-            <span class="${statusDot}" style="font-size:18px" aria-hidden="true">●</span>
+            <span class="${statusDot}" style="font-size:18px" aria-hidden="true"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>
             <h3 style="margin:0;font-size:16px;font-weight:700;" ${locodeAttr(n.name)}>${escapeHtml(n.name || 'Unknown')}</h3>
           </div>
           <div style="margin-bottom:12px;">
@@ -2321,7 +2517,7 @@
         html += `<h4 style="font-size:12px;margin:12px 0 6px;color:var(--text-muted);">Recent Packets</h4>
           <div style="font-size:11px;max-height:200px;overflow-y:auto;">` +
           recent.slice(0, 10).map(p => `<div style="padding:2px 0;display:flex;justify-content:space-between;">
-            <a href="#/packets/${encodeURIComponent(p.hash || '')}" style="color:var(--accent);text-decoration:none;">${escapeHtml(p.payload_type || '?')}${transportBadge(p.route_type)}${p.observation_count > 1 ? ' <span class="badge badge-obs" style="font-size:9px">👁 ' + p.observation_count + '</span>' : ''}</a>
+            <a href="#/packets/${encodeURIComponent(p.hash || '')}" style="color:var(--accent);text-decoration:none;">${escapeHtml(p.payload_type || '?')}${transportBadge(p.route_type)}${p.observation_count > 1 ? ' <span class="badge badge-obs" style="font-size:9px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + p.observation_count + '</span>' : ''}</a>
             <span style="color:var(--text-muted)">${formatLiveTimestampHtml(p.timestamp)}</span>
           </div>`).join('') +
           '</div>';
@@ -2331,7 +2527,7 @@
 
       html += `<div style="margin-top:12px;display:flex;gap:8px;">
         <a href="#/nodes/${encodeURIComponent(n.public_key)}" style="font-size:12px;color:var(--accent);">Full Detail →</a>
-        <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" style="font-size:12px;color:var(--accent);">📊 Analytics</a>
+        <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" style="font-size:12px;color:var(--accent);"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
       </div></div>`;
 
       content.innerHTML = html;
@@ -2391,12 +2587,12 @@
         nodeMarkers = {};
         nodeData = {};
       }
-      // Paginate past the server's 500-row /api/nodes cap so the live map isn't
-      // truncated to the top-500 by advert. safetyCap (2000) is fetchAllNodes'
-      // hard ceiling on returned nodes — preserves the prior limit=2000 intent
-      // while actually surfacing nodes past the first page.
+      // Paginate past the server's per-request node cap (listLimits.nodesMax)
+      // so the live map isn't truncated to the top-N by advert. LIVE_MAP_MAX_NODES
+      // is passed as safetyCap, which fetchAllNodes enforces as a hard ceiling on
+      // returned nodes — so the live map never renders more than the configured max.
       const { nodes: list } = await fetchAllNodes(`${beforeQs}${aqs}${rqs}`, {
-        safetyCap: 2000,
+        safetyCap: window.LIVE_MAP_MAX_NODES || 10000,
       });
       var now = Date.now();
       list.forEach(n => {
@@ -2564,7 +2760,7 @@
       const header = decoded.header || {};
       const payload = decoded.payload || {};
       const typeName = header.payloadTypeName || 'UNKNOWN';
-      const icon = PAYLOAD_ICONS[typeName] || '📦';
+      const icon = PAYLOAD_ICONS[typeName] || '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg>';
       const color = TYPE_COLORS[typeName] || '#6b7280';
 
       // Find longest path across all observations for display
@@ -2583,7 +2779,7 @@
       const text = payload.text || payload.name || '';
       const preview = text ? ' ' + (text.length > 35 ? text.slice(0, 35) + '…' : text) : '';
       const hopStr = longestHops.length ? `<span class="feed-hops">${longestHops.length}⇢</span>` : '';
-      const obsBadge = group.count > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px">👁 ${group.count}</span>` : '';
+      const obsBadge = group.count > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ${group.count}</span>` : '';
       const iataBadge = obsIataBadgeHtml(pkt);
 
       var _ccPayload = (pkt.decoded || {}).payload || {};
@@ -2924,7 +3120,7 @@
     const header = decoded.header || {};
     const payload = decoded.payload || {};
     const typeName = header.payloadTypeName || 'UNKNOWN';
-    const icon = PAYLOAD_ICONS[typeName] || '📦';
+    const icon = PAYLOAD_ICONS[typeName] || '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg>';
     const color = TYPE_COLORS[typeName] || '#6b7280';
     const obsCount = packets.length;
 
@@ -3427,7 +3623,7 @@
         container.dataset.matrixPrevTheme = currentTheme || 'light';
         document.documentElement.setAttribute('data-theme', 'dark');
         const dt = document.getElementById('darkModeToggle');
-        if (dt) { dt.textContent = '🌙'; dt.disabled = true; }
+        if (dt) { dt.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-moon"/></svg>'; dt.disabled = true; }
       } else {
         const dt = document.getElementById('darkModeToggle');
         if (dt) dt.disabled = true;
@@ -3454,7 +3650,7 @@
         document.documentElement.setAttribute('data-theme', prevTheme);
         localStorage.setItem('meshcore-theme', prevTheme);
         const dt = document.getElementById('darkModeToggle');
-        if (dt) { dt.textContent = prevTheme === 'dark' ? '🌙' : '☀️'; dt.disabled = false; }
+        if (dt) { dt.innerHTML = prevTheme === 'dark' ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-moon"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-sun"/></svg>'; dt.disabled = false; }
         delete container.dataset.matrixPrevTheme;
       } else {
         const dt = document.getElementById('darkModeToggle');
@@ -3928,9 +4124,9 @@
     const text = payload.text || payload.name || '';
     const preview = text ? ' ' + (text.length > 35 ? text.slice(0, 35) + '…' : text) : '';
     const hopStr = hops.length ? `<span class="feed-hops">${hops.length}⇢</span>` : '';
-    const obsBadge = pkt.observation_count > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px">👁 ${pkt.observation_count}</span>` : '';
+    const obsBadge = pkt.observation_count > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ${pkt.observation_count}</span>` : '';
     const iataBadge = obsIataBadgeHtml(pkt);
-    const anomalyIcon = (pkt.decoded && pkt.decoded.anomaly) ? '<span title="Anomaly detected" style="margin-left:4px">⚠️</span>' : '';
+    const anomalyIcon = (pkt.decoded && pkt.decoded.anomaly) ? '<span title="Anomaly detected" style="margin-left:4px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>' : '';
     var _ccPayload2 = (pkt.decoded || {}).payload || {};
     var _ccChan = (typeName === 'GRP_TXT' || typeName === 'CHAN') ? (_ccPayload2.channel || null) : null;
     var dotHtml = _ccChan ? _feedColorDot(_ccChan) : '';
@@ -3989,7 +4185,7 @@
           const ref = entry.element.querySelector('.feed-hops') || entry.element.querySelector('.feed-type');
           if (ref) ref.after(badge); else entry.element.appendChild(badge);
         }
-        badge.textContent = '👁 ' + entry.count;
+        badge.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + entry.count;
         // Flash + move to top
         entry.element.classList.remove('live-feed-enter');
         void entry.element.offsetWidth; // force reflow
@@ -4015,7 +4211,7 @@
     const text = payload.text || payload.name || '';
     const preview = text ? ' ' + (text.length > 35 ? text.slice(0, 35) + '…' : text) : '';
     const hopStr = hops.length ? `<span class="feed-hops">${hops.length}⇢</span>` : '';
-    const obsBadge = incomingObs > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px">👁 ${incomingObs}</span>` : '';
+    const obsBadge = incomingObs > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ${incomingObs}</span>` : '';
     const iataBadge = obsIataBadgeHtml(pkt);
     var _ccPayload3 = (pkt.decoded || {}).payload || {};
     var _ccChan3 = (typeName === 'GRP_TXT' || typeName === 'CHAN') ? (_ccPayload3.channel || null) : null;
@@ -4082,18 +4278,18 @@
     const card = document.createElement('div');
     card.className = 'feed-detail-card';
     card.innerHTML = `
-      <div class="fdc-header" style="border-left:3px solid ${color}">
+      <div class="panel-header" style="border-left:3px solid ${color}">
         <strong>${typeName}</strong>
         ${sender ? `<span class="fdc-sender">${escapeHtml(sender)}</span>` : ''}
-        <button class="fdc-close">✕</button>
+        <button class="fdc-close" aria-label="Close"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>
       </div>
       ${text ? `<div class="fdc-text">${escapeHtml(text.length > 120 ? text.slice(0, 120) + '…' : text)}</div>` : ''}
       <div class="fdc-meta">
-        ${channel ? `<span>📻 ${escapeHtml(channel)}</span>` : ''}
-        ${hops.length ? `<span>🔀 ${hops.length} hops</span>` : ''}
-        ${snr != null ? `<span>📶 ${Number(snr).toFixed(1)} dB</span>` : ''}
-        ${rssi != null ? `<span>📡 ${rssi} dBm</span>` : ''}
-        ${observer ? `<span>👁 ${escapeHtml(observer)}</span>` : ''}
+        ${channel ? `<span><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-radio"/></svg> ${escapeHtml(channel)}</span>` : ''}
+        ${hops.length ? `<span><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-shuffle"/></svg> ${hops.length} hops</span>` : ''}
+        ${snr != null ? `<span><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-cell-signal-high"/></svg> ${Number(snr).toFixed(1)} dB</span>` : ''}
+        ${rssi != null ? `<span><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> ${rssi} dBm</span>` : ''}
+        ${observer ? `<span><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ${escapeHtml(observer)}</span>` : ''}
       </div>
       ${pkt.hash ? `<a class="fdc-link" href="#/packets/${pkt.hash.toLowerCase()}">View in packets →</a>` : ''}
       <button class="fdc-replay">↻ Replay</button>
@@ -4112,6 +4308,12 @@
     });
     const feedEl = document.getElementById('liveFeed');
     if (feedEl) feedEl.parentElement.appendChild(card);
+    // #1619: register the popup with the live DragManager so users can move
+    // it out from behind the legend (responsive gate is handled inside the
+    // manager via its `enabled` flag — no extra wiring required here).
+    if (window._liveDragMgr) {
+      try { window._liveDragMgr.register(card); } catch (_) { /* ignore */ }
+    }
   }
 
   function destroy() {
@@ -4172,6 +4374,7 @@
     if (topNav) { topNav.classList.remove('nav-autohide'); topNav.style.position = ''; topNav.style.width = ''; topNav.style.zIndex = ''; }
     const existingPin = document.getElementById('navPinBtn');
     if (existingPin) existingPin.remove();
+    if (document.body) document.body.classList.remove('nav-pinned');
     if (_navCleanup) {
       clearTimeout(_navCleanup.timeout);
       const livePage = document.querySelector('.live-page');
@@ -4185,6 +4388,12 @@
     nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = clickablePathsLayer = null;
     clickablePaths = [];
     stopMatrixRain();
+    // #1572 — clear body.live-fullscreen on route exit. The class hides
+    // .bottom-nav (the only nav on mobile), so leaking it across SPA
+    // routes strands the user. Reset state but DO NOT clear the
+    // localStorage preference — restoring fullscreen on return to /live
+    // is intentional.
+    if (document.body) document.body.classList.remove('live-fullscreen');
     nodeMarkers = {}; nodeData = {};
     activeNodeDetailKey = null;
     recentPaths = [];

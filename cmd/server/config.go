@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/meshcore-analyzer/dbconfig"
@@ -24,11 +25,21 @@ type AreaEntry struct {
 	LonMax  *float64     `json:"lonMax,omitempty"`
 }
 
+// ListLimitsConfig defines maximum row limits for list endpoints to prevent DoS.
+type ListLimitsConfig struct {
+	PacketsMax         int `json:"packetsMax"`
+	NodesMax           int `json:"nodesMax"`
+	AnalyticsMax       int `json:"analyticsMax"`
+	ChannelMessagesMax int `json:"channelMessagesMax"`
+	BulkHealthMax      int `json:"bulkHealthMax"`
+}
+
 // Config mirrors the Node.js config.json structure (read-only fields).
 type Config struct {
-	Port    int    `json:"port"`
-	APIKey  string `json:"apiKey"`
-	DBPath  string `json:"dbPath"`
+	Port       int               `json:"port"`
+	APIKey     string            `json:"apiKey"`
+	DBPath     string            `json:"dbPath"`
+	ListLimits *ListLimitsConfig `json:"listLimits"`
 
 	// NodeBlacklist is a list of public keys to exclude from all API responses.
 	// Blacklisted nodes are hidden from node lists, search, detail, map, and stats.
@@ -37,9 +48,40 @@ type Config struct {
 	// operator refuses to fix.
 	NodeBlacklist []string `json:"nodeBlacklist"`
 
-	// blacklistSetCached is the lazily-built set version of NodeBlacklist.
-	blacklistSetCached map[string]bool
-	blacklistOnce      sync.Once
+	// HiddenNamePrefixes is a list of name prefixes that mark a node as
+	// hidden from API responses (issue #1181). The default `["🚫"]` mirrors
+	// a convention used by other MeshCore map dashboards: operators who
+	// rename their node with the prefix get hidden from the map without
+	// waiting for normal retention to clear stale data. DB rows are
+	// preserved — the filter is applied at the API layer only, so the
+	// underlying observation history remains intact.
+	HiddenNamePrefixes []string `json:"hiddenNamePrefixes"`
+
+	// hiddenPrefixesPtr holds the active prefix slice as an atomic pointer.
+	// Read path (IsNameHidden) is a single atomic load — no mutex, no
+	// sync.Once. Writers always replace the whole slice; readers see either
+	// the old or the new slice as a single value, never a partial state.
+	// Mirrors blacklistSetPtr.
+	hiddenPrefixesPtr atomic.Pointer[[]string]
+
+	// hiddenPrefixesGen is a monotonic counter bumped every time the
+	// hidden-prefix list mutates via SetHiddenNamePrefixes. Cache wiring
+	// is left for follow-up; the counter is the prerequisite primitive
+	// callers will key on (mirrors blacklistGen / #1629).
+	hiddenPrefixesGen atomic.Uint64
+
+	// blacklistSetPtr holds the active lookup set as an atomic pointer.
+	// Read path is a single atomic load — no mutex, no sync.Once. Writers
+	// always replace the whole map; readers see either the old or the new
+	// map as a single value, never a partially-built one.
+	blacklistSetPtr atomic.Pointer[map[string]bool]
+
+	// blacklistGen is a monotonic generation counter bumped every time the
+	// blacklist mutates via SetNodeBlacklist. Callers that cache responses
+	// keyed by pubkey (e.g. /api/nodes/{pubkey}/reach, #1629) include this
+	// generation in their cache key so any blacklist change naturally
+	// invalidates prior entries on the next request.
+	blacklistGen atomic.Uint64
 
 	Branding   map[string]interface{} `json:"branding"`
 	Theme      map[string]interface{} `json:"theme"`
@@ -63,7 +105,8 @@ type Config struct {
 
 	Roles            map[string]interface{} `json:"roles"`
 	HealthThresholds *HealthThresholds      `json:"healthThresholds"`
-	Tiles            map[string]interface{} `json:"tiles"`
+	Map              map[string]interface{} `json:"map"`
+	Tiles            map[string]interface{} `json:"tiles"` // deprecated
 	SnrThresholds    map[string]interface{} `json:"snrThresholds"`
 	DistThresholds   map[string]interface{} `json:"distThresholds"`
 	MaxHopDist       *float64               `json:"maxHopDist"`
@@ -75,6 +118,7 @@ type Config struct {
 
 	LiveMap struct {
 		PropagationBufferMs int `json:"propagationBufferMs"`
+		MaxNodes            int `json:"maxNodes"`
 	} `json:"liveMap"`
 
 	CacheTTL map[string]interface{} `json:"cacheTTL"`
@@ -85,6 +129,11 @@ type Config struct {
 
 	PacketStore *PacketStoreConfig `json:"packetStore,omitempty"`
 
+	// Runtime holds Go runtime tuning knobs (#1010).
+	// Currently exposes runtime.maxMemoryMB which sets a soft memory limit
+	// (GOMEMLIMIT) via runtime/debug.SetMemoryLimit at startup. The
+	// GOMEMLIMIT environment variable, when set, takes precedence.
+	Runtime *RuntimeConfig `json:"runtime,omitempty"`
 	GeoFilter *GeoFilterConfig `json:"geo_filter,omitempty"`
 
 	Areas map[string]AreaEntry `json:"areas,omitempty"`
@@ -99,10 +148,7 @@ type Config struct {
 	DebugAffinity bool `json:"debugAffinity,omitempty"`
 
 	// MapDarkTileProvider selects the default dark-mode basemap provider for
-	// new visitors. The client may override per-browser via the customizer
-	// (persisted to localStorage). Allowed values: "carto-dark" (default),
-	// "esri-darkgray-labels", "voyager-inverted", "positron-inverted". See
-	// public/map-tile-providers.js for the registry. #1420.
+	// new visitors. Deprecated: use Map.Tiles.DarkDefault instead.
 	MapDarkTileProvider string `json:"mapDarkTileProvider,omitempty"`
 
 	// ObserverBlacklist is a list of observer public keys to exclude from API
@@ -126,6 +172,26 @@ type Config struct {
 
 	// BatteryThresholds: voltage cutoffs for low/critical alerts (#663).
 	BatteryThresholds *BatteryThresholdsConfig `json:"batteryThresholds,omitempty"`
+
+	// Customizer controls operator-side knobs for the in-app customizer modal
+	// (theme/branding/etc.). See CustomizerConfig and issue #1508.
+	Customizer *CustomizerConfig `json:"customizer,omitempty"`
+
+	// Known-channels catalogue integration (issue #1323).
+	// URL of a JSON catalogue file (channels-by-country shape) fetched
+	// periodically and exposed via /api/known-channels. Empty disables.
+	KnownChannelsURL string `json:"knownChannelsUrl,omitempty"`
+	// Refresh interval in milliseconds. 0/missing => default 24h.
+	KnownChannelsRefreshMs int64 `json:"knownChannelsRefreshMs,omitempty"`
+}
+
+// CustomizerConfig holds operator-side knobs for the in-app customizer modal.
+// Today only DisabledTabs is exposed: a list of tab ids the operator wants to
+// hide from end users (e.g. ["branding","geofilter","export"]). The frontend
+// (public/customize-v2.js _renderTabs) reads this from /api/config/client and
+// filters those tabs out before rendering. Issue #1508.
+type CustomizerConfig struct {
+	DisabledTabs []string `json:"disabledTabs"`
 }
 
 // weakAPIKeys is the blocklist of known default/example API keys that must be rejected.
@@ -226,6 +292,16 @@ type PacketStoreConfig struct {
 // GeoFilterConfig is an alias for the shared geofilter.Config type.
 type GeoFilterConfig = geofilter.Config
 
+// RuntimeConfig holds Go runtime tuning knobs (#1010).
+type RuntimeConfig struct {
+	// MaxMemoryMB sets the Go soft memory limit (GOMEMLIMIT) in MiB via
+	// runtime/debug.SetMemoryLimit at startup. Takes precedence over the
+	// implicit limit derived from packetStore.maxMemoryMB. The GOMEMLIMIT
+	// environment variable, when set, takes precedence over this value.
+	// 0/unset preserves default behavior.
+	MaxMemoryMB int `json:"maxMemoryMB"`
+}
+
 type RetentionConfig struct {
 	NodeDays      int `json:"nodeDays"`
 	ObserverDays  int `json:"observerDays"`
@@ -325,6 +401,10 @@ type HealthThresholds struct {
 	// repeater to be considered "actively relaying" vs only "alive
 	// (advert-only)". See issue #662. Defaults to 24h.
 	RelayActiveHours float64 `json:"relayActiveHours"`
+	// Issue #1552 — observer health classification thresholds (minutes).
+	// Defaults match prior hardcoded behavior in public/observers.js (10/60).
+	ObserverOnlineMinutes int `json:"observerOnlineMinutes"`
+	ObserverStaleMinutes  int `json:"observerStaleMinutes"`
 }
 
 // ThemeFile mirrors theme.json overlay.
@@ -359,12 +439,69 @@ func LoadConfig(baseDirs ...string) (*Config, error) {
 			continue
 		}
 		cfg.NormalizeTimestampConfig()
+		cfg.migrateDeprecatedConfig()
+		cfg.applyListLimitsDefaults()
 		applyCORSEnv(cfg)
 		return cfg, nil
 	}
 	cfg.NormalizeTimestampConfig()
+	cfg.migrateDeprecatedConfig()
+	cfg.applyListLimitsDefaults()
 	applyCORSEnv(cfg)
 	return cfg, nil // defaults
+}
+
+func (c *Config) applyListLimitsDefaults() {
+	if c.ListLimits == nil {
+		c.ListLimits = &ListLimitsConfig{}
+	}
+	if c.ListLimits.PacketsMax <= 0 {
+		c.ListLimits.PacketsMax = 10000
+	}
+	if c.ListLimits.NodesMax <= 0 {
+		c.ListLimits.NodesMax = 2000
+	}
+	if c.ListLimits.AnalyticsMax <= 0 {
+		c.ListLimits.AnalyticsMax = 200
+	}
+	if c.ListLimits.ChannelMessagesMax <= 0 {
+		c.ListLimits.ChannelMessagesMax = 500
+	}
+	if c.ListLimits.BulkHealthMax <= 0 {
+		c.ListLimits.BulkHealthMax = 200
+	}
+}
+
+func (c *Config) migrateDeprecatedConfig() {
+	migrated := false
+	if c.Map == nil {
+		c.Map = make(map[string]interface{})
+	}
+	if c.Map["tiles"] == nil {
+		c.Map["tiles"] = make(map[string]interface{})
+	}
+	tilesMap, ok := c.Map["tiles"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	if c.MapDarkTileProvider != "" {
+		if tilesMap["darkDefault"] == nil {
+			tilesMap["darkDefault"] = c.MapDarkTileProvider
+		}
+		migrated = true
+	}
+	if len(c.Tiles) > 0 {
+		for k, v := range c.Tiles {
+			if tilesMap[k] == nil {
+				tilesMap[k] = v
+			}
+		}
+		migrated = true
+	}
+	if migrated {
+		fmt.Fprintf(os.Stderr, "[deprecated] Top-level 'mapDarkTileProvider' and 'tiles' keys in config.json are deprecated and will be ignored in v3.5.0 (see #1165). Please move them into 'map': { 'tiles': { ... } }.\n")
+	}
 }
 
 func LoadTheme(baseDirs ...string) *ThemeFile {
@@ -415,6 +552,18 @@ func (c *Config) GetHealthThresholds() HealthThresholds {
 		if c.HealthThresholds.RelayActiveHours > 0 {
 			h.RelayActiveHours = c.HealthThresholds.RelayActiveHours
 		}
+		if c.HealthThresholds.ObserverOnlineMinutes > 0 {
+			h.ObserverOnlineMinutes = c.HealthThresholds.ObserverOnlineMinutes
+		}
+		if c.HealthThresholds.ObserverStaleMinutes > 0 {
+			h.ObserverStaleMinutes = c.HealthThresholds.ObserverStaleMinutes
+		}
+	}
+	if h.ObserverOnlineMinutes <= 0 {
+		h.ObserverOnlineMinutes = 60
+	}
+	if h.ObserverStaleMinutes <= 0 {
+		h.ObserverStaleMinutes = 1440
 	}
 	return h
 }
@@ -431,11 +580,14 @@ func (h HealthThresholds) GetHealthMs(role string) (degradedMs, silentMs int) {
 // ToClientMs returns the thresholds as ms for the frontend.
 func (h HealthThresholds) ToClientMs() map[string]int {
 	const hourMs = 3600000
+	const minMs = 60000
 	return map[string]int{
-		"infraDegradedMs": int(h.InfraDegradedHours * hourMs),
-		"infraSilentMs":   int(h.InfraSilentHours * hourMs),
-		"nodeDegradedMs":  int(h.NodeDegradedHours * hourMs),
-		"nodeSilentMs":    int(h.NodeSilentHours * hourMs),
+		"infraDegradedMs":  int(h.InfraDegradedHours * hourMs),
+		"infraSilentMs":    int(h.InfraSilentHours * hourMs),
+		"nodeDegradedMs":   int(h.NodeDegradedHours * hourMs),
+		"nodeSilentMs":     int(h.NodeSilentHours * hourMs),
+		"observerOnlineMs": h.ObserverOnlineMinutes * minMs,
+		"observerStaleMs":  h.ObserverStaleMinutes * minMs,
 	}
 }
 
@@ -502,31 +654,166 @@ func (c *Config) PropagationBufferMs() int {
 	return 5000
 }
 
-// blacklistSet lazily builds and caches the nodeBlacklist as a set for O(1) lookups.
-// Uses sync.Once to eliminate the data race on first concurrent access.
-func (c *Config) blacklistSet() map[string]bool {
-	c.blacklistOnce.Do(func() {
-		if len(c.NodeBlacklist) == 0 {
-			return
+// LiveMapMaxNodes returns the operator-configured cap on how many nodes
+// the live map fetches (and thus renders) in a single page. Default is
+// 2000; values are clamped to [100, 20000] to defang misconfig.
+// Negative/zero falls back to default. See #1574.
+func (c *Config) LiveMapMaxNodes() int {
+	const def = 2000
+	const min = 100
+	const max = 20000
+	if c == nil || c.LiveMap.MaxNodes <= 0 {
+		return def
+	}
+	v := c.LiveMap.MaxNodes
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// buildBlacklistSet recomputes the lookup set from pks and returns it.
+// Empty/whitespace-only entries are skipped. Keys are lowercased + trimmed.
+// Returns nil for an empty effective set so callers can `len(m) == 0` short-circuit.
+func buildBlacklistSet(pks []string) map[string]bool {
+	if len(pks) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(pks))
+	for _, pk := range pks {
+		trimmed := strings.ToLower(strings.TrimSpace(pk))
+		if trimmed != "" {
+			m[trimmed] = true
 		}
-		m := make(map[string]bool, len(c.NodeBlacklist))
-		for _, pk := range c.NodeBlacklist {
-			trimmed := strings.ToLower(strings.TrimSpace(pk))
-			if trimmed != "" {
-				m[trimmed] = true
-			}
-		}
-		c.blacklistSetCached = m
-	})
-	return c.blacklistSetCached
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// SetNodeBlacklist atomically replaces NodeBlacklist with pks, rebuilds the
+// lookup set, and bumps the generation counter so any cache keyed on the
+// generation invalidates on the next request (#1629). Safe for concurrent
+// use with IsBlacklisted / BlacklistGeneration.
+func (c *Config) SetNodeBlacklist(pks []string) {
+	if c == nil {
+		return
+	}
+	// Copy so callers can mutate their slice without affecting us.
+	cp := make([]string, len(pks))
+	copy(cp, pks)
+	c.NodeBlacklist = cp
+	m := buildBlacklistSet(cp)
+	c.blacklistSetPtr.Store(&m)
+	c.blacklistGen.Add(1)
+}
+
+// BlacklistGeneration returns a monotonic counter that increments on every
+// SetNodeBlacklist call. Response caches keyed per-pubkey embed this value
+// in their cache key so any blacklist mutation invalidates prior entries on
+// the next request (#1629).
+func (c *Config) BlacklistGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.blacklistGen.Load()
 }
 
 // IsBlacklisted returns true if the given public key is in the nodeBlacklist.
+// Hot read path: a single atomic pointer load + map lookup. No locks, no
+// sync.Once. The in-memory set is populated either via SetNodeBlacklist or
+// lazily on first read from c.NodeBlacklist (covering the JSON-load path
+// where the setter was never called).
 func (c *Config) IsBlacklisted(pubkey string) bool {
-	if c == nil || len(c.NodeBlacklist) == 0 {
+	if c == nil {
 		return false
 	}
-	return c.blacklistSet()[strings.ToLower(strings.TrimSpace(pubkey))]
+	mp := c.blacklistSetPtr.Load()
+	if mp == nil {
+		// Lazy first-read materialisation from the JSON-loaded slice.
+		// CAS-style: if another goroutine wins the race, drop ours.
+		built := buildBlacklistSet(c.NodeBlacklist)
+		if c.blacklistSetPtr.CompareAndSwap(nil, &built) {
+			mp = &built
+		} else {
+			mp = c.blacklistSetPtr.Load()
+		}
+	}
+	if mp == nil || len(*mp) == 0 {
+		return false
+	}
+	return (*mp)[strings.ToLower(strings.TrimSpace(pubkey))]
+}
+
+// IsNameHidden returns true if the given node name starts with any of the
+// operator-configured HiddenNamePrefixes (issue #1181). Empty/whitespace
+// prefixes are ignored. Used to drop nodes from /api/nodes, /api/nodes/search
+// and /api/nodes/{pubkey} without deleting the underlying DB row, so observer
+// history stays intact even after the operator hides the node.
+//
+// Hot read path: a single atomic pointer load. No locks, no sync.Once.
+// Writers always replace the whole slice; readers see either the old or
+// the new slice as a single value, never a partially-built one. Mirrors
+// IsBlacklisted's CAS-style lazy first-read materialisation for the
+// JSON-load path where SetHiddenNamePrefixes was never called.
+func (c *Config) IsNameHidden(name string) bool {
+	if c == nil {
+		return false
+	}
+	pp := c.hiddenPrefixesPtr.Load()
+	if pp == nil {
+		// Lazy first-read materialisation from the JSON-loaded slice.
+		// CAS-style: if another goroutine wins the race, drop ours.
+		built := make([]string, len(c.HiddenNamePrefixes))
+		copy(built, c.HiddenNamePrefixes)
+		if c.hiddenPrefixesPtr.CompareAndSwap(nil, &built) {
+			pp = &built
+		} else {
+			pp = c.hiddenPrefixesPtr.Load()
+		}
+	}
+	if pp == nil || len(*pp) == 0 {
+		return false
+	}
+	for _, p := range *pp {
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetHiddenNamePrefixes atomically replaces HiddenNamePrefixes with the
+// given slice and bumps the generation counter. Safe for concurrent use
+// with IsNameHidden / HiddenNamePrefixesGeneration. Mirrors
+// SetNodeBlacklist (#1629).
+func (c *Config) SetHiddenNamePrefixes(prefixes []string) {
+	if c == nil {
+		return
+	}
+	cp := make([]string, len(prefixes))
+	copy(cp, prefixes)
+	c.HiddenNamePrefixes = cp
+	c.hiddenPrefixesPtr.Store(&cp)
+	c.hiddenPrefixesGen.Add(1)
+}
+
+// HiddenNamePrefixesGeneration returns a monotonic counter that increments
+// on every SetHiddenNamePrefixes call. Response caches keyed per-pubkey can
+// embed this value in their cache key so any prefix mutation invalidates
+// prior entries on the next request — same pattern as BlacklistGeneration.
+func (c *Config) HiddenNamePrefixesGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.hiddenPrefixesGen.Load()
 }
 
 // SaveGeoFilter writes the geo_filter section back to config.json on disk.

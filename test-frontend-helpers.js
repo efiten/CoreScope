@@ -540,8 +540,8 @@ console.log('\n=== hop-resolver.js ===');
 
   test('resolve single unique prefix', () => {
     HR.init([
-      { public_key: 'abcdef1234567890', name: 'NodeA', lat: 37.3, lon: -122.0 },
-      { public_key: '123456abcdef0000', name: 'NodeB', lat: 37.4, lon: -122.1 },
+      { public_key: 'abcdef1234567890', name: 'NodeA', lat: 37.3, lon: -122.0, role: 'repeater' },
+      { public_key: '123456abcdef0000', name: 'NodeB', lat: 37.4, lon: -122.1, role: 'repeater' },
     ]);
     const result = HR.resolve(['ab'], null, null, null, null);
     assert.strictEqual(result['ab'].name, 'NodeA');
@@ -549,8 +549,8 @@ console.log('\n=== hop-resolver.js ===');
 
   test('resolve ambiguous prefix', () => {
     HR.init([
-      { public_key: 'abcdef1234567890', name: 'NodeA', lat: 37.3, lon: -122.0 },
-      { public_key: 'abcd001234567890', name: 'NodeC', lat: 38.0, lon: -121.0 },
+      { public_key: 'abcdef1234567890', name: 'NodeA', lat: 37.3, lon: -122.0, role: 'repeater' },
+      { public_key: 'abcd001234567890', name: 'NodeC', lat: 38.0, lon: -121.0, role: 'repeater' },
     ]);
     const result = HR.resolve(['ab'], null, null, null, null);
     assert.ok(result['ab'].ambiguous);
@@ -570,8 +570,8 @@ console.log('\n=== hop-resolver.js ===');
 
   test('geo disambiguation with origin anchor', () => {
     HR.init([
-      { public_key: 'abcdef1234567890', name: 'NearNode', lat: 37.31, lon: -122.01 },
-      { public_key: 'abcd001234567890', name: 'FarNode', lat: 50.0, lon: 10.0 },
+      { public_key: 'abcdef1234567890', name: 'NearNode', lat: 37.31, lon: -122.01, role: 'repeater' },
+      { public_key: 'abcd001234567890', name: 'FarNode', lat: 50.0, lon: 10.0, role: 'repeater' },
     ]);
     const result = HR.resolve(['ab'], 37.3, -122.0, null, null);
     // Should prefer the nearer node
@@ -581,8 +581,8 @@ console.log('\n=== hop-resolver.js ===');
   test('regional filtering with IATA', () => {
     HR.init(
       [
-        { public_key: 'abcdef1234567890', name: 'SFONode', lat: 37.6, lon: -122.4 },
-        { public_key: 'abcd001234567890', name: 'LHRNode', lat: 51.5, lon: -0.1 },
+        { public_key: 'abcdef1234567890', name: 'SFONode', lat: 37.6, lon: -122.4, role: 'repeater' },
+        { public_key: 'abcd001234567890', name: 'LHRNode', lat: 51.5, lon: -0.1, role: 'repeater' },
       ],
       {
         observers: [{ id: 'obs1', iata: 'SFO' }],
@@ -726,12 +726,12 @@ console.log('\n=== pickByAffinity neighbor-graph scoring (#874) ===');
 
   // Two nodes sharing prefix "ab", hundreds of km apart.
   // NodeSF is near San Francisco, NodeDEN is near Denver.
-  const nodeSF = { public_key: 'ab11111111111111', name: 'NodeSF', lat: 37.7, lon: -122.4 };
-  const nodeDEN = { public_key: 'ab22222222222222', name: 'NodeDEN', lat: 39.7, lon: -104.9 };
+  const nodeSF = { public_key: 'ab11111111111111', name: 'NodeSF', lat: 37.7, lon: -122.4, role: 'repeater' };
+  const nodeDEN = { public_key: 'ab22222222222222', name: 'NodeDEN', lat: 39.7, lon: -104.9, role: 'repeater' };
   // A known neighbor of NodeSF (in the graph)
-  const nodeNeighbor = { public_key: 'cc33333333333333', name: 'SFNeighbor', lat: 37.8, lon: -122.3 };
+  const nodeNeighbor = { public_key: 'cc33333333333333', name: 'SFNeighbor', lat: 37.8, lon: -122.3, role: 'repeater' };
   // Another known node near Denver
-  const nodeDenNeighbor = { public_key: 'dd44444444444444', name: 'DENNeighbor', lat: 39.8, lon: -105.0 };
+  const nodeDenNeighbor = { public_key: 'dd44444444444444', name: 'DENNeighbor', lat: 39.8, lon: -105.0, role: 'repeater' };
 
   test('#874: graph edge scoring picks correct regional candidate (SF)', () => {
     HR.init([nodeSF, nodeDEN, nodeNeighbor, nodeDenNeighbor]);
@@ -777,7 +777,7 @@ console.log('\n=== pickByAffinity neighbor-graph scoring (#874) ===');
   test('#874: centroid uses average of prev+next positions', () => {
     // Prev near SF, next near Denver → centroid is midpoint (~Nevada)
     // NodeDEN is closer to Nevada midpoint than NodeSF
-    const nodeMid = { public_key: 'ee55555555555555', name: 'MidNode', lat: 38.5, lon: -114.0 };
+    const nodeMid = { public_key: 'ee55555555555555', name: 'MidNode', lat: 38.5, lon: -114.0, role: 'repeater' };
     HR.init([nodeSF, nodeDEN, nodeNeighbor, nodeDenNeighbor, nodeMid]);
     HR.setAffinity({ edges: [] });
     // Path: SFNeighbor → [ab??] → DENNeighbor
@@ -1132,12 +1132,10 @@ console.log('\n=== live.js: pruneStaleNodes ===');
     const markers = ctx.window._liveNodeMarkers();
     const data = ctx.window._liveNodeData();
 
-    let lastStyle = {};
-    let glowStyle = {};
+    let elStyle = {};
     markers['apiStale'] = {
-      _glowMarker: { setStyle: function(s) { glowStyle = s; } },
+      getElement: function() { return { style: elStyle }; },
       _staleDimmed: false,
-      setStyle: function(s) { lastStyle = s; },
     };
     data['apiStale'] = { public_key: 'apiStale', role: 'repeater', _fromAPI: true, _liveSeen: Date.now() - 96 * 3600000 };
 
@@ -1146,8 +1144,7 @@ console.log('\n=== live.js: pruneStaleNodes ===');
     assert.ok(markers['apiStale'], 'API node should NOT be removed');
     assert.ok(data['apiStale'], 'API node data should NOT be removed');
     assert.ok(markers['apiStale']._staleDimmed, 'API node should be marked as dimmed');
-    assert.strictEqual(lastStyle.fillOpacity, 0.25, 'marker should be dimmed to 0.25 fillOpacity');
-    assert.strictEqual(glowStyle.fillOpacity, 0.04, 'glow should be dimmed to 0.04 fillOpacity');
+    assert.strictEqual(elStyle.opacity, '0.35', 'marker should be dimmed to 0.35 opacity');
   });
 
   test('pruneStaleNodes restores API nodes when they become active again', () => {
@@ -1156,12 +1153,12 @@ console.log('\n=== live.js: pruneStaleNodes ===');
     const markers = ctx.window._liveNodeMarkers();
     const data = ctx.window._liveNodeData();
 
-    let lastStyle = {};
-    let glowStyle = {};
+    let elStyle = {};
     markers['apiNode'] = {
-      _glowMarker: { setStyle: function(s) { glowStyle = s; } },
+      getElement: function() { return { style: elStyle }; },
+      _glowMarker: { setStyle: function() {} },
       _staleDimmed: true,
-      setStyle: function(s) { lastStyle = s; },
+      setStyle: function() {},
     };
     data['apiNode'] = { public_key: 'apiNode', role: 'repeater', _fromAPI: true, _liveSeen: Date.now() };
 
@@ -1169,8 +1166,7 @@ console.log('\n=== live.js: pruneStaleNodes ===');
 
     assert.ok(markers['apiNode'], 'API node should remain');
     assert.strictEqual(markers['apiNode']._staleDimmed, false, 'staleDimmed should be cleared');
-    assert.strictEqual(lastStyle.fillOpacity, 0.85, 'opacity should be restored to 0.85');
-    assert.strictEqual(glowStyle.fillOpacity, 0.12, 'glow should be restored to 0.12');
+    assert.strictEqual(elStyle.opacity, '1', 'opacity should be restored to 1');
   });
 
   test('pruneStaleNodes still removes WS-only nodes when stale', () => {
@@ -1402,6 +1398,7 @@ console.log('\n=== nodes.js: WS handler runtime behavior ===');
           querySelectorAll() { return []; },
           querySelector() { return null; },
           getAttribute() { return null; },
+          setAttribute() {},
         };
       }
       return domElements[id];
@@ -1431,6 +1428,7 @@ console.log('\n=== nodes.js: WS handler runtime behavior ===');
     ctx.Set = Set;
     ctx.CLIENT_TTL = { nodeList: 90000, nodeDetail: 240000, nodeHealth: 240000 };
     ctx.RegionFilter = { init() {}, onChange() { return () => {}; }, getRegionParam() { return ''; }, offChange() {} };
+    ctx.AreaFilter = { init() {}, onChange() { return () => {}; }, getAreaParam() { return ''; }, offChange() {} };
 
     // Track API calls and cache invalidation
     let apiCallCount = 0;
@@ -1777,6 +1775,7 @@ console.log('\n=== compare.js: comparePacketSets ===');
     ctx.window.addEventListener = () => {};
     ctx.window.removeEventListener = () => {};
     ctx.RegionFilter = { init() {}, onChange() { return () => {}; }, offChange() {}, getRegionParam() { return ''; } };
+    ctx.AreaFilter = { init() {}, onChange() { return () => {}; }, offChange() {}, getAreaParam() { return ''; } };
     ctx.CLIENT_TTL = { observers: 120000 };
     ctx.debouncedOnWS = (fn) => fn;
     ctx.onWS = () => {};
@@ -2869,7 +2868,7 @@ console.log('\n=== channels.js: encrypted channel without key shows lock message
 
     // Should show lock message, NOT fetch messages API
     const msgEl = dom['chMessages'];
-    assert.ok(msgEl.innerHTML.includes('🔒'), 'should show lock emoji for encrypted channel without key');
+    assert.ok(msgEl.innerHTML.includes('#ph-lock'), 'should show lock sprite for encrypted channel without key'); // #1648 M3
     assert.ok(msgEl.innerHTML.includes('no decryption key'), 'should mention no decryption key');
     const messageApiFetched = apiCallPaths.some(p => p.indexOf('/messages') !== -1);
     assert.ok(!messageApiFetched, 'should NOT fetch messages API for encrypted channel without key');
@@ -2968,7 +2967,7 @@ console.log('\n=== channels.js: encrypted channel without key shows lock message
       includeEncryptedChannels: [{ hash: '#test', name: '#test', messageCount: 3, lastActivity: null, encrypted: null }],
       storedKey: null,
     });
-    assert.ok(!r.msgHtml.includes('🔒'), 'unencrypted #channel must NOT show lock affordance');
+    assert.ok(!r.msgHtml.includes('#ph-lock'), 'unencrypted #channel must NOT show lock affordance'); // #1648 M3
     const messageApiFetched = r.apiCallPaths.some(p => p.indexOf('/messages') !== -1);
     assert.ok(messageApiFetched, 'unencrypted #channel must fetch messages REST endpoint');
   });
@@ -2979,7 +2978,7 @@ console.log('\n=== channels.js: encrypted channel without key shows lock message
       includeEncryptedChannels: [{ hash: '#private', name: '#private', messageCount: 5, lastActivity: null, encrypted: true }],
       storedKey: null,
     });
-    assert.ok(r.msgHtml.includes('🔒'), 'encrypted #channel without key must show lock affordance');
+    assert.ok(r.msgHtml.includes('#ph-lock'), 'encrypted #channel without key must show lock affordance'); // #1648 M3
     assert.ok(r.msgHtml.includes('no decryption key'), 'lock should mention no decryption key');
     const messageApiFetched = r.apiCallPaths.some(p => p.indexOf('/messages') !== -1);
     assert.ok(!messageApiFetched, 'must NOT fetch /messages REST for encrypted channel without key');
@@ -3017,6 +3016,7 @@ console.log('\n=== packets.js: savedTimeWindowMin defaults ===');
     ctx.window.addEventListener = () => {};
     ctx.window.removeEventListener = () => {};
     ctx.RegionFilter = { init() {}, onChange() { return () => {}; }, offChange() {}, getRegionParam() { return ''; } };
+    ctx.AreaFilter = { init() {}, onChange() { return () => {}; }, offChange() {}, getAreaParam() { return ''; } };
     ctx.CLIENT_TTL = { observers: 120000 };
     ctx.debouncedOnWS = (fn) => fn;
     ctx.onWS = () => {};
@@ -3481,11 +3481,10 @@ console.log('\n=== live.js: nextHop null guards ===');
       'nextHop must return early when animLayer is null (post-destroy)');
   });
 
-  // NOTE (v3.8.3 merge): the fork's animLayer-based ghost-pulse was replaced
-  // upstream by the pathsLayer ghost implementation (PR #1334). The two former
-  // string-match assertions for `animLayer.hasLayer(ghost)` were removed as
-  // obsolete — equivalent null-safety is now provided by the guards above
-  // (`if (!animLayer || !pathsLayer) return;` / `if (!animLayer) return;`).
+  test('renderAnimations guards animLayer null before removing ghost', () => {
+    assert.ok(liveSource.includes('if (animLayer && animLayer.hasLayer(g.marker))'),
+      'renderAnimations must guard animLayer null before removing ghost');
+  });
 
   test('nextHop guards liveAnimCount element null', () => {
     assert.ok(liveSource.includes('const countEl = document.getElementById(\'liveAnimCount\')'),
@@ -3693,6 +3692,7 @@ function makeNodesSandbox(opts) {
   loadInCtx(ctx, 'public/app.js');
   ctx.registerPage = () => {};
   ctx.RegionFilter = { init: () => {}, onChange: () => () => {}, getRegionParam: () => '', offChange: () => {} };
+  ctx.AreaFilter = { init: () => {}, onChange: () => () => {}, getAreaParam: () => '', offChange: () => {} };
   ctx.onWS = () => {};
   ctx.offWS = () => {};
   ctx.debouncedOnWS = (fn) => fn;
@@ -3942,7 +3942,9 @@ console.log('\n=== nodes.js: toggleSort / sortNodes / sortArrow ===');
     const ctx = makeNodesSandbox();
     ctx.window._nodesSetSortState({ column: 'name', direction: 'asc' });
     const html = ctx.window._nodesSortArrow('name');
-    assert.ok(html.includes('▲'));
+    // #1648 M2 — Phosphor sprite caret-up replaces ▲.
+    assert.ok(html.includes('#ph-caret-up') || html.includes('▲'),
+      'should contain ascending arrow (▲ or ph-caret-up)');
     assert.ok(html.includes('sort-arrow'));
   });
 
@@ -3950,7 +3952,9 @@ console.log('\n=== nodes.js: toggleSort / sortNodes / sortArrow ===');
     const ctx = makeNodesSandbox();
     ctx.window._nodesSetSortState({ column: 'name', direction: 'desc' });
     const html = ctx.window._nodesSortArrow('name');
-    assert.ok(html.includes('▼'));
+    // #1648 M2 — Phosphor sprite caret-down replaces ▼.
+    assert.ok(html.includes('#ph-caret-down') || html.includes('▼'),
+      'should contain descending arrow (▼ or ph-caret-down)');
   });
 
   test('sortArrow returns empty for inactive column', () => {
@@ -4139,7 +4143,7 @@ console.log('\n=== app.js: payloadTypeColor ===');
   test('payloadTypeColor(99) = unknown', () => assert.strictEqual(payloadTypeColor(99), 'unknown'));
   test('payloadTypeColor(null) = unknown', () => assert.strictEqual(payloadTypeColor(null), 'unknown'));
   test('payloadTypeColor(undefined) = unknown', () => assert.strictEqual(payloadTypeColor(undefined), 'unknown'));
-  test('payloadTypeColor(6) = unknown (no mapping for 6)', () => assert.strictEqual(payloadTypeColor(6), 'unknown'));
+  test('payloadTypeColor(12) = unknown (no mapping for 12)', () => assert.strictEqual(payloadTypeColor(12), 'unknown'));
   test('all defined payload types return a non-unknown string', () => {
     const definedTypes = [0, 1, 2, 3, 4, 5, 7, 8, 9];
     for (const t of definedTypes) {
@@ -4549,7 +4553,7 @@ console.log('\n=== app.js: favorites ===');
   test('favStar returns filled star for favorite', () => {
     ctx.localStorage.setItem('meshcore-favorites', '["pk1"]');
     const html = ctx.favStar('pk1');
-    assert.ok(html.includes('★'));
+    assert.ok(html.includes('ph-star-fill'));
     assert.ok(html.includes('on'));
     assert.ok(html.includes('Remove from favorites'));
   });
@@ -4557,7 +4561,7 @@ console.log('\n=== app.js: favorites ===');
   test('favStar returns empty star for non-favorite', () => {
     ctx.localStorage.setItem('meshcore-favorites', '[]');
     const html = ctx.favStar('pk1');
-    assert.ok(html.includes('☆'));
+    assert.ok(html.includes('ph-star') && !html.includes('ph-star-fill'));
     assert.ok(!html.includes(' on'));
     assert.ok(html.includes('Add to favorites'));
   });
@@ -4980,6 +4984,7 @@ console.log('\n=== region-filter.js: setSelected ===');
     removeEventListener: () => {},
   });
 
+  loadInCtx(ctx, 'public/area-filter.js');
   loadInCtx(ctx, 'public/region-filter.js');
 
   const RF = ctx.RegionFilter;
@@ -5079,6 +5084,7 @@ console.log('\n=== packets.js: buildPacketsQuery ===');
 
   ctx.registerPage = () => {};
   ctx.RegionFilter = { init: () => Promise.resolve(), onChange: () => () => {}, offChange: () => {}, getSelected: () => null, getRegionParam: () => '', setSelected: () => {} };
+  ctx.AreaFilter = { init: () => Promise.resolve(), onChange: () => () => {}, offChange: () => {}, getSelected: () => null, getAreaParam: () => '', setSelected: () => {} };
   ctx.onWS = () => {};
   ctx.offWS = () => {};
   ctx.debouncedOnWS = () => () => {};
@@ -5235,21 +5241,21 @@ console.log('\n=== analytics.js: renderMultiByteCapability ===');
 
     test('renders confirmed status with green indicator', () => {
       const html = render([{ pubkey: 'aabb', name: 'RepA', role: 'repeater', status: 'confirmed', evidence: 'advert', maxHashSize: 2, lastSeen: '' }]);
-      assert.ok(html.includes('✅'), 'should contain confirmed icon');
+      assert.ok(html.includes('#ph-check-circle') || html.includes('✅'), 'should contain confirmed icon (✅ or ph-check-circle)');
       assert.ok(html.includes('Confirmed'), 'should contain Confirmed label');
       assert.ok(html.includes('--success'), 'should use --success CSS var for green');
     });
 
     test('renders suspected status with yellow indicator', () => {
       const html = render([{ pubkey: 'ccdd', name: 'RepB', role: 'repeater', status: 'suspected', evidence: 'path', maxHashSize: 2, lastSeen: '' }]);
-      assert.ok(html.includes('⚠️'), 'should contain suspected icon');
+      assert.ok(html.includes('#ph-warning') || html.includes('⚠️'), 'should contain suspected icon (⚠️ or ph-warning)');
       assert.ok(html.includes('Suspected'), 'should contain Suspected label');
       assert.ok(html.includes('--warning'), 'should use --warning CSS var for yellow');
     });
 
     test('renders unknown status with gray indicator', () => {
       const html = render([{ pubkey: 'eeff', name: 'RepC', role: 'repeater', status: 'unknown', evidence: '', maxHashSize: 1, lastSeen: '' }]);
-      assert.ok(html.includes('❓'), 'should contain unknown icon');
+      assert.ok(html.includes('#ph-question') || html.includes('❓'), 'should contain unknown icon (❓ or ph-question)');
       assert.ok(html.includes('Unknown'), 'should contain Unknown label');
       assert.ok(html.includes('--text-muted'), 'should use --text-muted CSS var for gray');
     });
@@ -5337,7 +5343,7 @@ console.log('\n=== analytics.js: renderMultiByteAdopters ===');
         { pubkey: 'aa11', name: 'NodeA', role: 'repeater', status: 'confirmed', evidence: 'advert', maxHashSize: 2, lastSeen: '' },
       ];
       const html = renderAdopters(nodes, caps);
-      assert.ok(html.includes('✅'), 'should show confirmed icon');
+      assert.ok(html.includes('#ph-check-circle') || html.includes('✅'), 'should show confirmed icon');
       assert.ok(html.includes('Confirmed'), 'should show Confirmed label');
       assert.ok(html.includes('2-byte'), 'should show hash size badge');
     });
@@ -5363,7 +5369,7 @@ console.log('\n=== analytics.js: renderMultiByteAdopters ===');
         { name: 'Orphan', pubkey: 'zz99', role: 'repeater', hashSize: 2, packets: 1, lastSeen: '' },
       ];
       const html = renderAdopters(nodes, []); // no caps
-      assert.ok(html.includes('❓'), 'should show unknown icon');
+      assert.ok(html.includes('#ph-question') || html.includes('❓'), 'should show unknown icon');
       assert.ok(html.includes('Unknown'), 'should show Unknown label');
     });
 
@@ -5816,7 +5822,7 @@ console.log('\n=== analytics.js: hashStatCardsHtml collision details ===');
     assert.ok(html.includes('onclick='), 'should have onclick when collisions > 0');
     assert.ok(html.includes('collisionRiskSection'), 'should scroll to collisionRiskSection');
     assert.ok(html.includes('cursor:pointer'), 'should show pointer cursor');
-    assert.ok(html.includes('▼'), 'should show expand indicator');
+    assert.ok(html.includes('#ph-caret-down') || html.includes('▼'), 'should show expand indicator');
   });
 
   test('collision count 0 renders non-clickable card', () => {
@@ -6289,7 +6295,7 @@ console.log('\n=== analytics.js: renderCollisionsFromServer collision table ==='
     }, {});
     // Must contain unreliable warning badge button
     assert.ok(html.includes('hop-unreliable-btn'), 'should have unreliable badge button');
-    assert.ok(html.includes('⚠️'), 'should have ⚠️ icon');
+    assert.ok(html.includes('#ph-warning'), 'should have ph-warning sprite icon'); // #1648 M3
     assert.ok(html.includes('Unreliable name resolution'), 'should have tooltip text');
     // Must NOT contain line-through in inline style (CSS class no longer has it)
     assert.ok(!html.includes('line-through'), 'should not contain line-through');
@@ -6404,6 +6410,172 @@ console.log('\n=== app.js: escapeHtml ===');
   });
 }
 
+// ===== roles.js: Map Tile Config Parsing =====
+console.log('\n=== roles.js: Map Tile Config Parsing ===');
+{
+  function makeRolesSandbox(cfg) {
+    const ctx = makeSandbox();
+    const rolesJs = fs.readFileSync(__dirname + '/public/roles.js', 'utf8');
+    ctx.fetch = () => Promise.resolve({ json: () => Promise.resolve(cfg) });
+    ctx.window.fetch = ctx.fetch;
+    // Load it
+    vm.runInNewContext(rolesJs, ctx);
+    return ctx;
+  }
+
+  test('mapTiles sets MC_MAP_CFG when map config is missing', async () => {
+    const ctx = makeRolesSandbox({});
+    await ctx.window.MeshConfigReady;
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.window.MC_MAP_CFG)), { tiles: { providers: {} } }, 'Should fallback to empty providers');
+  });
+
+  test('mapTiles exposes map config directly to MC_MAP_CFG', async () => {
+    const mapCfg = {
+      tiles: {
+        providers: { carto: { enabled: true, domain: 'test-carto' }, stamen: { enabled: true, token: 'test-stamen' } }
+      }
+    };
+    const ctx = makeRolesSandbox({ map: mapCfg });
+    await ctx.window.MeshConfigReady;
+    assert.deepStrictEqual(ctx.window.MC_MAP_CFG, mapCfg, 'MC_MAP_CFG should equal cfg.map');
+  });
+}
+
+// ===== #1504 — Path symbols legend disclosure =====
+{
+  console.log('\n--- #1504: Path symbols legend disclosure ---');
+  const sb = {
+    window: { addEventListener: () => {}, dispatchEvent: () => {} },
+    document: {
+      readyState: 'complete',
+      createElement: () => ({ id: '', textContent: '', innerHTML: '' }),
+      head: { appendChild: () => {} },
+      getElementById: () => null,
+      addEventListener: () => {},
+      querySelectorAll: () => [],
+      querySelector: () => null,
+    },
+    console, Date, Math, Array, Object, String, Number, JSON, RegExp, Map, Set,
+    encodeURIComponent, parseInt, parseFloat, isNaN, Infinity, NaN, undefined,
+    setTimeout: () => {}, setInterval: () => {}, clearTimeout: () => {}, clearInterval: () => {},
+  };
+  sb.window.document = sb.document; sb.self = sb.window; sb.globalThis = sb.window;
+  const ctx1504 = vm.createContext(sb);
+  vm.runInContext(fs.readFileSync(__dirname + '/public/hop-display.js', 'utf8'), ctx1504);
+  const HD = ctx1504.window.HopDisplay;
+
+  test('#1504: HopDisplay.PATH_SYMBOLS_LEGEND is defined and non-empty array', () => {
+    assert.ok(Array.isArray(HD.PATH_SYMBOLS_LEGEND), 'PATH_SYMBOLS_LEGEND must be an array');
+    assert.ok(HD.PATH_SYMBOLS_LEGEND.length >= 3, 'must have at least 3 entries (⚠N, ⚠️, dashed underline)');
+  });
+
+  test('#1504: each legend entry has glyph + description', () => {
+    HD.PATH_SYMBOLS_LEGEND.forEach((e, i) => {
+      // #1648 M3: glyph → glyphHtml (Phosphor sprite markup), text fallback OK
+      const g = (e && (e.glyphHtml || e.glyph)) || '';
+      assert.ok(typeof g === 'string' && g.length > 0, 'entry ' + i + ' needs non-empty glyph/glyphHtml');
+      assert.ok(typeof e.description === 'string' && e.description.length > 0, 'entry ' + i + ' needs non-empty description');
+    });
+  });
+
+  test('#1504: legend constant + renderer exposed on window.HopDisplay namespace', () => {
+    assert.ok(ctx1504.window.HopDisplay.PATH_SYMBOLS_LEGEND, 'PATH_SYMBOLS_LEGEND exported on namespace');
+    assert.strictEqual(typeof ctx1504.window.HopDisplay.renderPathSymbolsLegend, 'function', 'renderPathSymbolsLegend exported');
+  });
+
+  test('#1504: renderPathSymbolsLegend returns <details> disclosure with "Path symbols" summary + all glyphs', () => {
+    const html = HD.renderPathSymbolsLegend();
+    assert.ok(html.includes('<details'), 'must render a <details> element');
+    assert.ok(html.includes('<summary>Path symbols</summary>'), 'must have summary text "Path symbols"');
+    assert.ok(html.includes('#ph-warning') || html.includes('⚠'), 'must contain warning glyph (sprite or unicode)'); // #1648 M3
+    assert.ok(/dashed/i.test(html), 'must describe the dashed underline convention');
+  });
+
+  test('#1504: packets.js places legend in a sibling wrapper (NOT inside any <th> with data-sort-key)', () => {
+    const src = fs.readFileSync(__dirname + '/public/packets.js', 'utf8');
+    assert.ok(src.includes('renderPathSymbolsLegend'),
+      'packets.js must invoke HopDisplay.renderPathSymbolsLegend()');
+    assert.ok(src.includes('path-symbols-legend-wrapper'),
+      'packets.js must wrap the legend in .path-symbols-legend-wrapper (sibling, not inside <th>)');
+    // The legend invocation must NOT be inside a <th>...</th> with data-sort-key.
+    // Simple structural check: in any line that contains renderPathSymbolsLegend,
+    // we must NOT see "data-sort-key" on that same line.
+    src.split('\n').forEach((line, i) => {
+      if (line.includes('renderPathSymbolsLegend') && line.includes('data-sort-key')) {
+        throw new Error('packets.js line ' + (i+1) + ' places legend inside a sortable <th> — will clobber the sort handler: ' + line.trim());
+      }
+    });
+  });
+
+  test('#1504: nodes.js places legend in a sibling wrapper (NOT inside <h4>)', () => {
+    const src = fs.readFileSync(__dirname + '/public/nodes.js', 'utf8');
+    assert.ok(src.includes('path-symbols-legend-wrapper'),
+      'nodes.js must wrap the legend in .path-symbols-legend-wrapper (sibling, not inside <h4>)');
+    src.split('\n').forEach((line, i) => {
+      // line must not contain BOTH <h4 and renderPathSymbolsLegend
+      if (line.includes('renderPathSymbolsLegend') && /<h4[\s>]/.test(line)) {
+        throw new Error('nodes.js line ' + (i+1) + ' still embeds legend inside <h4>: ' + line.trim());
+      }
+    });
+  });
+
+  test('#1504: style.css gives .path-symbols-legend position:relative so absolutely-positioned panel anchors correctly', () => {
+    const css = fs.readFileSync(__dirname + '/public/style.css', 'utf8');
+    // Find the rule block for .path-symbols-legend (NOT .path-symbols-legend-wrapper)
+    const m = css.match(/\.path-symbols-legend\s*\{[^}]*\}/);
+    assert.ok(m, '.path-symbols-legend rule must exist');
+    assert.ok(/position\s*:\s*relative/.test(m[0]),
+      '.path-symbols-legend must declare position:relative so .path-legend-list (position:absolute) anchors to it, not a random ancestor. Block was: ' + m[0]);
+    // And the panel must still be position:absolute
+    const panel = css.match(/\.path-symbols-legend\s+\.path-legend-list\s*\{[^}]*\}/);
+    assert.ok(panel && /position\s*:\s*absolute/.test(panel[0]),
+      '.path-symbols-legend .path-legend-list must remain position:absolute');
+  });
+
+  test('#1504: legend glyphs match what hop-display.js actually renders (no documented-but-missing glyphs)', () => {
+    const hopSrc = fs.readFileSync(__dirname + '/public/hop-display.js', 'utf8');
+    HD.PATH_SYMBOLS_LEGEND.forEach(entry => {
+      // #1648 M3: glyphs are now sprite HTML (glyphHtml); the legend uses
+      // ph-warning sprite refs which appear inline in hop-display.js too.
+      const g = entry.glyphHtml || entry.glyph || '';
+      if (g === 'dashed underline') {
+        assert.ok(/hop-ambiguous|hop-global-fallback/.test(hopSrc),
+          'legend mentions "dashed underline" but hop-display.js has no ambiguous/global-fallback class');
+        return;
+      }
+      // Sprite legend entries reference ph-warning; hop-display.js must
+      // also reference ph-warning (it's what renderHop emits).
+      if (/ph-warning/.test(g)) {
+        assert.ok(/ph-warning/.test(hopSrc),
+          'legend uses ph-warning sprite but hop-display.js does not reference it');
+        return;
+      }
+      // Otherwise the literal glyph must appear in the file
+      assert.ok(hopSrc.includes(g),
+        'legend glyph ' + JSON.stringify(g.slice(0, 60)) + ' not found in hop-display.js');
+    });
+  });
+
+  test('#1504 regression: clicking <summary> in legend does NOT trigger column-sort handler', () => {
+    // Simulate the structural guarantee from the wrapper move: legend must not be a descendant of a sortable <th>.
+    // table-sort.js binds click on th[data-sort-key]; with the legend in a sibling div, no click on summary
+    // can bubble to a sortable th.
+    const pktSrc = fs.readFileSync(__dirname + '/public/packets.js', 'utf8');
+    // Extract the snippet around the table head and confirm the legend is OUTSIDE <thead>...</thead>
+    const theadIdx = pktSrc.indexOf('<thead>');
+    const theadEnd = pktSrc.indexOf('</thead>', theadIdx);
+    const tbodyEnd = pktSrc.indexOf('</table>', theadEnd);
+    assert.ok(theadIdx > 0 && theadEnd > theadIdx, 'must find thead boundaries');
+    const insideThead = pktSrc.slice(theadIdx, theadEnd);
+    assert.ok(!insideThead.includes('renderPathSymbolsLegend'),
+      'renderPathSymbolsLegend must NOT appear inside <thead> — would clobber sort handler');
+    // Also: legend must be outside the entire <table> (sibling)
+    const insideTable = pktSrc.slice(theadIdx, tbodyEnd);
+    assert.ok(!insideTable.includes('renderPathSymbolsLegend'),
+      'legend must be sibling of <table>, not a child of any <th>/<thead>/<tr>');
+  });
+}
+
 // ===== SUMMARY =====
 Promise.allSettled(pendingTests).then(() => {
   console.log(`\n${'═'.repeat(40)}`);
@@ -6414,3 +6586,64 @@ Promise.allSettled(pendingTests).then(() => {
   console.error('Failed waiting for async tests:', e);
   process.exit(1);
 });
+
+// ===== observers.js: healthStatus (#1552) =====
+console.log('\n=== observers.js: healthStatus (configurable thresholds) ===');
+{
+  // Extract the healthStatus function body from observers.js so we can test
+  // it standalone (the file is an IIFE that depends on many page globals).
+  const src = fs.readFileSync('public/observers.js', 'utf8');
+  const m = src.match(/function healthStatus\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+  if (!m) throw new Error('healthStatus not found in public/observers.js');
+  const healthStatusSrc = m[0];
+
+  function runHealthStatus(lastSeen, healthThresholds) {
+    const ctx = { window: {}, Date };
+    if (healthThresholds) ctx.window.HEALTH_THRESHOLDS = healthThresholds;
+    vm.createContext(ctx);
+    vm.runInContext(healthStatusSrc + '\n; result = healthStatus(lastSeen);', Object.assign(ctx, { lastSeen, result: null }));
+    return ctx.result;
+  }
+
+  test('observer 20min old with 30min override → Online', () => {
+    const ts = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+    const r = runHealthStatus(ts, { observerOnlineMs: 30 * 60 * 1000, observerStaleMs: 120 * 60 * 1000 });
+    assert.strictEqual(r.cls, 'health-green', 'expected Online with 30min override, got ' + JSON.stringify(r));
+  });
+
+  test('observer 20min old with default thresholds → Online (new 1h default, #1552)', () => {
+    const ts = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+    const r = runHealthStatus(ts, null);
+    assert.strictEqual(r.cls, 'health-green', 'expected Online with 1h default, got ' + JSON.stringify(r));
+  });
+
+  test('observer 30min old with NO HEALTH_THRESHOLDS → Online (#1552 default raised to 1h)', () => {
+    const ts = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const r = runHealthStatus(ts, null);
+    assert.strictEqual(r.cls, 'health-green', 'expected Online with new 1h default, got ' + JSON.stringify(r));
+  });
+
+  test('observer 2h old with default thresholds → Stale (new 24h stale default, #1552)', () => {
+    const ts = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const r = runHealthStatus(ts, null);
+    assert.strictEqual(r.cls, 'health-yellow', 'expected Stale with 24h default, got ' + JSON.stringify(r));
+  });
+
+  test('observer 25h old with default thresholds → Offline (>24h, #1552)', () => {
+    const ts = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    const r = runHealthStatus(ts, null);
+    assert.strictEqual(r.cls, 'health-red', 'expected Offline beyond 24h stale default, got ' + JSON.stringify(r));
+  });
+
+  test('observer 90min old with 2h stale override → Stale', () => {
+    const ts = new Date(Date.now() - 90 * 60 * 1000).toISOString();
+    const r = runHealthStatus(ts, { observerOnlineMs: 30 * 60 * 1000, observerStaleMs: 120 * 60 * 1000 });
+    assert.strictEqual(r.cls, 'health-yellow', 'expected Stale (90min < 120min stale), got ' + JSON.stringify(r));
+  });
+
+  test('null lastSeen → Unknown', () => {
+    const r = runHealthStatus(null, null);
+    assert.strictEqual(r.cls, 'health-red');
+    assert.strictEqual(r.label, 'Unknown');
+  });
+}

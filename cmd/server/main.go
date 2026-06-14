@@ -109,22 +109,37 @@ func main() {
 		log.Printf("[security] WARNING: API key is weak or a known default — write endpoints are vulnerable")
 	}
 
-	// Apply Go runtime soft memory limit (#836).
-	// Honors GOMEMLIMIT if set; otherwise derives from packetStore.maxMemoryMB.
+	// Apply Go runtime soft memory limit (#836, #1010).
+	// Precedence: GOMEMLIMIT env > runtime.maxMemoryMB > derived from packetStore.maxMemoryMB.
 	{
 		_, envSet := os.LookupEnv("GOMEMLIMIT")
+		runtimeMaxMB := 0
+		if cfg.Runtime != nil {
+			runtimeMaxMB = cfg.Runtime.MaxMemoryMB
+		}
 		maxMB := 0
 		if cfg.PacketStore != nil {
 			maxMB = cfg.PacketStore.MaxMemoryMB
 		}
-		limit, source := applyMemoryLimit(maxMB, envSet)
+		// runtime.maxMemoryMB (explicit) wins over packetStore-derived (implicit).
+		effectiveMB := maxMB
+		usedRuntimeCfg := false
+		if !envSet && runtimeMaxMB > 0 {
+			effectiveMB = runtimeMaxMB
+			usedRuntimeCfg = true
+		}
+		limit, source := applyMemoryLimit(effectiveMB, envSet)
 		switch source {
 		case "env":
 			log.Printf("[memlimit] using GOMEMLIMIT from environment (%s)", os.Getenv("GOMEMLIMIT"))
 		case "derived":
-			log.Printf("[memlimit] derived from packetStore.maxMemoryMB=%d → %d MiB (1.5x headroom)", maxMB, limit/(1024*1024))
+			if usedRuntimeCfg {
+				log.Printf("[memlimit] runtime.maxMemoryMB=%d → %d MiB (1.5x headroom)", runtimeMaxMB, limit/(1024*1024))
+			} else {
+				log.Printf("[memlimit] derived from packetStore.maxMemoryMB=%d → %d MiB (1.5x headroom)", maxMB, limit/(1024*1024))
+			}
 		default:
-			log.Printf("[memlimit] no soft memory limit set (GOMEMLIMIT unset, packetStore.maxMemoryMB=0); recommend setting one to avoid container OOM-kill")
+			log.Printf("[memlimit] unset → default (no soft memory limit; recommend setting GOMEMLIMIT or runtime.maxMemoryMB to ≥1.5× working set to avoid OOM-kill)")
 		}
 		warnIfMemlimitUnderprovisioned(limit)
 	}
@@ -183,18 +198,56 @@ func main() {
 	// In-memory packet store
 	store := NewPacketStore(database, cfg.PacketStore, cfg.CacheTTL)
 	store.config = cfg
-	if err := store.Load(); err != nil {
-		log.Fatalf("[store] failed to load: %v", err)
+
+	// Load the persisted neighbor graph BEFORE the packet load so the
+	// chunked loader can resolve relay-hop pubkeys from path_json. Since
+	// #1287 the ingestor persists relay data only as aggregate
+	// neighbor_edges — observations.resolved_path is never written — so
+	// without an available graph at load time a relay node's analytics
+	// history would rebuild only from post-restart live traffic (the
+	// "timeline empty after every restart" bug). neighbor_edges is small,
+	// so this adds negligible latency before the HTTP listener binds. The
+	// fresh-DB branch (no snapshot) still builds in-memory AFTER the load
+	// below, because BuildFromStore needs the loaded packets.
+	neighborEdgesPersisted := neighborEdgesTableExists(database.conn)
+	if neighborEdgesPersisted {
+		store.graph.Store(loadNeighborEdgesFromDB(database.conn))
+		log.Printf("[neighbor] loaded persisted neighbor graph")
 	}
+
+	// #1009: chunked Load with early HTTP readiness. LoadChunked runs
+	// asynchronously and signals FirstChunkReady after the first chunk
+	// is merged so the HTTP listener can bind without waiting for the
+	// full multi-minute scan to finish. loadStatusMiddleware (wired
+	// below) advertises loading|ready via X-CoreScope-Load-Status.
+	chunkSize := cfg.DBLoadChunkSize()
+	loadErrCh := make(chan error, 1)
+	go func() {
+		loadErrCh <- store.LoadChunked(chunkSize)
+	}()
+	select {
+	case <-store.FirstChunkReady():
+		log.Printf("[store] first chunk ready (chunkSize=%d) — HTTP listener may bind", chunkSize)
+	case err := <-loadErrCh:
+		if err != nil {
+			log.Fatalf("[store] LoadChunked failed before first chunk: %v", err)
+		}
+		log.Printf("[store] LoadChunked completed before first-chunk signal (empty DB?)")
+	}
+	go func() {
+		if err := <-loadErrCh; err != nil {
+			log.Printf("[store] LoadChunked background error: %v", err)
+		}
+	}()
 	if store.hotStartupHours > 0 {
 		log.Printf("[store] starting background load: filling retentionHours=%gh from hotStartupHours=%gh",
 			store.retentionHours, store.hotStartupHours)
 		go store.loadBackgroundChunks()
 	}
 
-	// Initialize persisted neighbor graph.
-	// Per #1287, schema migrations all live in the ingestor (see
-	// dbschema.Apply). The server merely loads the snapshot here and
+	// Neighbor graph: the persisted snapshot (if present) was already
+	// loaded above, before the packet load. Per #1287 schema migrations
+	// all live in the ingestor; the server only reads the snapshot and
 	// then refreshes it via the recompNeighborGraph slot every 60s.
 	dbPath = database.path
 	database.hasResolvedPath = true // dbschema.AssertReady above already verified observations.resolved_path exists
@@ -202,11 +255,7 @@ func main() {
 	// WaitGroup for background init steps that gate /api/healthz readiness.
 	var initWg sync.WaitGroup
 
-	// Load or build neighbor graph
-	if neighborEdgesTableExists(database.conn) {
-		store.graph.Store(loadNeighborEdgesFromDB(database.conn))
-		log.Printf("[neighbor] loaded persisted neighbor graph")
-	} else {
+	if !neighborEdgesPersisted {
 		// No persisted snapshot yet (e.g. fresh DB before the ingestor
 		// has run its first edge-build cycle). Build an in-memory graph
 		// from the packets we already have so reads aren't empty. We
@@ -331,6 +380,26 @@ func main() {
 	defer close(stopNeighborGraphCache)
 	log.Printf("[neighbor-graph-cache] background recompute enabled (interval=%s)", ngInterval)
 
+	// Known-channels catalogue cache (issue #1323). OPT-IN: an empty
+	// cfg.KnownChannelsURL leaves srv.knownChannels nil and starts no
+	// background fetch. The /api/known-channels endpoint then serves an
+	// empty snapshot. Operators who want the community catalogue must
+	// set knownChannelsUrl explicitly in config.json (see
+	// config.example.json for the pinned-SHA recommendation).
+	if cfg.KnownChannelsURL != "" {
+		kcRefresh := DefaultKnownChannelsRefresh
+		if cfg.KnownChannelsRefreshMs > 0 {
+			kcRefresh = time.Duration(cfg.KnownChannelsRefreshMs) * time.Millisecond
+		}
+		srv.knownChannels = newKnownChannelsCache(cfg.KnownChannelsURL, kcRefresh)
+		kcCtx, stopKnownChannels := context.WithCancel(context.Background())
+		srv.knownChannels.run(kcCtx)
+		defer stopKnownChannels()
+		log.Printf("[known-channels] background fetch enabled (url=%s, refresh=%s)", cfg.KnownChannelsURL, kcRefresh)
+	} else {
+		log.Printf("[known-channels] disabled (knownChannelsUrl unset in config)")
+	}
+
 	// Steady-state repeater-enrichment recomputer (issue #1262).
 	// Prewarms the bulk caches feeding handleNodes so the very first
 	// /api/nodes?limit=2000 from live.js's SPA bootstrap hits a
@@ -380,6 +449,10 @@ func main() {
 		handler = gzipMiddlewareWithConfig(cfg.Compression, router)
 		log.Printf("[server] HTTP gzip compression enabled")
 	}
+	// #1009: stamp X-CoreScope-Load-Status on every response so probes
+	// and dashboards can see when the chunked Load is still in flight.
+	// Outermost wrap so the header is set regardless of gzip/etc.
+	handler = loadStatusMiddleware(store, handler)
 	if cfg.WSCompressionEnabled() {
 		log.Printf("[server] WebSocket permessage-deflate compression enabled")
 	}

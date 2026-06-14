@@ -28,6 +28,11 @@ node test-channel-issue-1087.js
 node test-issue-1409-no-encrypted-flood.js
 node test-analytics-channels-integration.js
 node test-observers-headings.js
+node test-issue-1648-m1-emoji-scan.js
+node test-issue-1648-m2-emoji-scan.js
+node test-issue-1648-m3-emoji-scan.js
+node test-issue-1648-m6-final-sweep.js
+node test-issue-1648-m6-lint-self.js
 node test-traces.js
 
 # #1418 — route-view v2 (Tufte) coverage
@@ -38,9 +43,12 @@ node test-issue-1418-spider-fan.js
 node test-issue-1418-deeplink-hops-channels.js
 node test-issue-1418-polish-review.js
 node test-issue-1420-tile-providers.js
+node test-issue-1614-tile-url-function.js
 node test-issue-1438-marker-css-vars.js
 node test-issue-1438-customizer-mcrole.js
 node test-issue-1446-cb-preset-cascade.js
+node test-issue-1380-cb-sim-overlay.js
+node test-issue-1380-cb-reset-button.js
 node test-issue-1450-logo-aspect.js
 node test-issue-1454-channels-toggle.js
 node test-issue-1456-score-labels.js
@@ -49,6 +57,7 @@ node test-issue-1456-score-labels.js
 node test-issue-1461-mobile-page-actions.js
 node test-issue-1470-node-tile-helper.js
 node test-issue-1485-live-anim-z.js
+node test-issue-1532-live-fullscreen.js
 node test-issue-1473-reserved-prefixes.js
 node test-issue-1473-prefix-generator.js
 

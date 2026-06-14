@@ -100,11 +100,12 @@ if (typeof window !== 'undefined') {
     currentView = 'summary';
     routeFilter = 'all';
 
-    app.innerHTML = '<div class="compare-page" style="padding:16px">' +
-      '<div class="page-header" style="display:flex;align-items:center;gap:12px;margin-bottom:16px">' +
+    app.innerHTML = '<div class="compare-page">' +
+      '<div class="page-header">' +
         '<a href="#/observers" class="btn-icon" title="Back to Observers" aria-label="Back">\u2190</a>' +
-        '<h2 style="margin:0">\uD83D\uDD0D Observer Comparison</h2>' +
+        '<h2>\uD83D\uDD0D Observer Comparison</h2>' +
       '</div>' +
+      '<nav data-role="compare-breadcrumbs" aria-label="Compare breadcrumbs" class="compare-breadcrumbs"></nav>' +
       '<div id="compareControls" class="compare-controls"><div class="text-center text-muted" style="padding:20px">Loading observers\u2026</div></div>' +
       '<div id="compareContent"></div>' +
     '</div>';
@@ -131,6 +132,13 @@ if (typeof window !== 'undefined') {
     routeFilter = 'all';
   }
 
+  // #1646 round-2 — single shared "should we run a comparison?" predicate
+  // used by every auto-run call site so guards cannot drift apart.
+  // URL-prepopulated ?a=X&b=X (same observer in both slots) returns false.
+  function isComparisonReady() {
+    return !!(selA && selB && selA !== selB);
+  }
+
   async function loadObservers() {
     try {
       var data = await api('/observers', { ttl: CLIENT_TTL.observers });
@@ -138,7 +146,7 @@ if (typeof window !== 'undefined') {
         return (a.name || a.id).localeCompare(b.name || b.id);
       });
       renderControls();
-      if (selA && selB) runComparison();
+      if (isComparisonReady()) runComparison();
     } catch (e) {
       document.getElementById('compareControls').innerHTML =
         '<div class="text-muted" style="padding:20px">Error loading observers: ' + escapeHtml(e.message) + '</div>';
@@ -160,14 +168,15 @@ if (typeof window !== 'undefined') {
       '<div class="compare-selector">' +
         '<div class="compare-select-group">' +
           '<label for="compareObsA">Observer A</label>' +
+          '<span class="compare-select-id" aria-hidden="true">A</span>' +
           '<select id="compareObsA" class="compare-select">' + optionsHtml + '</select>' +
         '</div>' +
         '<span class="compare-vs">vs</span>' +
         '<div class="compare-select-group">' +
           '<label for="compareObsB">Observer B</label>' +
+          '<span class="compare-select-id" aria-hidden="true">B</span>' +
           '<select id="compareObsB" class="compare-select">' + optionsHtml + '</select>' +
         '</div>' +
-        '<button id="compareBtn" class="compare-btn" disabled>Compare</button>' +
         '<div class="compare-select-group">' +
           '<label for="compareRouteFilter">Packet Type</label>' +
           '<select id="compareRouteFilter" class="compare-select">' +
@@ -180,7 +189,6 @@ if (typeof window !== 'undefined') {
 
     var ddA = document.getElementById('compareObsA');
     var ddB = document.getElementById('compareObsB');
-    var btn = document.getElementById('compareBtn');
 
     if (selA) ddA.value = selA;
     if (selB) ddB.value = selB;
@@ -192,15 +200,55 @@ if (typeof window !== 'undefined') {
       if (comparisonResult) runComparison();
     });
 
+    // #1646 — single source of truth for "should we run a comparison?".
+    // Called from change handlers and from the initial pre-populated
+    // path in loadObservers(). The picker collapse rule (.is-collapsed)
+    // is the ONLY DOM hook for state — no parallel data-collapsed attr.
     function updateBtn() {
       selA = ddA.value || null;
       selB = ddB.value || null;
-      btn.disabled = !selA || !selB || selA === selB;
+      var wrap = document.getElementById('compareControls');
+      var ready = isComparisonReady();
+      if (wrap) wrap.classList.toggle('is-collapsed', ready);
+      renderBreadcrumbs();
     }
-    ddA.addEventListener('change', updateBtn);
-    ddB.addEventListener('change', updateBtn);
-    btn.addEventListener('click', function () { runComparison(); });
+    function onChange() {
+      updateBtn();
+      // change events only fire when value actually changes, so any
+      // ready transition that lands here came from a real user action.
+      if (isComparisonReady()) runComparison();
+    }
+    ddA.addEventListener('change', onChange);
+    ddB.addEventListener('change', onChange);
     updateBtn();
+  }
+
+  // #1640 — render breadcrumbs linking back to each observer's detail page.
+  // Hidden when neither observer is picked; otherwise:
+  //   "Observers › <A name> ⇆ <B name>"
+  // The "&lrm;" entities keep punctuation LTR in RTL contexts.
+  function renderBreadcrumbs() {
+    var el = document.querySelector('[data-role="compare-breadcrumbs"]');
+    if (!el) return;
+    function linkFor(id) {
+      if (!id) return null;
+      var match = null;
+      for (var i = 0; i < observers.length; i++) {
+        if (String(observers[i].id) === String(id)) { match = observers[i]; break; }
+      }
+      var label = match ? (match.name || match.id) : id;
+      return '<a href="#/observers/' + encodeURIComponent(id) + '">' + escapeHtml(label) + '</a>';
+    }
+    var parts = ['<a href="#/observers">Observers</a>'];
+    var aLink = linkFor(selA);
+    var bLink = linkFor(selB);
+    if (aLink || bLink) {
+      var pair = [];
+      if (aLink) pair.push(aLink);
+      if (bLink) pair.push(bLink);
+      parts.push(pair.join(' <span aria-hidden="true">\u21C6</span> '));
+    }
+    el.innerHTML = parts.join(' <span aria-hidden="true">\u203A</span> ');
   }
 
   function sinceISO(hours) {
@@ -283,76 +331,139 @@ if (typeof window !== 'undefined') {
 
     var typeHtml = Object.keys(typeBreakdown).map(function (t) {
       return '<span class="compare-type-badge">' +
-        escapeHtml(PAYLOAD_LABELS[t] || 'Type ' + t) + ': ' + typeBreakdown[t] +
+        escapeHtml(PAYLOAD_LABELS[t] || 'Type ' + t) + ' <b>' + typeBreakdown[t] + '</b>' +
       '</span>';
-    }).join(' ');
+    }).join('');
+
+    var stats = computeOverlapStats(r);
 
     content.innerHTML =
       '<div class="compare-results">' +
-        // Summary cards
-        '<div class="compare-summary">' +
-          '<div class="compare-card compare-card-both" data-view="both">' +
-            '<div class="compare-card-count">' + r.both.length.toLocaleString() + '</div>' +
-            '<div class="compare-card-label">Seen by both</div>' +
-            '<div class="compare-card-pct">' + pctBoth + '%</div>' +
+        // Headline strip — A | shared | B above a single proportional bar.
+        // All three cells lead with their percentage so the row reads in
+        // one unit (Tufte: show data variation, not design variation).
+        // #1646
+        '<section class="compare-strip" aria-label="Packet overlap summary">' +
+          '<div class="compare-strip-row">' +
+            '<div class="compare-strip-side" data-view="onlyA" role="button" tabindex="0" aria-label="Show only ' + nameA + ' packets">' +
+              '<div class="compare-strip-name">' + nameA + '</div>' +
+              '<div class="compare-strip-side-pct">' + pctA + '<span class="compare-strip-side-pct-unit">%</span></div>' +
+              '<div class="compare-strip-sub">' + r.onlyA.length.toLocaleString() + ' only here</div>' +
+            '</div>' +
+            '<div class="compare-strip-mid" data-view="both" role="button" tabindex="0" aria-label="Show shared packets">' +
+              '<div class="compare-strip-mid-pct">' + pctBoth + '<span class="compare-strip-mid-pct-unit">%</span></div>' +
+              '<div class="compare-strip-mid-count">' + r.both.length.toLocaleString() + '</div>' +
+              '<div class="compare-strip-mid-label">of all unique</div>' +
+            '</div>' +
+            '<div class="compare-strip-side compare-strip-side-b" data-view="onlyB" role="button" tabindex="0" aria-label="Show only ' + nameB + ' packets">' +
+              '<div class="compare-strip-name">' + nameB + '</div>' +
+              '<div class="compare-strip-side-pct">' + pctB + '<span class="compare-strip-side-pct-unit">%</span></div>' +
+              '<div class="compare-strip-sub">' + r.onlyB.length.toLocaleString() + ' only here</div>' +
+            '</div>' +
           '</div>' +
-          '<div class="compare-card compare-card-a" data-view="onlyA">' +
-            '<div class="compare-card-count">' + r.onlyA.length.toLocaleString() + '</div>' +
-            '<div class="compare-card-label">Only ' + nameA + '</div>' +
-            '<div class="compare-card-pct">' + pctA + '%</div>' +
+          // Single shared-axis diff bar. Width is exact proportion.
+          '<div class="compare-bar-container">' +
+            '<div class="compare-bar" role="img"' +
+                ' aria-label="' + nameA + ' only ' + pctA + '%, both ' + pctBoth + '%, ' + nameB + ' only ' + pctB + '%">' +
+              (pctA > 0 ? '<div class="compare-bar-seg compare-bar-a" style="width:' + pctA + '%" title="Only ' + nameA + ': ' + r.onlyA.length + '"></div>' : '') +
+              (pctBoth > 0 ? '<div class="compare-bar-seg compare-bar-both" style="width:' + pctBoth + '%" title="Both: ' + r.both.length + '"></div>' : '') +
+              (pctB > 0 ? '<div class="compare-bar-seg compare-bar-b" style="width:' + pctB + '%" title="Only ' + nameB + ': ' + r.onlyB.length + '"></div>' : '') +
+            '</div>' +
+            '<div class="compare-bar-legend">' +
+              '<span class="compare-legend-item"><span class="compare-dot compare-dot-a"></span> ' + nameA + ' only</span>' +
+              '<span class="compare-legend-item"><span class="compare-dot compare-dot-both"></span> Both</span>' +
+              '<span class="compare-legend-item"><span class="compare-dot compare-dot-b"></span> ' + nameB + ' only</span>' +
+            '</div>' +
           '</div>' +
-          '<div class="compare-card compare-card-b" data-view="onlyB">' +
-            '<div class="compare-card-count">' + r.onlyB.length.toLocaleString() + '</div>' +
-            '<div class="compare-card-label">Only ' + nameB + '</div>' +
-            '<div class="compare-card-pct">' + pctB + '%</div>' +
-          '</div>' +
-        '</div>' +
+        '</section>' +
 
-        // Visual bar
-        '<div class="compare-bar-container">' +
-          '<div class="compare-bar">' +
-            (pctA > 0 ? '<div class="compare-bar-seg compare-bar-a" style="width:' + pctA + '%" title="Only ' + nameA + ': ' + r.onlyA.length + '"></div>' : '') +
-            (pctBoth > 0 ? '<div class="compare-bar-seg compare-bar-both" style="width:' + pctBoth + '%" title="Both: ' + r.both.length + '"></div>' : '') +
-            (pctB > 0 ? '<div class="compare-bar-seg compare-bar-b" style="width:' + pctB + '%" title="Only ' + nameB + ': ' + r.onlyB.length + '"></div>' : '') +
+        // Asymmetric reach — two compact sentences instead of two big cards
+        '<section class="compare-asym" aria-label="Directional reach">' +
+          '<div class="compare-asym-line">' +
+            '<span class="compare-asym-pct">' + stats.aSeesOfB.toFixed(1) + '%</span>' +
+            nameA + ' saw <b>' + stats.shared.toLocaleString() + '</b> of ' + nameB +
+            '\u2019s <b>' + stats.totalB.toLocaleString() + '</b> packets' +
           '</div>' +
-          '<div class="compare-bar-legend">' +
-            '<span class="compare-legend-item"><span class="compare-dot compare-dot-a"></span> ' + nameA + ' only</span>' +
-            '<span class="compare-legend-item"><span class="compare-dot compare-dot-both"></span> Both</span>' +
-            '<span class="compare-legend-item"><span class="compare-dot compare-dot-b"></span> ' + nameB + ' only</span>' +
+          '<div class="compare-asym-line">' +
+            '<span class="compare-asym-pct">' + stats.bSeesOfA.toFixed(1) + '%</span>' +
+            nameB + ' saw <b>' + stats.shared.toLocaleString() + '</b> of ' + nameA +
+            '\u2019s <b>' + stats.totalA.toLocaleString() + '</b> packets' +
           '</div>' +
-        '</div>' +
+        '</section>' +
 
-        // Type breakdown for shared packets
-        (typeHtml ? '<div class="compare-type-summary"><strong>Shared packet types:</strong> ' + typeHtml + '</div>' : '') +
+        // Shared packet types — pills, mono-numeric
+        (typeHtml ? '<section class="compare-type-summary" aria-label="Shared packet types">' +
+            '<span class="compare-type-summary-label">Shared types</span>' + typeHtml +
+          '</section>' : '') +
 
         // Detail tabs
-        '<div class="compare-tabs">' +
-          '<button class="tab-btn' + (currentView === 'summary' ? ' active' : '') + '" data-cview="summary">Summary</button>' +
-          '<button class="tab-btn' + (currentView === 'both' ? ' active' : '') + '" data-cview="both">Both (' + r.both.length + ')</button>' +
-          '<button class="tab-btn' + (currentView === 'onlyA' ? ' active' : '') + '" data-cview="onlyA">Only ' + nameA + ' (' + r.onlyA.length + ')</button>' +
-          '<button class="tab-btn' + (currentView === 'onlyB' ? ' active' : '') + '" data-cview="onlyB">Only ' + nameB + ' (' + r.onlyB.length + ')</button>' +
+        '<div class="compare-tabs" role="tablist">' +
+          '<button class="tab-btn' + (currentView === 'summary' ? ' active' : '') + '" data-cview="summary" role="tab" aria-controls="compareDetail" aria-selected="' + (currentView === 'summary' ? 'true' : 'false') + '" tabindex="' + (currentView === 'summary' ? '0' : '-1') + '">Summary</button>' +
+          '<button class="tab-btn' + (currentView === 'both' ? ' active' : '') + '" data-cview="both" role="tab" aria-controls="compareDetail" aria-selected="' + (currentView === 'both' ? 'true' : 'false') + '" tabindex="' + (currentView === 'both' ? '0' : '-1') + '">Both (' + r.both.length + ')</button>' +
+          '<button class="tab-btn' + (currentView === 'onlyA' ? ' active' : '') + '" data-cview="onlyA" role="tab" aria-controls="compareDetail" aria-selected="' + (currentView === 'onlyA' ? 'true' : 'false') + '" tabindex="' + (currentView === 'onlyA' ? '0' : '-1') + '">Only ' + nameA + ' (' + r.onlyA.length + ')</button>' +
+          '<button class="tab-btn' + (currentView === 'onlyB' ? ' active' : '') + '" data-cview="onlyB" role="tab" aria-controls="compareDetail" aria-selected="' + (currentView === 'onlyB' ? 'true' : 'false') + '" tabindex="' + (currentView === 'onlyB' ? '0' : '-1') + '">Only ' + nameB + ' (' + r.onlyB.length + ')</button>' +
         '</div>' +
         '<div id="compareDetail"></div>' +
       '</div>';
 
-    // Bind tab clicks
-    content.addEventListener('click', function handler(e) {
-      var btn = e.target.closest('[data-cview]');
-      if (btn) {
-        currentView = btn.dataset.cview;
-        content.querySelectorAll('.tab-btn').forEach(function (b) { b.classList.remove('active'); });
-        btn.classList.add('active');
-        renderDetail();
+    // Sync the tablist's active/aria-selected/tabindex to currentView.
+    function syncTabState() {
+      content.querySelectorAll('.tab-btn').forEach(function (b) {
+        var on = b.dataset.cview === currentView;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+        b.setAttribute('tabindex', on ? '0' : '-1');
+      });
+    }
+
+    // Activate a [data-view] strip segment OR a [data-cview] tab.
+    function activate(el) {
+      if (!el) return;
+      if (el.dataset.cview) {
+        currentView = el.dataset.cview;
+      } else if (el.dataset.view) {
+        currentView = el.dataset.view;
+      } else {
         return;
       }
-      // Clickable summary cards
-      var card = e.target.closest('[data-view]');
-      if (card) {
-        currentView = card.dataset.view;
-        content.querySelectorAll('.tab-btn').forEach(function (b) {
-          b.classList.toggle('active', b.dataset.cview === currentView);
-        });
-        renderDetail();
+      syncTabState();
+      renderDetail();
+    }
+
+    // Bind tab clicks + strip clicks
+    content.addEventListener('click', function handler(e) {
+      var btn = e.target.closest('[data-cview]');
+      if (btn) { activate(btn); return; }
+      var seg = e.target.closest('[data-view]');
+      if (seg) { activate(seg); }
+    });
+
+    // Keyboard activation for tabs (arrow nav) + strip segments (Enter/Space).
+    content.addEventListener('keydown', function (e) {
+      var tab = e.target.closest('[data-cview]');
+      if (tab) {
+        if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+          e.preventDefault();
+          var tabs = Array.prototype.slice.call(content.querySelectorAll('.tab-btn'));
+          var idx = tabs.indexOf(tab);
+          if (idx < 0) return;
+          var next = e.key === 'ArrowRight'
+            ? tabs[(idx + 1) % tabs.length]
+            : tabs[(idx - 1 + tabs.length) % tabs.length];
+          activate(next);
+          next.focus();
+          return;
+        }
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          activate(tab);
+          return;
+        }
+      }
+      var seg = e.target.closest('[data-view]');
+      if (seg && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault();
+        activate(seg);
       }
     });
 
@@ -367,28 +478,18 @@ if (typeof window !== 'undefined') {
     var nameB = escapeHtml(obsName(selB));
 
     if (currentView === 'summary') {
-      // Textual summary
-      var stats = computeOverlapStats(r);
+      // Textual summary — the headline strip + asym lines already cover
+      // the quantitative story; this paragraph adds context and surfaces
+      // edge cases (no shared packets, perfect overlap).
       var total = r.onlyA.length + r.onlyB.length + r.both.length;
       var overlap = total > 0 ? (r.both.length / total * 100).toFixed(1) : '0.0';
       el.innerHTML =
         '<div class="compare-summary-text">' +
-          '<p>In the last 24 hours, <strong>' + nameA + '</strong> saw <strong>' + stats.totalA.toLocaleString() + '</strong> unique packets ' +
-          'and <strong>' + nameB + '</strong> saw <strong>' + stats.totalB.toLocaleString() + '</strong> unique packets.</p>' +
-          // #671 — asymmetric reference-observer comparison
-          '<div class="compare-asymmetric" style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">' +
-            '<div class="compare-asym-card" style="flex:1;min-width:240px;padding:12px;border:1px solid var(--border, #333);border-radius:6px">' +
-              '<div style="font-size:1.6em;font-weight:bold">' + stats.aSeesOfB.toFixed(1) + '%</div>' +
-              '<div class="text-muted">' + nameA + ' saw <strong>' + stats.shared.toLocaleString() + '</strong> of ' + nameB + '\u2019s ' + stats.totalB.toLocaleString() + ' packets</div>' +
-            '</div>' +
-            '<div class="compare-asym-card" style="flex:1;min-width:240px;padding:12px;border:1px solid var(--border, #333);border-radius:6px">' +
-              '<div style="font-size:1.6em;font-weight:bold">' + stats.bSeesOfA.toFixed(1) + '%</div>' +
-              '<div class="text-muted">' + nameB + ' saw <strong>' + stats.shared.toLocaleString() + '</strong> of ' + nameA + '\u2019s ' + stats.totalA.toLocaleString() + ' packets</div>' +
-            '</div>' +
-          '</div>' +
-          '<p><strong>' + r.both.length.toLocaleString() + '</strong> packets (' + overlap + '%) were seen by both observers. ' +
-          '<strong>' + r.onlyA.length.toLocaleString() + '</strong> were exclusive to ' + nameA + ' and ' +
-          '<strong>' + r.onlyB.length.toLocaleString() + '</strong> were exclusive to ' + nameB + '.</p>' +
+          '<p>In the last 24 hours, <strong>' + nameA + '</strong> saw <strong>' +
+            (r.onlyA.length + r.both.length).toLocaleString() + '</strong> unique packets ' +
+          'and <strong>' + nameB + '</strong> saw <strong>' +
+            (r.onlyB.length + r.both.length).toLocaleString() + '</strong> unique packets. ' +
+          '<strong>' + r.both.length.toLocaleString() + '</strong> (' + overlap + '%) were seen by both observers.</p>' +
           (r.both.length === 0 && total > 0 ? '<p class="compare-warning">\u26A0\uFE0F These observers share no packets \u2014 they may be on different frequencies or too far apart.</p>' : '') +
           (r.onlyA.length === 0 && r.onlyB.length === 0 && r.both.length > 0 ? '<p class="compare-good">\u2705 Perfect overlap \u2014 both observers see the same packets.</p>' : '') +
         '</div>';

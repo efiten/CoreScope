@@ -131,13 +131,16 @@ async function api(path, { ttl = 0, bust = false } = {}) {
 }
 
 // Fetch the COMPLETE /api/nodes set, transparently paging around the server's
-// 500-row per-request cap (handleNodes clamps ?limit to 500; routes.go). A
-// single ?limit=N fetch therefore silently truncates to the top 500 rows by
-// last_seen DESC, so on a mesh with >500 nodes every node-list consumer (map,
-// live, analytics, packets, area-map) loses the older-advert tail — a node that
+// per-request row cap. /api/nodes clamps ?limit to `listLimits.nodesMax`
+// (default 2000, operator-configurable; originally a hard 500 in PR #1540,
+// raised/made configurable in PR #1589). A single ?limit=N fetch therefore
+// silently truncates to the top nodesMax rows by last_seen DESC, so on a mesh
+// with more nodes than that cap every node-list consumer (map, live,
+// analytics, packets, area-map) loses the older-advert tail — a node that
 // relays constantly but last self-advertised hours ago drops off the map even
 // though it is plainly alive. #1606 fixed this for the Nodes page; this helper
-// generalizes the same loop for all callers, paging at the 500-row cap.
+// generalizes the same loop for all callers, using a fixed client page size
+// well under the server cap.
 //
 // extraQuery: query fragment appended after the paged limit/offset, each piece
 //   already '&'-prefixed exactly as callers build it today
@@ -155,10 +158,10 @@ async function fetchAllNodes(extraQuery = '', { ttl = 0, pageSize = 500, safetyC
       : (Array.isArray(data) ? data : []);
     accumulated.push.apply(accumulated, page);
     if (offset === 0) counts = (data && data.counts) || {};
-    // Canonical stop: a short page is the end. The server's `total` is
-    // unreliable (clamped to the returned page / overwritten under area+region
-    // filters), so we never loop on it nor surface it; a short page is the
-    // reliable end-of-data signal. See #1606.
+    // Canonical stop: a short page is the end. The server's `total` is a real
+    // COUNT(*) for the query, but the handler overwrites it with the filtered
+    // length under area/geo/blacklist filtering — so we never loop on it, nor
+    // surface it; a short page is the reliable end-of-data signal. See #1606.
     if (page.length < pageSize) break;
   }
   // Dedup by public_key: the sort window (last_seen DESC by default) can shift
@@ -170,8 +173,8 @@ async function fetchAllNodes(extraQuery = '', { ttl = 0, pageSize = 500, safetyC
     seen.set((n && n.public_key) || ('__nokey' + i), n);
   }
   // Enforce safetyCap as a real node-count ceiling (the page loop only bounds
-  // it to the next pageSize multiple), so a caller's render ceiling (e.g.
-  // live.js's 2000) is honored exactly rather than overshooting by pageSize-1.
+  // it to the next pageSize multiple), so e.g. live.js's LIVE_MAP_MAX_NODES is
+  // honored exactly rather than overshooting by up to pageSize-1.
   const nodes = Array.from(seen.values()).slice(0, safetyCap);
   return { nodes, counts, total: nodes.length };
 }
@@ -421,9 +424,13 @@ function toggleFavorite(pubkey) {
   localStorage.setItem(FAV_KEY, JSON.stringify(favs));
   return idx < 0; // true if now favorited
 }
+function favStarIconHtml(on) {
+  var id = on ? 'ph-star-fill' : 'ph-star';
+  return '<svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#' + id + '"/></svg>';
+}
 function favStar(pubkey, cls) {
   const on = isFavorite(pubkey);
-  return '<button class="fav-star ' + (cls || '') + (on ? ' on' : '') + '" data-fav="' + pubkey + '" title="' + (on ? 'Remove from favorites' : 'Add to favorites') + '">' + (on ? '★' : '☆') + '</button>';
+  return '<button class="fav-star ' + (cls || '') + (on ? ' on' : '') + '" data-fav="' + pubkey + '" aria-label="Toggle favorite" aria-pressed="' + (on ? 'true' : 'false') + '" title="' + (on ? 'Remove from favorites' : 'Add to favorites') + '">' + favStarIconHtml(on) + '</button>';
 }
 function bindFavStars(container, onToggle) {
   container.querySelectorAll('.fav-star').forEach(btn => {
@@ -431,8 +438,9 @@ function bindFavStars(container, onToggle) {
       e.stopPropagation();
       const pk = btn.dataset.fav;
       const nowOn = toggleFavorite(pk);
-      btn.textContent = nowOn ? '★' : '☆';
+      btn.innerHTML = favStarIconHtml(nowOn);
       btn.classList.toggle('on', nowOn);
+      btn.setAttribute('aria-pressed', nowOn ? 'true' : 'false');
       btn.title = nowOn ? 'Remove from favorites' : 'Add to favorites';
       if (onToggle) onToggle(pk, nowOn);
     });
@@ -729,11 +737,11 @@ function _showPullToast(msg, ok) {
 }
 
 function pullReconnect() {
-  // If WS is connected (readyState OPEN), give a brief "Connected ✓"
+  // If WS is connected (readyState OPEN), give a brief "Connected"
   // confirmation but still cycle so the user sees fresh data.
   const wasOpen = ws && ws.readyState === 1;
   if (wasOpen) {
-    _showPullToast('Connected ✓', true);
+    _showPullToast('Connected', true);
     // Fast cycle: close and let onclose reconnect immediately
     try { ws.close(); } catch (e) {}
   } else {
@@ -895,8 +903,8 @@ registerPage('tools-landing', {
       '<div class="tools-landing">' +
         '<h2>Tools</h2>' +
         '<div class="tools-menu">' +
-          '<a href="#/tools/path-inspector" class="tools-card"><h3>🔍 Path Inspector</h3><p>Resolve prefix paths to candidate full-pubkey routes with confidence scoring.</p></a>' +
-          '<a href="#/tools/trace/" class="tools-card"><h3>📡 Trace Viewer</h3><p>View detailed packet traces by hash.</p></a>' +
+          '<a href="#/tools/path-inspector" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Path Inspector</h3><p>Resolve prefix paths to candidate full-pubkey routes with confidence scoring.</p></a>' +
+          '<a href="#/tools/trace/" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Trace Viewer</h3><p>View detailed packet traces by hash.</p></a>' +
         '</div>' +
       '</div>';
   },
@@ -1003,6 +1011,14 @@ function navigate() {
     pages[currentPage].destroy();
   }
   currentPage = basePage;
+
+  // #1572 — defensive: ensure body.live-fullscreen is cleared whenever
+  // we navigate to a non-live route. Live page's destroy() also clears
+  // it, but this guards against any boot path (deep-link, restore) that
+  // somehow puts the body into fullscreen state outside /live.
+  if (basePage !== 'live' && document.body) {
+    document.body.classList.remove('live-fullscreen');
+  }
 
   const app = document.getElementById('app');
   // Pages with fixed-height containers (maps, virtual-scroll, split-panels)
@@ -1359,7 +1375,7 @@ window.addEventListener('DOMContentLoaded', () => {
       }
       // #1139 Bug B: floor the More menu at >=2 items. The greedy
       // fits() loop above is happy to stop after pushing exactly ONE
-      // link into overflow (commonly "🎵 Lab" at ~1600px viewports),
+      // link into overflow (commonly "🎵 Lab" at ~1600px viewports), // EMOJI-OK: comment referencing prior nav label
       // producing a degenerate single-item dropdown. If exactly one
       // link overflowed, promote one more from the queue so the user
       // sees a useful menu instead of a one-item fragment. Skip when
@@ -1477,7 +1493,7 @@ window.addEventListener('DOMContentLoaded', () => {
   async function renderFavDropdown() {
     const favs = getFavorites();
     if (!favs.length) {
-      favDropdown.innerHTML = '<div class="fav-dd-empty">No favorites yet.<br><small>Click ☆ on any node to add it.</small></div>';
+      favDropdown.innerHTML = '<div class="fav-dd-empty">No favorites yet.<br><small>Click the star on any node to add it.</small></div>';
       return;
     }
     favDropdown.innerHTML = '<div class="fav-dd-loading">Loading...</div>';
@@ -1485,16 +1501,17 @@ window.addEventListener('DOMContentLoaded', () => {
       try {
         const h = await api('/nodes/' + pk + '/health', { ttl: CLIENT_TTL.nodeHealth });
         const age = h.stats.lastHeard ? Date.now() - new Date(h.stats.lastHeard).getTime() : null;
-        const status = age === null ? '🔴' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? '🟢' : age < HEALTH_THRESHOLDS.nodeSilentMs ? '🟡' : '🔴';
+        const statusCls = age === null ? 'status-err' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? 'status-ok' : age < HEALTH_THRESHOLDS.nodeSilentMs ? 'status-warn' : 'status-err';
+        const statusLabel = age === null ? 'unknown' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? 'healthy' : age < HEALTH_THRESHOLDS.nodeSilentMs ? 'degraded' : 'silent';
         return '<a href="#/nodes/' + pk + '" class="fav-dd-item" data-key="' + pk + '">'
-          + '<span class="fav-dd-status">' + status + '</span>'
+          + '<span class="fav-dd-status ' + statusCls + '" title="' + statusLabel + '" aria-label="' + statusLabel + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>'
           + '<span class="fav-dd-name">' + (h.node.name || truncate(pk, 12)) + '</span>'
           + '<span class="fav-dd-meta">' + (h.stats.lastHeard ? timeAgo(h.stats.lastHeard) : 'never') + '</span>'
           + favStar(pk, 'fav-dd-star')
           + '</a>';
       } catch {
         return '<a href="#/nodes/' + pk + '" class="fav-dd-item" data-key="' + pk + '">'
-          + '<span class="fav-dd-status">❓</span>'
+          + '<span class="fav-dd-status status-muted" title="not found" aria-label="not found"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-question"/></svg></span>'
           + '<span class="fav-dd-name">' + truncate(pk, 16) + '</span>'
           + '<span class="fav-dd-meta">not found</span>'
           + favStar(pk, 'fav-dd-star')

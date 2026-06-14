@@ -43,6 +43,28 @@ type IngestorStatsSnapshot struct {
 	// the server's /api/perf/io endpoint under .ingestor (#1120 — "Both
 	// ingestor and server"). Optional; absent on non-Linux hosts.
 	ProcIO *PerfIOSample `json:"procIO,omitempty"`
+	// WriterPerf is the per-component SQLite writer-lock latency
+	// snapshot (#1340) — wait_ms / hold_ms / contention_total tagged
+	// by component (neighbor_builder, mqtt_handler, prune_packets,
+	// prune_observers, prune_metrics, vacuum). Surfaced by the server
+	// via /api/perf/write-sources under .writer_perf. Optional —
+	// older ingestor builds don't publish this field.
+	WriterPerf map[string]WriterStatsSnapshot `json:"writer_perf,omitempty"`
+	// SourceLiveness (PR #1609 M1) is the per-MQTT-source receipt vs
+	// write-path liveness snapshot. Keyed by source Tag. Surfaced by
+	// the server via /api/healthz under .ingest_liveness so operators
+	// can see "broker alive, write path stuck" (lastReceiptUnix recent,
+	// lastMessageUnix stale) distinct from "everything stalled" (both
+	// stale). Additive: omitempty so older server builds ignore it
+	// gracefully.
+	SourceLiveness map[string]SourceLivenessSnapshot `json:"source_liveness,omitempty"`
+}
+
+// SourceLivenessSnapshot is the per-source two-clock view exposed for
+// /api/healthz consumers. unixSeconds for both fields; 0 means "never".
+type SourceLivenessSnapshot struct {
+	LastReceiptUnix int64 `json:"lastReceiptUnix"`
+	LastMessageUnix int64 `json:"lastMessageUnix"`
 }
 
 // statsFilePath returns the writable path the ingestor will publish stats to.
@@ -61,6 +83,25 @@ func statsFilePath() string {
 
 // writeStatsAtomic writes b to path via a tmp-then-rename, refusing to follow
 // symlinks on the tmp file. Returns nil on success, an error otherwise.
+//
+// Symlink semantics (refs #1170):
+//
+//   - tmp side (path+".tmp"): protected by O_NOFOLLOW below. If tmp is a
+//     pre-planted symlink, openat fails with ELOOP instead of writing
+//     through it. This is the defensive-coding path that matters when the
+//     default stats path lives under world-writable /tmp.
+//
+//   - rename side (path): NOT protected by O_NOFOLLOW. Instead, os.Rename's
+//     semantics are relied upon — rename atomically replaces any existing
+//     entry at path (including a symlink) with the new regular file. The
+//     symlink's target is NEVER written through, because all writes happened
+//     to the unrelated tmp file before rename. Post-rename, path is a
+//     regular file (not a symlink) and any prior symlink target's contents
+//     are unchanged. The regression guardrail
+//     TestWriteStatsAtomic_SymlinkAtDestIsReplaced pins this behavior so a
+//     future refactor that swaps os.Rename for a destination-symlink-
+//     following primitive (e.g. an open(path, O_WRONLY) without O_NOFOLLOW)
+//     fails loudly.
 func writeStatsAtomic(path string, b []byte) error {
 	tmp := path + ".tmp"
 	// O_NOFOLLOW: if tmp is a pre-existing symlink, openat fails with ELOOP
@@ -204,6 +245,8 @@ func StartStatsFileWriter(s *Store, interval time.Duration) {
 				GroupCommitFlushes: 0, // group commit reverted (refs #1129)
 				BackfillUpdates:    s.Stats.SnapshotBackfills(),
 				ProcIO:             ioRate,
+				WriterPerf:         s.WriterStatsSnapshot(),
+				SourceLiveness:     SnapshotLivenessClocks(),
 			}
 			buf.Reset()
 			if err := enc.Encode(&snap); err != nil {

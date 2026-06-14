@@ -51,6 +51,25 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
+	// Apply Go runtime soft memory limit (GOMEMLIMIT). See #1010.
+	// Precedence: GOMEMLIMIT env > runtime.maxMemoryMB > unset (default).
+	{
+		_, envSet := os.LookupEnv("GOMEMLIMIT")
+		runtimeMaxMB := 0
+		if cfg.Runtime != nil {
+			runtimeMaxMB = cfg.Runtime.MaxMemoryMB
+		}
+		limit, source := applyMemoryLimit(runtimeMaxMB, envSet)
+		switch source {
+		case "env":
+			log.Printf("[memlimit] using GOMEMLIMIT from environment (%s)", os.Getenv("GOMEMLIMIT"))
+		case "config":
+			log.Printf("[memlimit] runtime.maxMemoryMB=%d → SetMemoryLimit(%d MiB)", runtimeMaxMB, limit/(1024*1024))
+		default:
+			log.Printf("[memlimit] unset → default (no soft memory limit; recommend setting GOMEMLIMIT or runtime.maxMemoryMB to ≥1.5× working set to avoid OOM-kill)")
+		}
+	}
+
 	sources := cfg.ResolvedSources()
 
 	store, err := OpenStoreWithInterval(cfg.DBPath, cfg.MetricsSampleInterval())
@@ -146,11 +165,12 @@ func main() {
 		// Capture source for closure
 		src := source
 		opts.SetDefaultPublishHandler(func(c mqtt.Client, m mqtt.Message) {
-			// Stamp liveness at RECEIPT (not at processing) so the stall
-			// watchdog reflects broker liveness even while the buffer is
-			// gated during startup (#1608). handleMessage also stamps it,
-			// which is a harmless cheap re-store once draining begins.
-			markLivenessForTag(tag, time.Now())
+			// PR #1609 M1: stamp the RECEIPT clock here (broker liveness)
+			// independently of the post-write clock that handleMessage
+			// stamps. Without separation the watchdog/healthz could
+			// report "fresh" while the writer was stalled and the
+			// buffer was filling.
+			markReceiptForTag(tag, time.Now())
 			ingestBuffer.Submit(func() {
 				handleMessage(store, tag, src, m, channelKeys, regionKeys, cfg)
 			})
@@ -752,8 +772,8 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					log.Printf("MQTT [%s] node telemetry update error: %v", tag, err)
 				}
 			}
-			// Update default_scope when advert carries a matched transport scope (#899)
-			if pktData.IsTransportScoped {
+			// Update default_scope when advert carries a matched transport scope (#899, #1534)
+			if shouldUpdateDefaultScope(pktData) {
 				if err := store.UpdateNodeDefaultScope(decoded.Payload.PubKey, pktData.ScopeName); err != nil {
 					log.Printf("MQTT [%s] node default_scope update error: %v", tag, err)
 				}
@@ -1112,6 +1132,37 @@ func extractObserverMeta(msg map[string]interface{}) *ObserverMeta {
 		}
 	}
 
+	// Issue #1290: firmware 1.16 publishes a `repeat` flag at the top
+	// level of the /status JSON (MQTTMessageBuilder.cpp:58 — see
+	// agessaman/MeshCore mqtt-bridge-implementation-flex). Accept
+	// either a boolean or a case-insensitive `on|off|true|false|1|0`
+	// string. Missing field → leave CanRelay nil; the writer preserves
+	// the prior column value (default 1, back-compat).
+	if v, ok := msg["repeat"]; ok && v != nil {
+		switch t := v.(type) {
+		case bool:
+			b := t
+			meta.CanRelay = &b
+			hasData = true
+		case string:
+			s := strings.ToLower(strings.TrimSpace(t))
+			switch s {
+			case "on", "true", "1", "yes":
+				b := true
+				meta.CanRelay = &b
+				hasData = true
+			case "off", "false", "0", "no":
+				b := false
+				meta.CanRelay = &b
+				hasData = true
+			}
+		case float64:
+			b := t != 0
+			meta.CanRelay = &b
+			hasData = true
+		}
+	}
+
 	if !hasData {
 		return nil
 	}
@@ -1392,4 +1443,12 @@ func init() {
 		fmt.Println("corescope-ingestor", version)
 		os.Exit(0)
 	}
+}
+
+// shouldUpdateDefaultScope returns true when the packet carries a transport
+// scope whose region key matched (#1534). Without the ScopeName non-empty
+// guard, transport-scoped adverts from non-matching regions would overwrite
+// previously-correct default_scope values with the empty string.
+func shouldUpdateDefaultScope(pktData *PacketData) bool {
+	return pktData.IsTransportScoped && pktData.ScopeName != ""
 }

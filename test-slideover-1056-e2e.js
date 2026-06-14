@@ -39,7 +39,7 @@ step.skip = function (name, reason, fn) {
 function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
 
 const PAGES = [
-  { hash: '#/packets',   tableSel: '#pktTable',    rowSel: '#pktTable tbody tr[data-id], #pktTable tbody tr',   name: 'packets'   },
+  { hash: '#/packets',   tableSel: '#pktTable',    rowSel: '#pktTable tbody tr[data-hash]',                     name: 'packets'   },
   { hash: '#/nodes',     tableSel: '#nodesTable',  rowSel: '#nodesTable tbody tr[data-value]',                  name: 'nodes'     },
   { hash: '#/observers', tableSel: '#obsTable',    rowSel: '#obsTable tbody tr[data-action="navigate"]',        name: 'observers' },
 ];
@@ -65,11 +65,12 @@ const PAGES = [
     await step(`${tag}: page renders + first row exists`, async () => {
       await page.goto(BASE + '/' + p.hash, { waitUntil: 'domcontentloaded' });
       await page.waitForSelector(p.tableSel, { timeout: 8000 });
-      // wait for at least one tbody row
-      await page.waitForFunction((sel) => {
-        const t = document.querySelector(sel);
-        return t && t.querySelectorAll('tbody tr').length > 0;
-      }, p.tableSel, { timeout: 8000 });
+      // Wait for at least one real data row (per the page-specific rowSel).
+      // Using p.rowSel here — not a bare `tbody tr` — avoids the
+      // virtual-scroll spacer race on the packets page (#1662).
+      await page.waitForFunction((rowSel) => {
+        return document.querySelector(rowSel) !== null;
+      }, p.rowSel, { timeout: 8000 });
     });
 
     await step(`${tag}: clicking row opens slide-over with backdrop`, async () => {
@@ -428,16 +429,42 @@ const PAGES = [
       assert(r.isActive, 'focus did NOT restore to originating row after Escape: ' + JSON.stringify(r));
     });
 
+    await step('focus-restore@800: re-renders while open still restore to new row instance', async () => {
+      const rowKey = await openPanelFromRow();
+      
+      // Force a re-render of the table so the original DOM node is detached
+      await page.evaluate(() => {
+        if (typeof window.renderRows === 'function') {
+           window.renderRows();
+        }
+      });
+
+      await page.keyboard.press('Escape');
+      // Wait for renderRows() + post-rAF focus restore to settle.
+      await page.waitForFunction((key) => {
+        const esc = (window.CSS && CSS.escape) ? CSS.escape(key) : key;
+        const row = document.querySelector('#nodesTable tbody tr[data-value="' + esc + '"]');
+        return !!row && document.activeElement === row;
+      }, rowKey, { timeout: 2000 }).catch(() => {});
+
+      const r = await page.evaluate((key) => {
+        const esc = (window.CSS && CSS.escape) ? CSS.escape(key) : key;
+        const row = document.querySelector('#nodesTable tbody tr[data-value="' + esc + '"]');
+        return {
+          rowExists: !!row,
+          isActive: !!row && document.activeElement === row,
+        };
+      }, rowKey);
+      assert(r.rowExists, 'originating row vanished from DOM after manual re-render');
+      assert(r.isActive, 'focus did NOT restore to NEW row instance after Escape: ' + JSON.stringify(r));
+    });
+
     // ------------------------------------------------------------------
-    // SKIP: tracked in #1172 — flaky in CI Chromium, see issue for repro.
-    // X-click focus-restore is real and works locally; head-to-head with
-    // headless CI flake. Soft-warn pattern was removed (#1168 Munger #4):
-    // skipped tests are VISIBLE in CI output (↷ SKIP), not silently
-    // swallowed by `if (!cond) console.warn(...)`. Hard assertions
-    // preserved below — flip step.skip → step once #1172 ships a fix.
+    // #1616: hard-asserted (architectural fix in SlideOver.close — detach
+    // panel on close, MutationObserver fallback for late-attaching rows).
+    // Supersedes the #1172 soften-and-track approach.
     // ------------------------------------------------------------------
-    step.skip('focus-restore@800: X-button click returns focus to originating row',
-      'tracked in #1172 — flaky in CI Chromium', async () => {
+    await step('focus-restore@800: X-button click returns focus to originating row', async () => {
       const rowKey = await openPanelFromRow();
       await page.evaluate(() => {
         const x = document.querySelector('.slide-over-panel .slide-over-close');
@@ -454,6 +481,82 @@ const PAGES = [
       }, rowKey);
       assert(r.rowExists, 'originating row vanished from DOM');
       assert(r.isActive, 'focus did NOT restore to originating row after X click: ' + JSON.stringify(r));
+    });
+
+    // ------------------------------------------------------------------
+    // #1616 followup: SYNTHETIC deterministic repro for the Escape-path
+    // focus-restore race. The natural test above flakes ~50% of the time
+    // in Chromium-headless because the nodes module's onClose calls
+    // `renderRows()` synchronously and the originating <tr> instance is
+    // replaced — but the exact micro-timing between focus(), the panel
+    // detach, and the synchronous innerHTML swap is racy: under some
+    // schedules Chromium drops activeElement to <body> before the
+    // replacement <tr> is laid out.
+    //
+    // This test forces the race deterministically by driving SlideOver
+    // directly with an onClose that defers the row swap to a microtask
+    // (Promise.resolve().then(...)). Resolver runs synchronously at
+    // close-time and returns the OLD (still-attached) tr — but by the
+    // time the microtask fires, the OLD tr is detached and Chromium
+    // re-derives activeElement = <body>. The MutationObserver fallback
+    // SHOULD pick up the new row attachment and re-land focus.
+    // ------------------------------------------------------------------
+    await step('focus-restore@800: Escape with async-cb re-render (synthetic)', async () => {
+      // Build an isolated test surface: a tbody with a single row and a
+      // resolver/closer pair driven through SlideOver.open() directly.
+      // We rebuild the row from scratch in a microtask after close() to
+      // exactly mirror the production async-render race.
+      await page.evaluate(() => {
+        // Clean any prior fixture so re-runs are deterministic.
+        const old = document.getElementById('synth-1616');
+        if (old) old.remove();
+        const wrap = document.createElement('div');
+        wrap.id = 'synth-1616';
+        wrap.innerHTML = '<table><tbody id="synth-tbody">'
+          + '<tr data-value="row-A" tabindex="0"><td>A</td></tr>'
+          + '</tbody></table>';
+        document.body.appendChild(wrap);
+      });
+      // Focus the row, open SlideOver with a microtask-delayed onClose.
+      await page.evaluate(() => {
+        const tbody = document.getElementById('synth-tbody');
+        const row = tbody.querySelector('tr[data-value="row-A"]');
+        row.focus();
+        window.SlideOver.open({
+          title: 'Synthetic',
+          restoreFocus: function () {
+            return document.querySelector('#synth-tbody tr[data-value="row-A"]');
+          },
+          onClose: function () {
+            // Defer the row swap to a microtask so it lands AFTER
+            // close()'s synchronous focus + detach. This is the precise
+            // race: resolver() returned the OLD tr (still attached at
+            // close() time); the microtask then replaces it.
+            Promise.resolve().then(function () {
+              tbody.innerHTML = '<tr data-value="row-A" tabindex="0"><td>A-new</td></tr>';
+            });
+          }
+        });
+      });
+      // Slide-over is open. Press Escape.
+      await page.keyboard.press('Escape');
+      // Wait for the new row to mount AND focus to land on it.
+      await page.waitForFunction(() => {
+        const row = document.querySelector('#synth-tbody tr[data-value="row-A"]');
+        return !!row && document.activeElement === row;
+      }, null, { timeout: 1500 }).catch(() => {});
+      const r = await page.evaluate(() => {
+        const row = document.querySelector('#synth-tbody tr[data-value="row-A"]');
+        return {
+          rowExists: !!row,
+          isActive: !!row && document.activeElement === row,
+          rowText: row && row.textContent,
+          activeTag: document.activeElement && document.activeElement.tagName,
+        };
+      });
+      assert(r.rowExists, 'synthetic row vanished after async cb');
+      assert(r.rowText === 'A-new', 'synthetic row was not re-rendered by microtask (got: ' + r.rowText + ')');
+      assert(r.isActive, 'focus did NOT restore to NEW synthetic row after async cb: ' + JSON.stringify(r));
     });
 
     await ctx.close();
@@ -578,42 +681,17 @@ const PAGES = [
       assert(after.backdropGone, 'backdrop still shown after viewport crossed BP');
       assert(!after.bodyHasLockClass, 'scroll-locked class still present after viewport crossed BP');
       assert(after.bodyOverflow !== 'hidden', 'body scroll-lock not released after viewport crossed BP (overflow=' + after.bodyOverflow + ')');
-      // Focus-restore portion of this scenario is exercised in the
-      // skipped step below (tracked in #1172). Soft-warn pattern removed
-      // per #1168 Munger #4 — skipped is visible, soft-warn was not.
+      // #1616: focus-restore portion is now hard-asserted (architectural
+      // fix in SlideOver.close — panel detach + MutationObserver fallback).
+      assert(after.rowExists, 'originating row vanished after viewport-crossing close');
+      assert(after.focusRestored, 'focus did NOT restore to originating row after viewport-crossing close: ' + JSON.stringify(after));
     });
 
-    // ------------------------------------------------------------------
-    // SKIP: tracked in #1172 — flaky in CI Chromium, see issue for repro.
-    // Same root cause as the X-click case above. Cleanup checks
-    // (panel/backdrop/scroll-lock) are HARD in the step above; only the
-    // focus identity check is skipped. Restore by flipping step.skip →
-    // step once #1172 ships a fix.
-    // ------------------------------------------------------------------
-    step.skip('resize@800→1440 nodes: focus restored after viewport-crossing close',
-      'tracked in #1172 — flaky in CI Chromium', async () => {
-      const rowKey = await page.evaluate(() => {
-        const r = document.querySelector('#nodesTable tbody tr[data-value]');
-        if (!r) return null;
-        r.focus();
-        r.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        return r.getAttribute('data-value');
-      });
-      assert(rowKey, 'no nodes row for resize focus test');
-      await page.waitForFunction(() => {
-        const p = document.querySelector('.slide-over-panel');
-        return p && !p.hidden;
-      }, null, { timeout: 8000 });
-      await page.setViewportSize({ width: 1440, height: 900 });
-      await page.waitForTimeout(500);
-      const after = await page.evaluate((key) => {
-        const esc = (window.CSS && CSS.escape) ? CSS.escape(key) : key;
-        const row = document.querySelector('#nodesTable tbody tr[data-value="' + esc + '"]');
-        return { rowExists: !!row, focusRestored: !!row && document.activeElement === row };
-      }, rowKey);
-      assert(after.rowExists, 'originating row vanished');
-      assert(after.focusRestored, 'focus not restored after viewport-crossing close');
-    });
+    // #1616: the formerly-skipped duplicate focus-only test has been merged
+    // into the cleanup assertion above (single open/resize cycle). The
+    // separate test was unreachable anyway — by the time it ran the viewport
+    // was already 1440, so SlideOver.shouldUse() returned false and the
+    // panel never opened.
 
     await ctx.close();
   }

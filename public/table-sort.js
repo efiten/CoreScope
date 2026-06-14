@@ -114,7 +114,12 @@ window.TableSort = (function() {
             state.direction = state.direction === 'asc' ? 'desc' : 'asc';
           } else {
             state.column = key;
-            state.direction = options.defaultDirection || 'asc';
+            // #1639/#1641: switching to a new column picks a sensible default
+            // direction per type — text columns default to ascending (A→Z),
+            // numeric/date/dbm default to descending (largest/newest first).
+            // options.defaultDirection only seeds the INITIAL load.
+            var thType = th.getAttribute('data-type');
+            state.direction = (!thType || thType === 'text') ? 'asc' : 'desc';
           }
           doSort();
         };
@@ -152,7 +157,8 @@ window.TableSort = (function() {
           th.setAttribute('aria-sort', state.direction === 'asc' ? 'ascending' : 'descending');
           var span = document.createElement('span');
           span.className = 'sort-arrow';
-          span.textContent = state.direction === 'asc' ? ' ▲' : ' ▼';
+          // #1648 M2 — Phosphor caret-up/caret-down via sprite (no emoji).
+          span.innerHTML = ' <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-' + (state.direction === 'asc' ? 'up' : 'down') + '"/></svg>';
           th.appendChild(span);
         } else {
           th.classList.remove('sort-active');

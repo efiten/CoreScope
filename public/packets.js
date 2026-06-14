@@ -257,12 +257,34 @@
   // (multiple SlideOver opens reuse the same token; only paired with a
   // matching release on close).
   let scrollLockToken = null;
+  // #1616: open state is now tracked by a flag instead of panel.hidden.
+  // The architectural close path DETACHES panel + backdrop from the DOM
+  // (removeChild) — there is no "focused-but-hidden" intermediate state
+  // for Chromium-headless to race against. See close() below.
+  let panelOpen = false;
+  // #1616: list of pending one-shot MutationObservers (per-close-invocation)
+  // waiting for a row to re-attach so we can land focus on the new instance.
+  // Tracked so a follow-up close()/open() can disconnect any stragglers.
+  let pendingFocusObservers = [];
+
+  function disconnectFocusObservers() {
+    for (var i = 0; i < pendingFocusObservers.length; i++) {
+      try { pendingFocusObservers[i].disconnect(); } catch (_) {}
+    }
+    pendingFocusObservers = [];
+  }
 
   function ensureNodes() {
     if (panel && backdrop) return;
     backdrop = document.createElement('div');
     backdrop.className = 'slide-over-backdrop';
+    // #1616: state is data-state="open|closed"; closed nodes are DETACHED
+    // from the DOM in close() so panel.hidden never has to be true while
+    // anything inside (or the panel itself) holds focus. We keep
+    // backdrop.hidden as a defensive fallback for the brief window after
+    // ensureNodes() runs before the first open() attaches them.
     backdrop.hidden = true;
+    backdrop.setAttribute('data-state', 'closed');
     // Backdrop is decorative — assistive tech should not announce it.
     backdrop.setAttribute('aria-hidden', 'true');
     backdrop.addEventListener('click', function () { close(); });
@@ -277,11 +299,12 @@
     // is the actual title rendered into the panel.
     panel.setAttribute('aria-labelledby', 'slideOverTitle');
     panel.hidden = true;
+    panel.setAttribute('data-state', 'closed');
     panel.tabIndex = -1;
     panel.innerHTML =
       '<div class="slide-over-header">' +
         '<h3 class="slide-over-title" id="slideOverTitle"></h3>' +
-        '<button type="button" class="slide-over-close" aria-label="Close detail (Esc)" title="Close">✕</button>' +
+        '<button type="button" class="slide-over-close" aria-label="Close detail (Esc)" title="Close"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>' +
       '</div>' +
       '<div class="slide-over-content"></div>';
     panel.querySelector('.slide-over-close').addEventListener('mousedown', function (e) {
@@ -315,8 +338,10 @@
         try { first.focus(); } catch {}
       }
     });
-    document.body.appendChild(backdrop);
-    document.body.appendChild(panel);
+    // #1616: do NOT attach panel + backdrop to <body> on ensureNodes().
+    // They are appended in open() and removed in close() so the closed
+    // state is "not in the DOM" — Chromium-headless cannot land focus on
+    // something that isn't there.
 
     // Single Escape handler shared across all uses.
     document.addEventListener('keydown', function (e) {
@@ -352,7 +377,10 @@
   }
 
   function isOpen() {
-    return !!(panel && !panel.hidden);
+    // #1616: open state is the panelOpen flag, NOT (!panel.hidden).
+    // When closed the panel is DETACHED from <body>, so a `.hidden`
+    // check on a node nothing roots to <body> is meaningless.
+    return panelOpen;
   }
 
   function open(opts) {
@@ -365,6 +393,10 @@
     // prior close() can detect that a newer open has happened and skip
     // its stale focus-restore.
     openSeq++;
+    // #1616: a fresh open() invalidates any pending focus-observers
+    // from a recent close() — disconnect them so they can't land a
+    // stale focus on row A after row B has opened.
+    disconnectFocusObservers();
     closeCb = typeof opts.onClose === 'function' ? opts.onClose : null;
     // If the caller passes restoreFocus(), it owns lookup at close-time —
     // useful when the caller re-renders the row table (which would detach
@@ -382,8 +414,16 @@
     title.textContent = opts.title || 'Detail';
     content = panel.querySelector('.slide-over-content');
     content.innerHTML = '';
+    // #1616: ATTACH panel + backdrop now. They were removed (or never
+    // appended) by the prior close(). Order matters — backdrop first so
+    // it sits beneath the panel in source/paint order.
+    if (backdrop.parentNode !== document.body) document.body.appendChild(backdrop);
+    if (panel.parentNode !== document.body) document.body.appendChild(panel);
     backdrop.hidden = false;
     panel.hidden = false;
+    backdrop.setAttribute('data-state', 'open');
+    panel.setAttribute('data-state', 'open');
+    panelOpen = true;
     // Focus the close button so Esc/Enter works without an extra tab.
     const x = panel.querySelector('.slide-over-close');
     if (x) try { x.focus(); } catch {}
@@ -391,9 +431,7 @@
   }
 
   function close() {
-    if (!panel || panel.hidden) return;
-    panel.hidden = true;
-    if (backdrop) backdrop.hidden = true;
+    if (!panel || !panelOpen) return;
     // #1168 Munger #3: release the ref-counted scroll-lock token.
     if (scrollLockToken != null) {
       window.__scrollLock.release(scrollLockToken);
@@ -401,42 +439,140 @@
     }
     const cb = closeCb;
     closeCb = null;
-    if (content) content.innerHTML = '';
-    // Restore focus to whatever opened us (typically the table row), so
-    // keyboard users don't get dumped at the top of the document.
-    let toFocus = prevFocus;
     const resolver = prevFocusResolver;
+    let toFocus = prevFocus;
     prevFocus = null;
     prevFocusResolver = null;
-    // #1168 Munger #1: capture the open-sequence at close-time. If a NEW
-    // open() happens before our deferred rAF fires, openSeq will have
-    // advanced past this value and the stale rAF must no-op (otherwise
-    // it would steal focus back to row A's originating row AFTER row B
-    // is open — clobbering B's focus).
     const seqAtClose = openSeq;
+
+    // Fire the user's onClose BEFORE we touch focus. Callers typically
+    // re-render the originating table inside cb() (e.g. clearing the
+    // selected row state), which detaches the originating <tr>; we
+    // intentionally re-look-up via the resolver below.
     if (cb) try { cb(); } catch {}
-    // Resolver runs AFTER cb (cb may re-render the table and reattach the row).
+
+    // Resolve the focus target by DATA-VALUE LOOKUP AT RESTORE TIME.
+    // #1616: no captured-element-ref path — if cb() re-rendered the
+    // tbody, the captured prevFocus is now an orphaned node detached
+    // from the document, and Chromium-headless will silently swallow
+    // a .focus() call on it (activeElement falls back to <body>).
     if (resolver) {
       try {
         const resolved = resolver();
         if (resolved) toFocus = resolved;
-      } catch {}
+      } catch (_) {}
     }
+
+    // #1616 (architectural): SYNCHRONOUSLY focus the target row BEFORE
+    // the panel/backdrop are detached. This eliminates the
+    // focused-but-hidden intermediate state Chromium-headless reasons
+    // about non-deterministically. If activeElement is inside the panel
+    // when the panel detaches, focus drops to <body>; landing focus on
+    // the row first means the detach is a no-op for the active element.
+    // The deferred microtask + rAF + observer chain below handles the
+    // case where cb() queued an async re-render that detaches this row.
     if (toFocus && typeof toFocus.focus === 'function' && document.body.contains(toFocus)) {
-      // Defer to next microtask + rAF so the focus call lands AFTER any
-      // event-handler bookkeeping (e.g. an Escape keydown chain that would
-      // otherwise see focus snap back to <body> as the key event unwinds).
-      const target = toFocus;
-      const tryFocus = function () {
-        // Munger #1: bail if a newer open() has happened since close-time.
-        if (openSeq !== seqAtClose) return;
-        if (document.body.contains(target)) {
-          try { target.focus(); } catch {}
-        }
-      };
-      tryFocus();
-      requestAnimationFrame(tryFocus);
+      try { toFocus.focus({ preventScroll: true }); } catch (_) {}
     }
+
+    // DETACH panel + backdrop. After this point, there is no "panel
+    // node sitting hidden in the document tree" for Chromium to race
+    // a stale blur against.
+    panelOpen = false;
+    panel.setAttribute('data-state', 'closed');
+    backdrop.setAttribute('data-state', 'closed');
+    if (content) content.innerHTML = '';
+    panel.hidden = true;
+    backdrop.hidden = true;
+    if (panel.parentNode) panel.parentNode.removeChild(panel);
+    if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+
+    // If sync focus landed: schedule a microtask re-check. The
+    // caller's cb() may have queued an ASYNC re-render (microtask
+    // or rAF) that detaches the row AFTER our sync focus() — in that
+    // case activeElement falls to <body> AFTER this function returns,
+    // and we need a second-pass focus restore. queueMicrotask() runs
+    // AFTER any Promise.resolve().then(...) the caller queued from
+    // inside cb() (FIFO microtask queue), so re-resolving here picks
+    // up the NEW row instance.
+    if (!resolver) {
+      // No resolver = no second-pass capability; best-effort done.
+      return;
+    }
+
+    // Always run the deferred re-check pass, even if sync focus
+    // appeared to land — it may be on a soon-to-be-detached orphan.
+    function deferredRecheck() {
+      // Stale guard — newer open() bumped openSeq; bail.
+      if (openSeq !== seqAtClose) return;
+      // If focus already landed on something non-body that matches
+      // the resolver, we're done.
+      let fresh = null;
+      try { fresh = resolver(); } catch (_) {}
+      if (fresh && document.body.contains(fresh)) {
+        if (document.activeElement === fresh) return;
+        try { fresh.focus({ preventScroll: true }); } catch (_) {}
+        if (document.activeElement === fresh) return;
+      }
+      // Still not landed. Attach a one-shot MutationObserver rooted
+      // at document.body — broader than the prior tbody-rooted
+      // observer (which fails when the tbody itself is innerHTML-
+      // swapped), still bounded by a short timeout below.
+      attachBodyObserver();
+    }
+
+    function attachBodyObserver() {
+      const obs = new MutationObserver(function () {
+        if (openSeq !== seqAtClose) {
+          obs.disconnect();
+          const idx = pendingFocusObservers.indexOf(obs);
+          if (idx >= 0) pendingFocusObservers.splice(idx, 1);
+          return;
+        }
+        let target = null;
+        try { target = resolver(); } catch (_) {}
+        if (!target || !document.body.contains(target)) return;
+        try { target.focus({ preventScroll: true }); } catch (_) {}
+        if (document.activeElement === target) {
+          obs.disconnect();
+          const idx = pendingFocusObservers.indexOf(obs);
+          if (idx >= 0) pendingFocusObservers.splice(idx, 1);
+        }
+      });
+      // #1616 followup: root = document.body. The prior 'smart' tbody
+      // root logic broke when cb() replaced the entire tbody via
+      // innerHTML — the observer was watching a node that no longer
+      // received the mutation we cared about. document.body is broader
+      // but correctly catches the re-attachment in all known callsites
+      // (nodes/packets/observers all swap rows under tbody under body).
+      obs.observe(document.body, { childList: true, subtree: true });
+      pendingFocusObservers.push(obs);
+      // Tight timeout — 200ms is enough for any sync or microtask/rAF
+      // re-render to commit. Longer (e.g. the prior 2s) creates new
+      // races where the observer fires AFTER a subsequent open() and
+      // steals focus from row B back to row A.
+      setTimeout(function () {
+        obs.disconnect();
+        const idx = pendingFocusObservers.indexOf(obs);
+        if (idx >= 0) pendingFocusObservers.splice(idx, 1);
+      }, 200);
+    }
+
+    // Step 1: microtask — runs AFTER cb's Promise.resolve().then(...)
+    // re-renders, BEFORE next animation frame. Catches the common
+    // async-render path.
+    queueMicrotask(function () {
+      if (openSeq !== seqAtClose) return;
+      let fresh = null;
+      try { fresh = resolver(); } catch (_) {}
+      if (fresh && document.body.contains(fresh)
+          && document.activeElement !== fresh) {
+        try { fresh.focus({ preventScroll: true }); } catch (_) {}
+      }
+      // Step 2: rAF — runs after layout commits. Catches re-renders
+      // that wait on rAF or that resolve only after style/layout work.
+      requestAnimationFrame(deferredRecheck);
+    });
   }
 
   // If the viewport grows past the breakpoint while open, close the slide-over
@@ -626,7 +762,7 @@
     });
   }
   const PANEL_WIDTH_KEY = 'meshcore-panel-width';
-  const PANEL_CLOSE_HTML = '<button class="panel-close-btn" title="Close detail pane (Esc)">✕</button>';
+  const PANEL_CLOSE_HTML = '<button class="panel-close-btn" title="Close detail pane (Esc)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>';
 
   // getParsedPath / getParsedDecoded are in shared packet-helpers.js (loaded before this file)
   const getParsedPath = window.getParsedPath;
@@ -862,7 +998,7 @@
     }
     const f = formatTimestampWithTooltip(isoString, getTimestampMode());
     const warn = f.isFuture
-      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed">⚠️</span>'
+      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
       : '';
     return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
   }
@@ -971,7 +1107,9 @@
         packetsPaused = !packetsPaused;
         const pauseBtn = document.getElementById('pktPauseBtn');
         if (pauseBtn) {
-          pauseBtn.textContent = packetsPaused ? '▶' : '⏸';
+          // #1648 M4: Phosphor sprite glyph for play/pause (was ▶/⏸). // EMOJI-OK: comment
+          pauseBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#' +
+            (packetsPaused ? 'ph-play' : 'ph-pause') + '"/></svg>';
           pauseBtn.title = packetsPaused ? 'Resume live updates' : 'Pause live updates';
           pauseBtn.classList.toggle('active', packetsPaused);
         }
@@ -1019,7 +1157,7 @@
         pauseBuffer.push(...msgs);
         if (pauseBuffer.length > 2000) pauseBuffer = pauseBuffer.slice(-2000);
         const btn = document.getElementById('pktPauseBtn');
-        if (btn) btn.textContent = '▶ ' + pauseBuffer.length;
+        if (btn) btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-play"/></svg> ' + pauseBuffer.length;
         return;
       }
       const newPkts = msgs
@@ -1330,9 +1468,9 @@
       <div class="page-header">
         <h2>Latest Packets <span class="count">(${totalCount})</span></h2>
         <div>
-          <button class="btn-icon" data-action="pkt-refresh" title="Refresh">🔄</button>
-          <button class="btn-icon" id="pktPauseBtn" data-action="pkt-pause" title="Pause live updates">⏸</button>
-          <button class="btn-icon" data-action="pkt-byop" title="Bring Your Own Packet" aria-label="Bring Your Own Packet - paste raw packet hex for analysis" aria-haspopup="dialog">📦 BYOP</button>
+          <button class="btn-icon" data-action="pkt-refresh" title="Refresh" aria-label="Refresh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-arrow-clockwise"/></svg></button>
+          <button class="btn-icon" id="pktPauseBtn" data-action="pkt-pause" title="Pause live updates" aria-label="Pause live updates"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-pause"/></svg></button>
+          <button class="btn-icon" data-action="pkt-byop" title="Bring Your Own Packet" aria-label="Bring Your Own Packet - paste raw packet hex for analysis" aria-haspopup="dialog"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg> BYOP</button>
         </div>
       </div>
       <div class="filter-group pkt-filter-expr" style="flex:1;margin-bottom:8px;position:relative">
@@ -1347,7 +1485,7 @@
         <button class="btn filter-toggle-btn" id="filterToggleBtn">Filters ▾</button>
         <!-- #1124 (MAJOR-3) Group 1: Filter input + Clear -->
         <div class="filter-group filter-group-clear">
-          <button class="btn btn-clear-filters" id="clearFiltersBtn" title="Clear all filters" style="display:none;font-size:12px;padding:2px 8px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer">✕ Clear</button>
+          <button class="btn btn-clear-filters" id="clearFiltersBtn" title="Clear all filters" style="display:none;font-size:12px;padding:2px 8px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg> Clear</button>
         </div>
         <!-- Group 2: Quick filters (hash, node name) -->
         <div class="filter-group filter-group-quick">
@@ -1357,13 +1495,13 @@
             <div class="node-filter-dropdown hidden" id="fNodeDropdown" role="listbox"></div>
           </div>
         </div>
-        <!-- Group 3: Quick toggles (time range, Group by Hash, ★ My Nodes)
+        <!-- Group 3: Quick toggles (time range, Group by Hash, My Nodes)
              — #1128 Bug 5: placed BEFORE the Observer/Region/Type/Channel
              dropdowns so the most-frequently-used controls sit next to
              the search input where the eye lands first. -->
         <div class="filter-group filter-group-toggles">
           <button class="btn ${groupByHash ? 'active' : ''}" id="fGroup" title="Collapse duplicate observations of the same packet into expandable groups">Group by Hash</button>
-          <button class="btn" id="fMyNodes" title="Show only packets from your favorited/claimed nodes">★ My Nodes</button>
+          <button class="btn" id="fMyNodes" title="Show only packets from your favorited/claimed nodes"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg> My Nodes</button>
           <select id="fTimeWindow" class="filter-select" aria-label="Time window filter">
             <option value="15">Last 15 min</option>
             <option value="30">Last 30 min</option>
@@ -1408,6 +1546,7 @@
           <button class="btn btn-icon${showHexHashes ? ' active' : ''}" id="hexHashToggle" title="Show raw hex hash prefixes instead of resolved node names in the path column">Hex Paths</button>
         </div>
       </div>
+      <div class="path-symbols-legend-wrapper">${(window.HopDisplay && HopDisplay.renderPathSymbolsLegend) ? HopDisplay.renderPathSymbolsLegend() : ''}</div>
       <div class="table-fluid-wrap"><table class="data-table" id="pktTable">
         <thead><tr>
           <th scope="col" class="col-expand" data-priority="1"></th><th scope="col" class="col-region" data-sort-key="region" data-priority="3">Region</th><th scope="col" class="col-time" data-sort-key="time" data-type="date" data-priority="1">Time</th><th scope="col" class="col-hash" data-sort-key="hash" data-priority="3">Hash</th><th scope="col" class="col-size" data-sort-key="size" data-type="numeric" data-priority="4">Size</th>
@@ -2029,7 +2168,7 @@
     const _grpHashStripe = _hashStripeStyle(p.hash);
     const _grpStyle = _grpHashStripe + _grpChanStyle;
     let html = `<tr class="${isSingle ? '' : 'group-header'} ${isExpanded ? 'expanded' : ''}" data-hash="${p.hash}" data-action="${isSingle ? 'select-hash' : 'toggle-select'}" data-value="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row"${_grpStyle ? ' style="' + _grpStyle + '"' : ''}>
-          <td class="col-expand" style="text-align:center;cursor:pointer">${isSingle ? '' : (isExpanded ? '▼' : '▶')}</td>
+          <td class="col-expand" style="text-align:center;cursor:pointer">${isSingle ? '' : (isExpanded ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg>')}</td>
           <td class="col-region">${groupRegion ? `<span class="badge-region">${groupRegion}</span>` : '—'}</td>
           <td class="col-time">${renderTimestampCell(p.latest)}</td>
           <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || '—', 8)}</td>
@@ -2038,7 +2177,7 @@
           <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(groupTypeName || '')}">${p.payload_type != null ? `<span class="badge badge-${groupTypeClass}">${groupTypeName}</span>${transportBadge(p.route_type)}` : '—'}</td>
           <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(headerObserverId) || '')}">${isSingle ? escapeHtml(truncate(obsNameOnly(headerObserverId), 16)) + obsIataBadge(p) : escapeHtml(truncate(obsNameOnly(headerObserverId), 10)) + groupedObserverIataBadgesHtml(p)}</td>
           <td class="col-path"><span class="path-hops">${groupPathStr}</span></td>
-          <td class="col-rpt">${p.observation_count > 1 ? '<span class="badge badge-obs" title="Seen ' + p.observation_count + ' times">👁 ' + p.observation_count + '</span>' : (isSingle ? '' : p.count)}</td>
+          <td class="col-rpt">${p.observation_count > 1 ? '<span class="badge badge-obs" title="Seen ' + p.observation_count + ' times"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + p.observation_count + '</span>' : (isSingle ? '' : p.count)}</td>
           <td class="col-details">${getDetailPreview(getParsedDecoded(p))}</td>
         </tr>`;
     if (isExpanded && p._children) {
@@ -2603,31 +2742,31 @@
     if (decoded.type === 'CHAN' && decoded.text) {
       const ch = decoded.channel ? `<span class="chan-tag">${escapeHtml(decoded.channel)}</span> ` : '';
       const t = decoded.text.length > 80 ? decoded.text.slice(0, 80) + '…' : decoded.text;
-      return `${ch}💬 ${escapeHtml(t)}`;
+      return `${ch}<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chat-circle"/></svg> ${escapeHtml(t)}`;
     }
     // Advertisements — show node name and role
     if (decoded.type === 'ADVERT' && decoded.name) {
-      const role = decoded.flags?.repeater ? '📡' : decoded.flags?.room ? '🏠' : decoded.flags?.sensor ? '🌡' : '📻';
+      const role = decoded.flags?.repeater ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg>' : decoded.flags?.room ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-house-line"/></svg>' : decoded.flags?.sensor ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-thermometer"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-radio"/></svg>';
       return `${role} <a href="#/nodes/${encodeURIComponent(decoded.pubKey)}" class="hop-link hop-named" data-hop-link="true" ${locodeAttr(decoded.name)}>${escapeHtml(decoded.name)}</a>`;
     }
     // Undecrypted channel messages — show channel hash and decryption status
     if (decoded.type === 'GRP_TXT' && decoded.channelHash != null) {
       const hashHex = decoded.channelHashHex || decoded.channelHash.toString(16).padStart(2, '0').toUpperCase();
       const statusLabel = decoded.decryptionStatus === 'no_key' ? 'no key' : 'decryption failed';
-      return `🔒 Ch 0x${hashHex} <span class="muted">(${statusLabel})</span>`;
+      return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> Ch 0x${hashHex} <span class="muted">(${statusLabel})</span>`;
     }
     // Direct messages
-    if (decoded.type === 'TXT_MSG') return `✉️ ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'TXT_MSG') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Path updates
-    if (decoded.type === 'PATH') return `🔀 ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'PATH') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-shuffle"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Requests/responses (encrypted)
-    if (decoded.type === 'REQ' || decoded.type === 'RESPONSE') return `🔒 ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'REQ' || decoded.type === 'RESPONSE') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Anonymous requests
-    if (decoded.type === 'ANON_REQ') return `🔒 anon → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'ANON_REQ') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> anon → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Companion bridge text
     if (decoded.text) return escapeHtml(decoded.text.length > 80 ? decoded.text.slice(0, 80) + '…' : decoded.text);
     // Bare adverts with just pubkey
-    if (decoded.public_key) return `📡 ${decoded.public_key.slice(0, 16)}…`;
+    if (decoded.public_key) return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> ${decoded.public_key.slice(0, 16)}…`;
     return '';
   }
 
@@ -2686,7 +2825,7 @@
         sheet = document.createElement('div');
         sheet.id = 'mobileDetailSheet';
         sheet.className = 'mobile-detail-sheet';
-        sheet.innerHTML = '<div class="mobile-sheet-handle"></div><button class="mobile-sheet-close" id="mobileSheetClose">✕</button><div class="mobile-sheet-content"></div>';
+        sheet.innerHTML = '<div class="mobile-sheet-handle"></div><button class="mobile-sheet-close" id="mobileSheetClose" aria-label="Close"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button><div class="mobile-sheet-content"></div>';
         document.body.appendChild(sheet);
         sheet.querySelector('#mobileSheetClose').addEventListener('click', () => {
           sheet.classList.remove('open');
@@ -2838,7 +2977,7 @@
       const hashHex = decoded.channelHashHex || decoded.channelHash.toString(16).padStart(2, '0').toUpperCase();
       const statusLabel = decoded.decryptionStatus === 'no_key' ? 'no key' : 'decryption failed';
       messageHtml = `<div class="detail-message" style="padding:12px;margin:8px 0;background:var(--card-bg);border-radius:8px;border-left:3px solid var(--warning, #f0ad4e)">
-        <div style="font-size:1.1em">🔒 Channel Hash: 0x${hashHex} <span style="color:var(--text-muted)">(${statusLabel})</span></div>
+        <div style="font-size:1.1em"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> Channel Hash: 0x${hashHex} <span style="color:var(--text-muted)">(${statusLabel})</span></div>
       </div>`;
     }
 
@@ -2875,7 +3014,7 @@
       const nodeName = decoded.name || '';
       locationHtml = `${decoded.lat.toFixed(5)}, ${decoded.lon.toFixed(5)}`;
       if (nodeName) locationHtml = `${escapeHtml(nodeName)} — ${locationHtml}`;
-      if (locationNodeKey) locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link">📍map</a>`;
+      if (locationNodeKey) locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg>map</a>`;
     } else {
       // Try to resolve sender node location from nodes list
       const senderKey = decoded.pubKey || decoded.srcPubKey;
@@ -2887,7 +3026,7 @@
             locationNodeKey = nodeData.node.public_key;
             locationHtml = `${nodeData.node.lat.toFixed(5)}, ${nodeData.node.lon.toFixed(5)}`;
             if (nodeData.node.name) locationHtml = `${escapeHtml(nodeData.node.name)} — ${locationHtml}`;
-            locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link">📍map</a>`;
+            locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg>map</a>`;
           } else if (senderName && !senderKey) {
             // Search by name
             const searchData = await api(`/nodes/search?q=${encodeURIComponent(senderName)}`, { ttl: 30000 }).catch(() => null);
@@ -2896,7 +3035,7 @@
               locationNodeKey = match.public_key;
               locationHtml = `${match.lat.toFixed(5)}, ${match.lon.toFixed(5)}`;
               locationHtml = `${escapeHtml(match.name)} — ${locationHtml}`;
-              locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link">📍map</a>`;
+              locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg>map</a>`;
             }
           }
         } catch {}
@@ -2904,7 +3043,7 @@
     }
 
     const anomalyBanner = decoded.anomaly
-      ? `<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;">⚠️ Anomaly: ${escapeHtml(decoded.anomaly)}</div>`
+      ? `<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Anomaly: ${escapeHtml(decoded.anomaly)}</div>`
       : '';
 
     // Hop count display: use pathHops length (= effective observation's path_json).
@@ -2972,10 +3111,10 @@
         ${effectivePkt.direction ? `<dt>Direction</dt><dd>${escapeHtml(effectivePkt.direction)}</dd>` : ''}
       </dl>
       <div class="detail-actions">
-        <button class="copy-link-btn" data-packet-hash="${pkt.hash || ''}" data-packet-id="${pkt.id}" title="Copy link to this packet">🔗 Copy Link</button>
-        ${pathHops.length ? `<button class="detail-map-link" id="viewRouteBtn">🗺️ View route on map</button>` : ''}
-        ${pkt.hash ? `<a href="#/traces/${pkt.hash}" class="detail-map-link" style="text-decoration:none">🔍 Trace</a>` : ''}
-        <button class="replay-live-btn" title="Replay this packet on the live map">▶ Replay</button>
+        <button class="copy-link-btn" data-packet-hash="${pkt.hash || ''}" data-packet-id="${pkt.id}" title="Copy link to this packet"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-link"/></svg> Copy Link</button>
+        ${pathHops.length ? `<button class="detail-map-link" id="viewRouteBtn"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> View route on map</button>` : ''}
+        ${pkt.hash ? `<a href="#/traces/${pkt.hash}" class="detail-map-link" style="text-decoration:none"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Trace</a>` : ''}
+        <button class="replay-live-btn" title="Replay this packet on the live map"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-play"/></svg> Replay</button>
       </div>
 
       ${(hasRawHex || Object.keys(decoded).length) ? `<details class="detail-technical"${(typeof window !== 'undefined' && window.innerWidth > 480) ? ' open' : ''}>
@@ -3043,8 +3182,8 @@
         const obsParam = selectedObservationId ? `?obs=${selectedObservationId}` : '';
         const url = pktHash ? `${location.origin}/#/packets/${pktHash}${obsParam}` : `${location.origin}/#/packets/${copyLinkBtn.dataset.packetId}${obsParam}`;
         window.copyToClipboard(url, () => {
-          copyLinkBtn.textContent = '✅ Copied!';
-          setTimeout(() => { copyLinkBtn.textContent = '🔗 Copy Link'; }, 1500);
+          copyLinkBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Copied!';
+          setTimeout(() => { copyLinkBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-link"/></svg> Copy Link'; }, 1500);
         });
       });
     }
@@ -3268,7 +3407,7 @@
     }
 
     if (decoded.anomaly) {
-      rows += `<tr class="anomaly-row" style="background:var(--warning, #f0ad4e); color:#000; font-weight:600;"><td colspan="2">⚠️ Anomaly</td><td colspan="2">${escapeHtml(decoded.anomaly)}</td></tr>`;
+      rows += `<tr class="anomaly-row" style="background:var(--warning, #f0ad4e); color:#000; font-weight:600;"><td colspan="2"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Anomaly</td><td colspan="2">${escapeHtml(decoded.anomaly)}</td></tr>`;
     }
 
     return `<table class="field-table">
@@ -3291,7 +3430,7 @@
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay byop-overlay';
     overlay.innerHTML = '<div class="modal byop-modal" role="dialog" aria-label="Decode a Packet" aria-modal="true">'
-      + '<div class="byop-header"><h3>📦 Decode a Packet</h3><button class="btn-icon byop-x" title="Close" aria-label="Close dialog">✕</button></div>'
+      + '<div class="byop-header"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg> Decode a Packet</h3><button class="btn-icon byop-x" title="Close" aria-label="Close dialog"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button></div>'
       + '<p class="text-muted" style="margin:0 0 12px;font-size:.85rem">Paste raw hex bytes from your radio or MQTT feed:</p>'
       + '<textarea id="byopHex" class="byop-input" aria-label="Packet hex data" placeholder="e.g. 15C31A8D4674FEAE37..." spellcheck="false"></textarea>'
       + '<button class="btn-primary byop-go" id="byopDecode" style="width:100%;margin:8px 0">Decode</button>'
@@ -3349,7 +3488,7 @@
         if (data.error) throw new Error(data.error);
         result.innerHTML = renderDecodedPacket(data.decoded, hex);
       } catch (e) {
-        result.innerHTML = '<p class="byop-err" role="alert">❌ ' + e.message + '</p>';
+        result.innerHTML = '<p class="byop-err" role="alert"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x-circle"/></svg> ' + e.message + '</p>';
       }
     }
   }
@@ -3364,7 +3503,7 @@
 
     // Anomaly banner
     if (d.anomaly) {
-      html += '<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;">⚠️ Anomaly: ' + escapeHtml(d.anomaly) + '</div>';
+      html += '<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Anomaly: ' + escapeHtml(d.anomaly) + '</div>';
     }
 
     // Header section

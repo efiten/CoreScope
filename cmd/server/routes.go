@@ -36,13 +36,13 @@ type Server struct {
 	buildTime string
 
 	// Cached runtime.MemStats to avoid stop-the-world pauses on every health check
-	memStatsMu   sync.Mutex
-	memStatsCache runtime.MemStats
+	memStatsMu       sync.Mutex
+	memStatsCache    runtime.MemStats
 	memStatsCachedAt time.Time
 
 	// Cached /api/stats response — recomputed at most once every 10s
-	statsMu      sync.Mutex
-	statsCache   *StatsResponse
+	statsMu       sync.Mutex
+	statsCache    *StatsResponse
 	statsCachedAt time.Time
 
 	// Guards s.cfg.GeoFilter — read by ingest/handler goroutines, written by PUT handler
@@ -83,6 +83,16 @@ type Server struct {
 	// bypass branch was exercised without standing up a full DB/store.
 	// Production code MUST leave this nil. #1483 follow-up.
 	computeNeighborGraphResponseFn func(minCount int, minScore float64, region, role string) NeighborGraphResponse
+
+	// Per-server state for /api/nodes/{pk}/reach: TTL cache + singleflight
+	// + cached neighbor_edges degree snapshot. Lives on *Server (not as
+	// package globals) so multiple instances don't share observable
+	// state. Initialised lazily on first use; see node_reach.go.
+	reach reachState
+
+	// Known-channels catalogue cache (issue #1323). Nil until configured;
+	// when nil the /api/known-channels endpoint returns an empty snapshot.
+	knownChannels *knownChannelsCache
 }
 
 // PerfStats tracks request performance.
@@ -111,6 +121,9 @@ func NewPerfStats() *PerfStats {
 }
 
 func NewServer(db *DB, cfg *Config, hub *Hub) *Server {
+	if cfg != nil {
+		cfg.applyListLimitsDefaults()
+	}
 	return &Server{
 		db:        db,
 		cfg:       cfg,
@@ -139,6 +152,24 @@ func (s *Server) getMemStats() runtime.MemStats {
 
 // getGeoFilter returns a pointer to the current geo_filter config under read lock.
 // Callers MUST NOT mutate the returned struct.
+// isPubkeyHidden returns true if the node with the given pubkey has a name
+// matching an operator-configured hidden prefix (#1181). Mirrors the
+// IsBlacklisted check used at the top of per-pubkey handlers: per-pubkey
+// endpoints should 404 on hidden nodes so callers learn nothing about
+// whether the row exists. Returns false on DB error / missing row (the
+// downstream handler's own 404 covers those).
+func (s *Server) isPubkeyHidden(pubkey string) bool {
+	if s == nil || s.cfg == nil || len(s.cfg.HiddenNamePrefixes) == 0 {
+		return false
+	}
+	node, err := s.db.GetNodeByPubkey(pubkey)
+	if err != nil || node == nil {
+		return false
+	}
+	name, _ := node["name"].(string)
+	return s.cfg.IsNameHidden(name)
+}
+
 func (s *Server) getGeoFilter() *GeoFilterConfig {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -161,8 +192,21 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	// Performance instrumentation middleware
 	r.Use(s.perfMiddleware)
 
-	// Backfill status header middleware
-	r.Use(s.backfillStatusMiddleware)
+	// /api/* responses must not be cached by upstream CDNs (#1551).
+	// Cloudflare/nginx/Varnish default zone policies cache
+	// application/json for 15min–4h when no Cache-Control is set,
+	// causing operators behind a CDN to serve stale observers/packets/
+	// stats data. Scope: /api/ prefix only — static assets stay
+	// CDN-cacheable (their headers are set by spaHandler).
+	r.Use(noStoreAPIMiddleware)
+
+	// Detect CDN-fronted deployments and warn the operator ONCE if
+	// any CDN-typical header (CF-Ray, CF-Connecting-IP, etc.) is
+	// observed. See #1561: no-store alone isn't sufficient on
+	// Cloudflare zones with Cache Rules / Page Rules that ignore
+	// origin Cache-Control. Operator must add a Bypass Cache rule
+	// for /api/* — see docs/deployment-behind-cdn.md.
+	r.Use(cdnDetectionMiddleware)
 
 	// Config endpoints
 	r.HandleFunc("/api/config/cache", s.handleConfigCache).Methods("GET")
@@ -222,6 +266,9 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/nodes/{pubkey}/clock-skew", s.handleNodeClockSkew).Methods("GET")
 	r.HandleFunc("/api/observers/clock-skew", s.handleObserverClockSkew).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}/neighbors", s.handleNodeNeighbors).Methods("GET")
+	// Keep specific sub-routes (…/reach, …/rx-coverage) registered BEFORE the
+	// catch-all /api/nodes/{pubkey} — mux matches in registration order, so
+	// reordering these below the catch-all would shadow them and break the route.
 	r.HandleFunc("/api/nodes/{pubkey}/reach", s.handleNodeReach).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}/rx-coverage", s.handleNodeRxCoverage).Methods("GET")
 	r.HandleFunc("/api/nodes/resolve", s.handleResolvePrefix).Methods("GET")
@@ -242,11 +289,13 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/analytics/subpaths-bulk", s.handleAnalyticsSubpathsBulk).Methods("GET")
 	r.HandleFunc("/api/analytics/subpath-detail", s.handleAnalyticsSubpathDetail).Methods("GET")
 	r.HandleFunc("/api/analytics/neighbor-graph", s.handleNeighborGraph).Methods("GET")
+	r.HandleFunc("/api/analytics/relay-airtime-share", s.handleAnalyticsRelayAirtimeShare).Methods("GET")
 
 	// Other endpoints
 	r.HandleFunc("/api/resolve-hops", s.handleResolveHops).Methods("GET")
 	r.HandleFunc("/api/channels/{hash}/messages", s.handleChannelMessages).Methods("GET")
 	r.HandleFunc("/api/channels", s.handleChannels).Methods("GET")
+	r.HandleFunc("/api/known-channels", s.handleKnownChannels).Methods("GET")
 	r.HandleFunc("/api/observers/metrics/summary", s.handleMetricsSummary).Methods("GET")
 	r.HandleFunc("/api/observers/{id}/metrics", s.handleObserverMetrics).Methods("GET")
 	r.HandleFunc("/api/observers/{id}/analytics", s.handleObserverAnalytics).Methods("GET")
@@ -262,12 +311,26 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/docs", s.handleSwaggerUI).Methods("GET")
 }
 
-func (s *Server) backfillStatusMiddleware(next http.Handler) http.Handler {
+// noStoreAPIMiddleware sets Cache-Control: no-store on every response
+// whose request path starts with /api/. See #1551 — CDNs cache JSON
+// for minutes when no Cache-Control is present, which causes observers/
+// packets/stats responses to go stale through Cloudflare/nginx/Varnish.
+//
+// Why no-store (not private,max-age=0):
+//   - no-store is the most conservative directive; forbids ANY cache
+//     (CDN, browser, intermediary) from storing the response.
+//   - private,max-age=0 still permits short browser caches and some
+//     intermediaries; we don't gain anything from it because the data
+//     is fresh-on-every-request semantics by contract (WS pushes diff
+//     against REST GETs).
+//
+// Scope: /api/ prefix only. Static assets (HTML/JS/CSS) keep their
+// existing headers from spaHandler and remain CDN-cacheable on
+// hashed URLs.
+func noStoreAPIMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.store != nil && s.store.backfillComplete.Load() {
-			w.Header().Set("X-CoreScope-Status", "ready")
-		} else {
-			w.Header().Set("X-CoreScope-Status", "backfilling")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -357,10 +420,19 @@ func (s *Server) handleConfigCache(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
+	// #1508 — surface the operator-side customizer knobs. The frontend
+	// (public/customize-v2.js _renderTabs) reads disabledTabs to hide
+	// admin-only tabs from end users. Always return a non-nil slice so
+	// the JSON shape is `[]` (not `null`) and the client can call
+	// `.includes()` without an undefined guard.
+	disabledTabs := []string{}
+	if s.cfg.Customizer != nil && s.cfg.Customizer.DisabledTabs != nil {
+		disabledTabs = s.cfg.Customizer.DisabledTabs
+	}
 	writeJSON(w, ClientConfigResponse{
 		Roles:               s.cfg.Roles,
 		HealthThresholds:    s.cfg.GetHealthThresholds().ToClientMs(),
-		Tiles:               s.cfg.Tiles,
+		Map:                 s.cfg.Map,
 		SnrThresholds:       s.cfg.SnrThresholds,
 		DistThresholds:      s.cfg.DistThresholds,
 		MaxHopDist:          s.cfg.MaxHopDist,
@@ -370,9 +442,12 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		CacheInvalidateMs:   s.cfg.CacheInvalidMs,
 		ExternalUrls:        s.cfg.ExternalUrls,
 		PropagationBufferMs: float64(s.cfg.PropagationBufferMs()),
+		LiveMapMaxNodes:     s.cfg.LiveMapMaxNodes(),
 		Timestamps:          s.cfg.GetTimestampConfig(),
 		DebugAffinity:       s.cfg.DebugAffinity,
 		MapDarkTileProvider: s.cfg.MapDarkTileProvider,
+		Tiles:               s.cfg.Tiles,
+		Customizer:          CustomizerClientConfig{DisabledTabs: disabledTabs},
 	})
 }
 
@@ -439,30 +514,30 @@ func (s *Server) handleConfigTheme(w http.ResponseWriter, r *http.Request) {
 	}, s.cfg.Branding, theme.Branding)
 
 	themeColors := mergeMap(map[string]interface{}{
-		"accent":      "#4a9eff",
-		"accentHover": "#6db3ff",
-		"navBg":       "#0f0f23",
-		"navBg2":      "#1a1a2e",
-		"navText":     "#ffffff",
+		"accent":       "#4a9eff",
+		"accentHover":  "#6db3ff",
+		"navBg":        "#0f0f23",
+		"navBg2":       "#1a1a2e",
+		"navText":      "#ffffff",
 		"navTextMuted": "#cbd5e1",
-		"background":  "#f4f5f7",
-		"text":        "#1a1a2e",
-		"textMuted":   "#5b6370",
-		"border":      "#e2e5ea",
-		"surface1":    "#ffffff",
-		"surface2":    "#ffffff",
-		"surface3":    "#ffffff",
-		"sectionBg":   "#eef2ff",
-		"cardBg":      "#ffffff",
-		"contentBg":   "#f4f5f7",
-		"detailBg":    "#ffffff",
-		"inputBg":     "#ffffff",
-		"rowStripe":   "#f9fafb",
-		"rowHover":    "#eef2ff",
-		"selectedBg":  "#dbeafe",
-		"statusGreen": "#22c55e",
+		"background":   "#f4f5f7",
+		"text":         "#1a1a2e",
+		"textMuted":    "#5b6370",
+		"border":       "#e2e5ea",
+		"surface1":     "#ffffff",
+		"surface2":     "#ffffff",
+		"surface3":     "#ffffff",
+		"sectionBg":    "#eef2ff",
+		"cardBg":       "#ffffff",
+		"contentBg":    "#f4f5f7",
+		"detailBg":     "#ffffff",
+		"inputBg":      "#ffffff",
+		"rowStripe":    "#f9fafb",
+		"rowHover":     "#eef2ff",
+		"selectedBg":   "#dbeafe",
+		"statusGreen":  "#22c55e",
 		"statusYellow": "#eab308",
-		"statusRed":   "#ef4444",
+		"statusRed":    "#ef4444",
 	}, s.cfg.Theme, theme.Theme)
 
 	nodeColors := mergeMap(map[string]interface{}{
@@ -474,30 +549,30 @@ func (s *Server) handleConfigTheme(w http.ResponseWriter, r *http.Request) {
 	}, s.cfg.NodeColors, theme.NodeColors)
 
 	themeDark := mergeMap(map[string]interface{}{
-		"accent":      "#4a9eff",
-		"accentHover": "#6db3ff",
-		"navBg":       "#0f0f23",
-		"navBg2":      "#1a1a2e",
-		"navText":     "#ffffff",
+		"accent":       "#4a9eff",
+		"accentHover":  "#6db3ff",
+		"navBg":        "#0f0f23",
+		"navBg2":       "#1a1a2e",
+		"navText":      "#ffffff",
 		"navTextMuted": "#cbd5e1",
-		"background":  "#0f0f23",
-		"text":        "#e2e8f0",
-		"textMuted":   "#a8b8cc",
-		"border":      "#334155",
-		"surface1":    "#1a1a2e",
-		"surface2":    "#232340",
-		"cardBg":      "#1a1a2e",
-		"contentBg":   "#0f0f23",
-		"detailBg":    "#232340",
-		"inputBg":     "#1e1e34",
-		"rowStripe":   "#1e1e34",
-		"rowHover":    "#2d2d50",
-		"selectedBg":  "#1e3a5f",
-		"statusGreen": "#22c55e",
+		"background":   "#0f0f23",
+		"text":         "#e2e8f0",
+		"textMuted":    "#a8b8cc",
+		"border":       "#334155",
+		"surface1":     "#1a1a2e",
+		"surface2":     "#232340",
+		"cardBg":       "#1a1a2e",
+		"contentBg":    "#0f0f23",
+		"detailBg":     "#232340",
+		"inputBg":      "#1e1e34",
+		"rowStripe":    "#1e1e34",
+		"rowHover":     "#2d2d50",
+		"selectedBg":   "#1e3a5f",
+		"statusGreen":  "#22c55e",
 		"statusYellow": "#eab308",
-		"statusRed":   "#ef4444",
-		"surface3":    "#2d2d50",
-		"sectionBg":   "#1e1e34",
+		"statusRed":    "#ef4444",
+		"surface3":     "#2d2d50",
+		"sectionBg":    "#1e1e34",
 	}, s.cfg.ThemeDark, theme.ThemeDark)
 	typeColors := mergeMap(map[string]interface{}{
 		"ADVERT":   "#22c55e",
@@ -516,14 +591,19 @@ func (s *Server) handleConfigTheme(w http.ResponseWriter, r *http.Request) {
 		"heroTitle":    "CoreScope",
 		"heroSubtitle": "Real-time MeshCore LoRa mesh network analyzer",
 		"steps": []interface{}{
-			map[string]interface{}{"emoji": "🔵", "title": "Connect via Bluetooth", "description": "Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.io/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair"},
-			map[string]interface{}{"emoji": "📻", "title": "Set the right frequency preset", "description": "**US Recommended:**\n`910.525 MHz · BW 62.5 kHz · SF 7 · CR 5`\nSelect **\"US Recommended\"** in the app or flasher."},
-			map[string]interface{}{"emoji": "📡", "title": "Advertise yourself", "description": "Tap the signal icon → **Flood** to broadcast your node to the mesh. Companions only advert when you trigger it manually."},
-			map[string]interface{}{"emoji": "🔁", "title": "Check \"Heard N repeats\"", "description": "- **\"Sent\"** = transmitted, no confirmation\n- **\"Heard 0 repeats\"** = no repeater picked it up\n- **\"Heard 1+ repeats\"** = you're on the mesh!"},
+			// #1648 M5: defaults use 'ph:<name>' Phosphor sprite tokens.
+			// The frontend render path (home.js _renderHomeGlyph, customize-v2.js
+			// renderConfigGlyph) ALSO accepts legacy emoji strings, so any
+			// operator config.json that still stores raw emoji values continues
+			// to render as-is — this changes ONLY the built-in default set.
+			map[string]interface{}{"emoji": "ph:bluetooth", "title": "Connect via Bluetooth", "description": "Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.io/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair"},
+			map[string]interface{}{"emoji": "ph:radio", "title": "Set the right frequency preset", "description": "**US Recommended:**\n`910.525 MHz · BW 62.5 kHz · SF 7 · CR 5`\nSelect **\"US Recommended\"** in the app or flasher."},
+			map[string]interface{}{"emoji": "ph:broadcast", "title": "Advertise yourself", "description": "Tap the signal icon → **Flood** to broadcast your node to the mesh. Companions only advert when you trigger it manually."},
+			map[string]interface{}{"emoji": "ph:repeat", "title": "Check \"Heard N repeats\"", "description": "- **\"Sent\"** = transmitted, no confirmation\n- **\"Heard 0 repeats\"** = no repeater picked it up\n- **\"Heard 1+ repeats\"** = you're on the mesh!"},
 		},
 		"footerLinks": []interface{}{
-			map[string]interface{}{"label": "📦 Packets", "url": "#/packets"},
-			map[string]interface{}{"label": "🗺️ Network Map", "url": "#/map"},
+			map[string]interface{}{"label": "ph:package Packets", "url": "#/packets"},
+			map[string]interface{}{"label": "ph:map-trifold Network Map", "url": "#/map"},
 		},
 	}
 	home := mergeMap(defaultHome, s.cfg.Home, theme.Home)
@@ -693,18 +773,6 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	counts := s.db.GetRoleCounts()
 
-	// Compute backfill progress
-	backfilling := s.store != nil && !s.store.backfillComplete.Load()
-	var backfillProgress float64
-	if backfilling && s.store != nil && s.store.backfillTotal.Load() > 0 {
-		backfillProgress = float64(s.store.backfillProcessed.Load()) / float64(s.store.backfillTotal.Load())
-		if backfillProgress > 1 {
-			backfillProgress = 1
-		}
-	} else if !backfilling {
-		backfillProgress = 1
-	}
-
 	// Memory accounting (#832). storeDataMB is the in-store packet byte
 	// estimate (the old "trackedMB"); processRSSMB / goHeapInuseMB / goSysMB
 	// give ops the breakdown needed to reason about real RSS. All values
@@ -734,8 +802,6 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			Companions: counts["companions"],
 			Sensors:    counts["sensors"],
 		},
-		Backfilling:           backfilling,
-		BackfillProgress:      backfillProgress,
 		SignatureDrops:        s.db.GetSignatureDropCount(),
 		HashMigrationComplete: s.store != nil && s.store.hashMigrationComplete.Load(),
 
@@ -895,7 +961,7 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("order") == "asc" {
 			order = "ASC"
 		}
-		lim := queryLimit(r, 50, 500)
+		lim := queryLimit(r, 50, s.cfg.ListLimits.PacketsMax)
 		var result *PacketResult
 		var err error
 		if s.store != nil {
@@ -911,24 +977,21 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err.Error())
 			return
 		}
-		writeJSON(w, PacketListResponse{
-			Packets: mapSliceToTransmissions(result.Packets),
-			Total:   result.Total,
-			Limit:   lim,
-			Offset:  queryInt(r, "offset", 0),
-		})
+		result.Limit = lim
+		result.Offset = queryInt(r, "offset", 0)
+		writeJSON(w, result)
 		return
 	}
 
 	q := PacketQuery{
-		Limit:    queryLimit(r, 50, 500),
-		Offset:   queryInt(r, "offset", 0),
-		Observer: r.URL.Query().Get("observer"),
-		Hash:     r.URL.Query().Get("hash"),
-		Since:    r.URL.Query().Get("since"),
-		Until:    r.URL.Query().Get("until"),
-		Region:   r.URL.Query().Get("region"),
-		Node:     r.URL.Query().Get("node"),
+		Limit:              queryLimit(r, 50, s.cfg.ListLimits.PacketsMax),
+		Offset:             queryInt(r, "offset", 0),
+		Observer:           r.URL.Query().Get("observer"),
+		Hash:               r.URL.Query().Get("hash"),
+		Since:              r.URL.Query().Get("since"),
+		Until:              r.URL.Query().Get("until"),
+		Region:             r.URL.Query().Get("region"),
+		Node:               r.URL.Query().Get("node"),
 		Channel:            r.URL.Query().Get("channel"),
 		Area:               r.URL.Query().Get("area"),
 		Order:              "DESC",
@@ -958,6 +1021,8 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err.Error())
 			return
 		}
+		result.Limit = q.Limit
+		result.Offset = q.Offset
 		writeJSON(w, result)
 		return
 	}
@@ -974,6 +1039,8 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	result.Limit = q.Limit
+	result.Offset = q.Offset
 	writeJSON(w, result)
 }
 
@@ -1215,7 +1282,7 @@ func (s *Server) handlePostPacket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	nodes, total, counts, err := s.db.GetNodes(
-		queryLimit(r, 50, 500),
+		queryLimit(r, 50, s.cfg.ListLimits.NodesMax),
 		queryInt(r, "offset", 0),
 		q.Get("role"), q.Get("search"), q.Get("before"),
 		q.Get("lastHeard"), q.Get("sortBy"), q.Get("region"),
@@ -1308,6 +1375,20 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		total = len(filtered)
 		nodes = filtered
 	}
+	// Filter nodes whose name starts with a hidden prefix (#1181). DB rows
+	// are preserved — this only drops them from the API surface so observer
+	// history (paths, hops, distances) remains intact for analytics.
+	if len(s.cfg.HiddenNamePrefixes) > 0 {
+		filtered := nodes[:0]
+		for _, node := range nodes {
+			name, _ := node["name"].(string)
+			if !s.cfg.IsNameHidden(name) {
+				filtered = append(filtered, node)
+			}
+		}
+		total = len(filtered)
+		nodes = filtered
+	}
 	// Filter by area
 	if area := q.Get("area"); area != "" {
 		var areaNodes map[string]bool
@@ -1360,6 +1441,17 @@ func (s *Server) handleNodeSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		nodes = filtered
 	}
+	// Drop hidden-prefix nodes from search results (#1181).
+	if len(s.cfg.HiddenNamePrefixes) > 0 {
+		filtered := make([]map[string]interface{}, 0, len(nodes))
+		for _, node := range nodes {
+			name, _ := node["name"].(string)
+			if !s.cfg.IsNameHidden(name) {
+				filtered = append(filtered, node)
+			}
+		}
+		nodes = filtered
+	}
 	writeJSON(w, NodeSearchResponse{Nodes: nodes})
 }
 
@@ -1398,7 +1490,13 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
-	// From here on use the canonical pubkey for downstream lookups.
+	// Hide the node when its name matches an operator-configured prefix
+	// (#1181). 404 mirrors the blacklist behaviour above — callers learn
+	// nothing about whether the row exists.
+	if name, _ := node["name"].(string); s.cfg.IsNameHidden(name) {
+		writeError(w, 404, "Not found")
+		return
+	}
 	if pk, _ := node["public_key"].(string); pk != "" {
 		pubkey = pk
 	}
@@ -1443,6 +1541,10 @@ func (s *Server) handleNodeHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
+	if s.isPubkeyHidden(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
 	if s.store != nil {
 		result, err := s.store.GetNodeHealth(pubkey)
 		if err != nil || result == nil {
@@ -1456,19 +1558,28 @@ func (s *Server) handleNodeHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBulkHealth(w http.ResponseWriter, r *http.Request) {
-	limit := queryLimit(r, 50, 200)
+	lim := queryLimit(r, 50, s.cfg.ListLimits.BulkHealthMax)
 
 	if s.store != nil {
 		region := r.URL.Query().Get("region")
 		area := r.URL.Query().Get("area")
-		results := s.store.GetBulkHealth(limit, region, area)
-		// Filter blacklisted nodes
-		if len(s.cfg.NodeBlacklist) > 0 {
+		results := s.store.GetBulkHealth(lim, region, area)
+		// Filter blacklisted nodes + hidden-prefix nodes (#1181).
+		needsBlacklist := len(s.cfg.NodeBlacklist) > 0
+		needsHidden := len(s.cfg.HiddenNamePrefixes) > 0
+		if needsBlacklist || needsHidden {
 			filtered := make([]map[string]interface{}, 0, len(results))
 			for _, entry := range results {
-				if pk, ok := entry["public_key"].(string); !ok || !s.cfg.IsBlacklisted(pk) {
-					filtered = append(filtered, entry)
+				if pk, ok := entry["public_key"].(string); ok && needsBlacklist && s.cfg.IsBlacklisted(pk) {
+					continue
 				}
+				if needsHidden {
+					name, _ := entry["name"].(string)
+					if s.cfg.IsNameHidden(name) {
+						continue
+					}
+				}
+				filtered = append(filtered, entry)
 			}
 			writeJSON(w, filtered)
 			return
@@ -1496,6 +1607,10 @@ func (s *Server) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
+	if s.isPubkeyHidden(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
 	node, err := s.db.GetNodeByPubkey(pubkey)
 	if err != nil || node == nil {
 		writeError(w, 404, "Not found")
@@ -1503,6 +1618,10 @@ func (s *Server) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.store == nil {
 		writeError(w, 503, "Packet store unavailable")
+		return
+	}
+	if !s.store.PathHopIndexReady() {
+		writeIndexLoading503(w)
 		return
 	}
 
@@ -1874,6 +1993,10 @@ func (s *Server) handleNodeAnalytics(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
+	if s.isPubkeyHidden(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
 	days := queryInt(r, "days", 7)
 	if days < 1 {
 		days = 1
@@ -1950,6 +2073,21 @@ func (s *Server) handleAnalyticsRF(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleAnalyticsRelayAirtimeShare(w http.ResponseWriter, r *http.Request) {
+	window := ParseTimeWindow(r)
+	if s.store != nil {
+		writeJSON(w, s.store.GetRelayAirtimeShareWithWindow(window))
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"rows":        []map[string]interface{}{},
+		"total_count": 0,
+		"total_score": 0,
+		"window":      "",
+		"cached":      false,
+	})
+}
+
 func (s *Server) handleAnalyticsTopology(w http.ResponseWriter, r *http.Request) {
 	region := r.URL.Query().Get("region")
 	area := r.URL.Query().Get("area")
@@ -2000,6 +2138,19 @@ func (s *Server) handleAnalyticsDistance(w http.ResponseWriter, r *http.Request)
 	region := r.URL.Query().Get("region")
 	area := r.URL.Query().Get("area")
 	if s.store != nil {
+		// Lazy build (#1011): distance index is not built at startup.
+		// First request triggers an async build and gets 202 +
+		// Retry-After; concurrent requests during the build window
+		// also get 202. Cached results (after the build completes)
+		// are served as 200 from the analytics recomputer / TTL cache.
+		if !s.store.DistanceIndexBuilt() {
+			s.store.TriggerDistanceIndexBuild()
+			w.Header().Set("Retry-After", "5")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"status":"building","retry_after_seconds":5,"detail":"distance index is being computed (lazy build, #1011). Retry after Retry-After seconds."}`))
+			return
+		}
 		writeJSON(w, s.store.GetAnalyticsDistance(region, area))
 		return
 	}
@@ -2021,7 +2172,7 @@ func (s *Server) handleAnalyticsHashSizes(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, map[string]interface{}{
-		"total":                    0,
+		"total":                   0,
 		"distribution":            map[string]int{"1": 0, "2": 0, "3": 0},
 		"distributionByRepeaters": map[string]int{"1": 0, "2": 0, "3": 0},
 		"hourly":                  []HashSizeHourly{},
@@ -2045,14 +2196,20 @@ func (s *Server) handleAnalyticsHashCollisions(w http.ResponseWriter, r *http.Re
 
 func (s *Server) handleAnalyticsSubpaths(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil {
+		if !s.store.SubpathIndexReady() {
+			writeIndexLoading503(w)
+			return
+		}
 		region := r.URL.Query().Get("region")
 		minLen := queryInt(r, "minLen", 2)
 		if minLen < 2 {
 			minLen = 2
 		}
 		maxLen := queryInt(r, "maxLen", 8)
-		limit := queryLimit(r, 100, 200)
-		data := s.store.GetAnalyticsSubpaths(region, minLen, maxLen, limit)
+		limit := queryLimit(r, 100, s.cfg.ListLimits.AnalyticsMax)
+		// Issue #1217: honor the Time window filter on Route Patterns.
+		window := ParseTimeWindow(r)
+		data := s.store.GetAnalyticsSubpathsWithWindow(region, minLen, maxLen, limit, window)
 		if s.cfg != nil && len(s.cfg.NodeBlacklist) > 0 {
 			data = s.filterBlacklistedFromSubpaths(data)
 		}
@@ -2067,8 +2224,13 @@ func (s *Server) handleAnalyticsSubpaths(w http.ResponseWriter, r *http.Request)
 
 // handleAnalyticsSubpathsBulk returns multiple length-range buckets in a single
 // response, avoiding repeated scans of the same packet data. Query format:
-//   ?groups=2-2:50,3-3:30,4-4:20,5-8:15   (minLen-maxLen:limit per group)
+//
+//	?groups=2-2:50,3-3:30,4-4:20,5-8:15   (minLen-maxLen:limit per group)
 func (s *Server) handleAnalyticsSubpathsBulk(w http.ResponseWriter, r *http.Request) {
+	if s.store != nil && !s.store.SubpathIndexReady() {
+		writeIndexLoading503(w)
+		return
+	}
 	region := r.URL.Query().Get("region")
 	groupsParam := r.URL.Query().Get("groups")
 	if groupsParam == "" {
@@ -2113,7 +2275,7 @@ func (s *Server) handleAnalyticsSubpathsBulk(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	results := s.store.GetAnalyticsSubpathsBulk(region, groups)
+	results := s.store.GetAnalyticsSubpathsBulkWithWindow(region, groups, ParseTimeWindow(r))
 	if s.cfg != nil && len(s.cfg.NodeBlacklist) > 0 {
 		for i, r := range results {
 			results[i] = s.filterBlacklistedFromSubpaths(r)
@@ -2138,16 +2300,20 @@ func (s *Server) handleAnalyticsSubpathDetail(w http.ResponseWriter, r *http.Req
 		writeJSON(w, ErrorResp{Error: "Need at least 2 hops"})
 		return
 	}
-	// Reject if any hop is a blacklisted node.
-	if s.cfg != nil && len(s.cfg.NodeBlacklist) > 0 {
+	// Reject if any hop is a blacklisted or hidden-prefix node (#1181).
+	if s.cfg != nil && (len(s.cfg.NodeBlacklist) > 0 || len(s.cfg.HiddenNamePrefixes) > 0) {
 		for _, hop := range rawHops {
-			if s.cfg.IsBlacklisted(hop) {
+			if s.cfg.IsBlacklisted(hop) || s.isPubkeyHidden(hop) {
 				writeError(w, 404, "Not found")
 				return
 			}
 		}
 	}
 	if s.store != nil {
+		if !s.store.SubpathIndexReady() {
+			writeIndexLoading503(w)
+			return
+		}
 		writeJSON(w, s.store.GetSubpathDetail(rawHops))
 		return
 	}
@@ -2214,6 +2380,11 @@ func (s *Server) handleResolveHops(w http.ResponseWriter, r *http.Request) {
 				for _, ni := range matched {
 					// Skip blacklisted nodes from resolution results.
 					if s.cfg != nil && s.cfg.IsBlacklisted(ni.PublicKey) {
+						continue
+					}
+					// #1181: skip hidden-prefix nodes too. We have the
+					// name on ni so no extra DB lookup is needed.
+					if s.cfg != nil && s.cfg.IsNameHidden(ni.Name) {
 						continue
 					}
 					c := HopCandidate{Pubkey: ni.PublicKey}
@@ -2284,8 +2455,9 @@ func (s *Server) handleResolveHops(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Use the resolved node as the default (best-effort pick).
-			// Skip if the best pick is a blacklisted node.
-			if best != nil && !(s.cfg != nil && s.cfg.IsBlacklisted(best.PublicKey)) {
+			// Skip if the best pick is blacklisted or has a hidden-prefix
+			// name (#1181).
+			if best != nil && !(s.cfg != nil && (s.cfg.IsBlacklisted(best.PublicKey) || s.cfg.IsNameHidden(best.Name))) {
 				hr.Name = best.Name
 				hr.Pubkey = best.PublicKey
 			}
@@ -2341,7 +2513,7 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleChannelMessages(w http.ResponseWriter, r *http.Request) {
 	hash := mux.Vars(r)["hash"]
-	limit := queryLimit(r, 100, 500)
+	limit := queryLimit(r, 100, s.cfg.ListLimits.ChannelMessagesMax)
 	offset := queryInt(r, "offset", 0)
 	region := r.URL.Query().Get("region")
 	// Prefer DB for full history (in-memory store has limited retention)
@@ -2455,13 +2627,14 @@ func (s *Server) buildObserversDefaultResponse() (ObserverListResponse, error) {
 			ID: o.ID, Name: o.Name, IATA: o.IATA,
 			LastSeen: o.LastSeen, FirstSeen: o.FirstSeen,
 			PacketCount: o.PacketCount,
-			Model: o.Model, Firmware: o.Firmware,
+			Model:       o.Model, Firmware: o.Firmware,
 			ClientVersion: o.ClientVersion, Radio: o.Radio,
 			BatteryMv: o.BatteryMv, UptimeSecs: o.UptimeSecs,
-			NoiseFloor: o.NoiseFloor,
-			LastPacketAt: o.LastPacketAt,
+			NoiseFloor:      o.NoiseFloor,
+			LastPacketAt:    o.LastPacketAt,
 			PacketsLastHour: plh,
-			Lat: lat, Lon: lon, NodeRole: nodeRole,
+			Lat:             lat, Lon: lon, NodeRole: nodeRole,
+			CanRelay: o.CanRelay,
 		}
 		applyObserverNaiveClock(&resp, o, nowTime)
 		result = append(result, resp)
@@ -2500,12 +2673,13 @@ func (s *Server) handleObserverDetail(w http.ResponseWriter, r *http.Request) {
 			ID: obs.ID, Name: obs.Name, IATA: obs.IATA,
 			LastSeen: obs.LastSeen, FirstSeen: obs.FirstSeen,
 			PacketCount: obs.PacketCount,
-			Model: obs.Model, Firmware: obs.Firmware,
+			Model:       obs.Model, Firmware: obs.Firmware,
 			ClientVersion: obs.ClientVersion, Radio: obs.Radio,
 			BatteryMv: obs.BatteryMv, UptimeSecs: obs.UptimeSecs,
-			NoiseFloor: obs.NoiseFloor,
-			LastPacketAt: obs.LastPacketAt,
+			NoiseFloor:      obs.NoiseFloor,
+			LastPacketAt:    obs.LastPacketAt,
 			PacketsLastHour: plh,
+			CanRelay:        obs.CanRelay,
 		}
 		applyObserverNaiveClock(&resp, obs, time.Now().UTC())
 		return resp
@@ -3064,8 +3238,9 @@ func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// filterBlacklistedFromTopology removes blacklisted node references from the
-// topology analytics response (TopRepeaters, TopPairs, BestPathList, MultiObsNodes, PerObserverReach).
+// filterBlacklistedFromTopology removes blacklisted + hidden-prefix node
+// references (#1181) from the topology analytics response (TopRepeaters,
+// TopPairs, BestPathList, MultiObsNodes, PerObserverReach).
 func (s *Server) filterBlacklistedFromTopology(data map[string]interface{}) map[string]interface{} {
 	// Filter TopRepeaters
 	if repeaters, ok := data["topRepeaters"]; ok {
@@ -3073,6 +3248,9 @@ func (s *Server) filterBlacklistedFromTopology(data map[string]interface{}) map[
 			var filtered []TopRepeater
 			for _, r := range arr {
 				if pk, ok := r.Pubkey.(string); ok && s.cfg.IsBlacklisted(pk) {
+					continue
+				}
+				if name, ok := r.Name.(string); ok && s.cfg.IsNameHidden(name) {
 					continue
 				}
 				filtered = append(filtered, r)
@@ -3092,6 +3270,12 @@ func (s *Server) filterBlacklistedFromTopology(data map[string]interface{}) map[
 				if pkB, ok := p.PubkeyB.(string); ok && s.cfg.IsBlacklisted(pkB) {
 					continue
 				}
+				if nameA, ok := p.NameA.(string); ok && s.cfg.IsNameHidden(nameA) {
+					continue
+				}
+				if nameB, ok := p.NameB.(string); ok && s.cfg.IsNameHidden(nameB) {
+					continue
+				}
 				filtered = append(filtered, p)
 			}
 			data["topPairs"] = filtered
@@ -3104,6 +3288,9 @@ func (s *Server) filterBlacklistedFromTopology(data map[string]interface{}) map[
 			var filtered []BestPathEntry
 			for _, p := range arr {
 				if pk, ok := p.Pubkey.(string); ok && s.cfg.IsBlacklisted(pk) {
+					continue
+				}
+				if pk, ok := p.Pubkey.(string); ok && s.isPubkeyHidden(pk) {
 					continue
 				}
 				filtered = append(filtered, p)
@@ -3120,6 +3307,9 @@ func (s *Server) filterBlacklistedFromTopology(data map[string]interface{}) map[
 				if pk, ok := n.Pubkey.(string); ok && s.cfg.IsBlacklisted(pk) {
 					continue
 				}
+				if name, ok := n.Name.(string); ok && s.cfg.IsNameHidden(name) {
+					continue
+				}
 				filtered = append(filtered, n)
 			}
 			data["multiObsNodes"] = filtered
@@ -3134,6 +3324,9 @@ func (s *Server) filterBlacklistedFromTopology(data map[string]interface{}) map[
 					var filteredNodes []ReachNode
 					for _, rn := range v.Rings[ri].Nodes {
 						if pk, ok := rn.Pubkey.(string); ok && s.cfg.IsBlacklisted(pk) {
+							continue
+						}
+						if name, ok := rn.Name.(string); ok && s.cfg.IsNameHidden(name) {
 							continue
 						}
 						filteredNodes = append(filteredNodes, rn)
@@ -3159,7 +3352,7 @@ func (s *Server) filterBlacklistedFromSubpaths(data map[string]interface{}) map[
 					if hops, ok := m["hops"].([]interface{}); ok {
 						skip := false
 						for _, h := range hops {
-							if hp, ok := h.(string); ok && s.cfg.IsBlacklisted(hp) {
+							if hp, ok := h.(string); ok && (s.cfg.IsBlacklisted(hp) || s.isPubkeyHidden(hp)) {
 								skip = true
 								break
 							}
@@ -3179,7 +3372,7 @@ func (s *Server) filterBlacklistedFromSubpaths(data map[string]interface{}) map[
 
 // handleDroppedPackets returns recently dropped packets for investigation.
 func (s *Server) handleDroppedPackets(w http.ResponseWriter, r *http.Request) {
-	limit := queryLimit(r, 100, 500)
+	limit := queryLimit(r, 100, s.cfg.ListLimits.PacketsMax)
 	observerID := r.URL.Query().Get("observer")
 	nodePubkey := r.URL.Query().Get("pubkey")
 

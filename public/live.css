@@ -322,6 +322,18 @@
   visibility: hidden;
 }
 
+/* #1616 — the legend is informational (color swatches + labels). Its only
+ * interactive child is the corner-reposition button in .panel-header. The
+ * legend's bounding box overlaps the Leaflet topright Settings cog
+ * (#liveControlsToggle) on viewports where both pin to the right edge,
+ * which made Playwright (and real users on touch) miss the cog. Disable
+ * pointer events on the legend surface and re-enable only on the move
+ * button so the cog stays clickable through the legend's empty area.
+ */
+.live-legend { pointer-events: none; }
+.live-legend .panel-header,
+.live-legend .panel-corner-btn { pointer-events: auto; }
+
 .legend-title {
   font-size: 9px;
   font-weight: 700;
@@ -431,11 +443,14 @@
   padding: 0;
   border: 0;
   box-shadow: none;
-  flex: 0 0 100%;          /* break onto its own row inside flex-wrap header */
+  flex: auto;          /* Let it flow on the same row if there is room */
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  border-left: 1px solid var(--border); /* Vertical line between metrics and filters */
+  padding-left: 12px;
+  margin-left: 4px;
 }
 .live-controls-body {
   display: flex;
@@ -447,9 +462,25 @@
 
 /* Region/Area filters inline in live header controls body */
 .live-controls-body .live-region-filter-container,
-.live-controls-body .live-area-filter-container { display: inline-flex; align-items: center; }
+.live-controls-body .live-area-filter-container,
+.live-controls-body .live-show-all-region-nodes { display: inline-flex; align-items: center; font-size: 11px; }
 .live-controls-body .live-region-filter-container .region-dropdown-trigger,
-.live-controls-body .live-area-filter-container .region-dropdown-trigger { font-size: inherit; padding: 2px 6px; }
+.live-controls-body .live-area-filter-container .region-dropdown-trigger {
+  font-size: inherit;
+  padding: 2px 8px;
+  height: 30px;
+  position: relative;
+}
+.live-controls-body .live-region-filter-container .region-dropdown-trigger::after,
+.live-controls-body .live-area-filter-container .region-dropdown-trigger::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: max(100%, 44px);
+  height: 44px;
+  transform: translate(-50%, -50%);
+}
 
 /* #1108 — "Show all nodes" sibling of the region dropdown. Reuses the
    .live-controls-body label rhythm so it lines up with the other inline toggles. */
@@ -457,20 +488,66 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: inherit;
   white-space: nowrap;
 }
+.live-controls-body .live-show-all-region-nodes input { margin: 0; }
 
-/* ---- Leaflet overrides for dark theme ---- */
-.live-page .leaflet-control-zoom a {
-  background: color-mix(in srgb, var(--surface-1) 92%, transparent) !important;
-  backdrop-filter: blur(12px);
-  color: var(--text) !important;
-  border-color: var(--border) !important;
+/* ---- #1532 Live: default-collapsed controls + fullscreen mode ---- */
+
+/* #1532 — `.live-controls` collapses by default at ALL viewports (was
+   ≤768px only). The ⚙ pin reveals the toggles row on demand, parity
+   with the map-controls accordion pattern. Top-level (not media-gated)
+   so it applies on desktop too. */
+.live-controls-toggle,
+.live-fullscreen-toggle { display: inline-flex; }
+.live-controls.is-collapsed .live-controls-body { display: none; }
+
+/* Fullscreen mode (#1532). The body class hides chrome and
+   pins the 3 stat pills top-right so the firework animation is the
+   primary visual surface. The header band, controls row, VCR row,
+   and bottom-nav drop out; the beacon + pkt-count critical strip is
+   inside the header body so it goes with it (LIVE rate stays in
+   the stats row, which remains). */
+body.live-fullscreen .live-header-body { display: none !important; }
+body.live-fullscreen .live-controls-body { display: none !important; }
+body.live-fullscreen .live-controls-toggle,
+body.live-fullscreen .live-header-toggle { display: none !important; }
+body.live-fullscreen .vcr-bar .vcr-controls { display: none !important; }
+body.live-fullscreen .vcr-bar { display: none !important; }
+body.live-fullscreen .bottom-nav { display: none !important; }
+body.live-fullscreen .live-feed,
+body.live-fullscreen .live-legend,
+body.live-fullscreen .legend-toggle-btn,
+body.live-fullscreen .feed-show-btn { display: none !important; }
+
+/* Collapse the header chrome to just the floating stats row pinned
+   top-right. The header background/border drop so the stats pills
+   float over the map. */
+body.live-fullscreen .live-header {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  pointer-events: none;
 }
-.live-page .leaflet-control-zoom a:hover {
-  background: rgba(59, 130, 246, 0.2) !important;
+body.live-fullscreen .live-header-body {
+  display: none !important;
 }
+body.live-fullscreen .live-stats-row,
+body.live-fullscreen .live-header-critical {
+  pointer-events: auto;
+}
+
+/* Hide top nav in fullscreen UNLESS it was explicitly pinned */
+body.live-fullscreen:not(.nav-pinned) .top-nav {
+  display: none !important;
+}
+/* Shift map controls and live header up when top nav is hidden */
+body.live-fullscreen:not(.nav-pinned) .leaflet-top.leaflet-right,
+body.live-fullscreen:not(.nav-pinned) .live-header {
+  top: 12px !important;
+}
+
+
 
 /* ---- Medium breakpoint (#279) + collapse toggles (#1178, #1179) ---- */
 @media (max-width: 768px) {
@@ -480,6 +557,9 @@
   .live-header { gap: 6px; padding: 4px 8px; max-height: none; min-height: 48px; }
   .live-stat-pill { font-size: 11px; padding: 1px 7px; }
   .live-toggles { font-size: 10px; gap: 6px; }
+  .live-controls-body .live-region-filter-container,
+  .live-controls-body .live-area-filter-container,
+  .live-controls-body .live-show-all-region-nodes { font-size: 10px; }
 
   /* Show toggle buttons */
   .live-header-toggle,
@@ -565,6 +645,11 @@
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     min-width: 0;
+  }
+  .live-controls {
+    border-left: none;
+    padding-left: 0;
+    margin-left: 0;
   }
 
   /* #1234 — hide top app navbar on /live route at ≤640px.
@@ -654,6 +739,38 @@
   .live-page .leaflet-top.leaflet-right { top: 56px; }
 }
 
+/* Custom Live Toggles (Settings & Fullscreen) */
+.live-leaflet-toggle {
+  /* No absolute positioning needed; they stack normally in leaflet-right */
+}
+.live-leaflet-toggle a {
+  width: 44px !important;
+  height: 44px !important;
+  line-height: 44px !important;
+  font-size: 20px !important;
+  background-color: var(--surface-1) !important;
+  color: var(--text) !important;
+  border-bottom: none !important;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+}
+.live-leaflet-toggle a:hover {
+  background-color: var(--surface-2) !important;
+  color: var(--text) !important;
+}
+
+/* Active states for cog and fullscreen toggles */
+body.live-fullscreen #liveFullscreenToggle,
+#liveControlsToggle[aria-expanded="true"],
+body.live-fullscreen #liveFullscreenToggle:hover,
+#liveControlsToggle[aria-expanded="true"]:hover {
+  color: var(--accent) !important;
+}
+
+
+
+
 /* Feed item hover */
 .live-feed-item:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
 
@@ -669,7 +786,9 @@
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 12px;
-  z-index: 600;
+  /* #1619: was 600 — sat behind legend (z=1000); 1050 keeps it below
+     mobile bottom-nav (z=1100) while clearing all live overlays. */
+  z-index: 1050;
   box-shadow: 0 8px 24px rgba(0,0,0,0.5);
   animation: fadeSlideIn 0.15s ease-out;
   font-size: .8rem;
@@ -677,14 +796,16 @@
 }
 @keyframes fadeSlideIn { from { opacity:0; transform: translateY(-50%) translateX(8px); } to { opacity:1; transform: translateY(-50%) translateX(0); } }
 
-.fdc-header {
+.fdc-header,
+.feed-detail-card .panel-header {
   display: flex;
   align-items: center;
   gap: 8px;
   padding-left: 8px;
   margin-bottom: 8px;
 }
-.fdc-header strong { font-size: .85rem; color: var(--text); }
+.fdc-header strong,
+.feed-detail-card .panel-header strong { font-size: .85rem; color: var(--text); }
 .fdc-sender { color: var(--text-muted); font-size: .75rem; }
 .fdc-close {
   margin-left: auto;
@@ -833,7 +954,10 @@
 
 /* #1110 Live page node filter — match toolbar control sizing & theme */
 .live-node-filter-wrap { position: relative; display: inline-flex; align-items: center; }
-.live-node-filter-input {
+input.live-node-filter-input {
+  box-sizing: border-box;
+  height: 30px;
+  min-height: 30px; /* Override global 48px min-height on text inputs */
   background: color-mix(in srgb, var(--text) 6%, transparent);
   color: var(--text);
   border: 1px solid var(--border);
@@ -841,11 +965,10 @@
   padding: 3px 8px;
   font-size: inherit;
   line-height: 1.3;
-  height: auto;
   min-width: 140px;
   outline: none;
 }
-.live-node-filter-input:focus {
+input.live-node-filter-input:focus {
   border-color: color-mix(in srgb, var(--text) 35%, transparent);
   background: color-mix(in srgb, var(--text) 10%, transparent);
 }
@@ -985,12 +1108,20 @@
   padding: 4px 10px;
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.15s;
+  /* #1528: transition was `all 0.15s` which animated background-color +
+   * border-color when --accent-bg / --accent-border changed at runtime
+   * (e.g. customizer overrides, or the Playwright sentinel-swap in
+   * test-e2e-playwright.js #1528). getComputedStyle() polled immediately
+   * after the var swap returned the mid-flight (≈old) value, breaking
+   * the theming-illusion guard test. Restrict the transition to props
+   * that are NOT bound to themable tokens so token swaps render
+   * instantly. */
+  transition: color 0.15s, transform 0.15s;
 }
 .vcr-scope-btn.active {
-  background: rgba(59,130,246,0.2);
+  background: var(--accent-bg, rgba(59,130,246,0.2));
   color: var(--text);
-  border-color: rgba(59,130,246,0.3);
+  border-color: var(--accent-border, rgba(59,130,246,0.3));
 }
 
 .vcr-timeline-container {

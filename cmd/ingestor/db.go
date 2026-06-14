@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,6 +82,16 @@ type Store struct {
 
 	sampleIntervalSec int
 	backfillWg        sync.WaitGroup
+
+	// prefixIdx holds the prefix → pubkey index used by the
+	// resolved_path writer (#1547). Rebuilt on startup and once per
+	// neighbor-edges builder tick (60s).
+	prefixIdx prefixIdxHolder
+
+	// neighborGraph holds the in-memory NeighborGraph snapshot used
+	// by the context-aware resolver (#1560). Rebuilt on startup and
+	// once per neighbor-edges builder tick (60s).
+	neighborGraph neighborGraphHolder
 }
 
 // OpenStore opens or creates a SQLite DB at the given path, applying the
@@ -186,7 +197,9 @@ func applySchema(db *sql.DB) error {
 			last_packet_at TEXT DEFAULT NULL,
 			clock_skew_seconds INTEGER DEFAULT NULL,
 			clock_skew_count_24h INTEGER DEFAULT 0,
-			clock_last_naive_at TEXT DEFAULT NULL
+			clock_last_naive_at TEXT DEFAULT NULL,
+			can_relay INTEGER DEFAULT 1,
+			can_relay_seen INTEGER DEFAULT 0
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
@@ -711,13 +724,14 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtInsertObservation, err = s.db.Prepare(`
-		INSERT INTO observations (transmission_id, observer_idx, direction, snr, rssi, score, path_json, timestamp, raw_hex)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO observations (transmission_id, observer_idx, direction, snr, rssi, score, path_json, timestamp, raw_hex, resolved_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(transmission_id, observer_idx, COALESCE(path_json, '')) DO UPDATE SET
-			snr     = COALESCE(excluded.snr,     snr),
-			rssi    = COALESCE(excluded.rssi,    rssi),
-			score   = COALESCE(excluded.score,   score),
-			raw_hex = COALESCE(excluded.raw_hex, raw_hex)
+			snr           = COALESCE(excluded.snr,           snr),
+			rssi          = COALESCE(excluded.rssi,          rssi),
+			score         = COALESCE(excluded.score,         score),
+			raw_hex       = COALESCE(excluded.raw_hex,       raw_hex),
+			resolved_path = COALESCE(excluded.resolved_path, resolved_path)
 	`)
 	if err != nil {
 		return err
@@ -745,8 +759,8 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtUpsertObserver, err = s.db.Prepare(`
-		INSERT INTO observers (id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor)
-		VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO observers (id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, can_relay, can_relay_seen)
+		VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 1), CASE WHEN ? IS NULL THEN 0 ELSE 1 END)
 		ON CONFLICT(id) DO UPDATE SET
 			name = COALESCE(?, name),
 			iata = COALESCE(?, iata),
@@ -758,7 +772,9 @@ func (s *Store) prepareStatements() error {
 			radio = COALESCE(?, radio),
 			battery_mv = COALESCE(?, battery_mv),
 			uptime_secs = COALESCE(?, uptime_secs),
-			noise_floor = COALESCE(?, noise_floor)
+			noise_floor = COALESCE(?, noise_floor),
+			can_relay = COALESCE(?, can_relay),
+			can_relay_seen = CASE WHEN ? IS NULL THEN can_relay_seen ELSE 1 END
 	`)
 	if err != nil {
 		return err
@@ -809,6 +825,21 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	if hash == "" {
 		return false, nil
 	}
+
+	// Wait/hold instrumentation (#1340). The hot path uses prepared
+	// statements that auto-commit; gate the whole function under
+	// writerMu so concurrent mqtt_handler inserts queue behind any
+	// other writer (vacuum, prune, neighbor-builder) and the wait is
+	// Go-visible.
+	mqttWaitStart := time.Now()
+	writerMu.Lock()
+	mqttWait := time.Since(mqttWaitStart)
+	mqttHoldStart := time.Now()
+	defer func() {
+		mqttHold := time.Since(mqttHoldStart)
+		writerMu.Unlock()
+		recordWriterTiming("mqtt_handler", mqttWait, mqttHold, "InsertTransmission")
+	}()
 
 	rxTime := data.Timestamp
 	ingestNow := time.Now().UTC().Format(time.RFC3339)
@@ -872,10 +903,25 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		epochTs = t.Unix()
 	}
 
+	// Resolve hop prefixes to full pubkeys for `observations.resolved_path`.
+	// Per #1547: this writer was lost in the #1289 refactor and lives in
+	// the ingestor now. Per #1560: use the context-aware resolver so
+	// 1-byte prefix collisions are disambiguated via NeighborGraph
+	// adjacency (anchored on from_pubkey for ADVERTs, previous hop
+	// otherwise). Empty resolved JSON → NULL via nilIfEmpty.
+	resolved := resolvePathWithContext(
+		parsePathArray(data.PathJSON),
+		strings.ToLower(data.FromPubkey),
+		s.neighborGraph.load(),
+		s.prefixIdx.load(),
+	)
+	resolvedJSON := marshalResolvedPath(resolved)
+
 	_, err = s.stmtInsertObservation.Exec(
 		txID, observerIdx, data.Direction,
 		data.SNR, data.RSSI, data.Score,
 		data.PathJSON, epochTs, nilIfEmpty(data.RawHex),
+		nilIfEmpty(resolvedJSON),
 	)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
@@ -961,6 +1007,13 @@ type ObserverMeta struct {
 	RecvErrors    *int     // cumulative CRC/decode failures since boot
 	PacketsSent   *int     // cumulative packets sent since boot
 	PacketsRecv   *int     // cumulative packets received since boot
+	// CanRelay reflects the firmware 1.16 /status `repeat` flag (#1290).
+	// nil means the firmware did not send the field — caller must
+	// preserve the existing observers.can_relay value (default 1).
+	// true → relay-capable (`repeat:on`); false → listener-only
+	// (`repeat:off`), which causes the server-side disambiguator to
+	// exclude this observer's pubkey from path-hop candidate sets.
+	CanRelay *bool
 }
 
 // UpsertObserver inserts or updates an observer using the current wall-clock
@@ -983,7 +1036,7 @@ func (s *Store) UpsertObserverAt(id, name, iata string, meta *ObserverMeta, last
 	normalizedIATA := strings.TrimSpace(strings.ToUpper(iata))
 
 	var model, firmware, clientVersion, radio interface{}
-	var batteryMv, uptimeSecs, noiseFloor interface{}
+	var batteryMv, uptimeSecs, noiseFloor, canRelay interface{}
 	if meta != nil {
 		if meta.Model != nil {
 			model = *meta.Model
@@ -1006,11 +1059,22 @@ func (s *Store) UpsertObserverAt(id, name, iata string, meta *ObserverMeta, last
 		if meta.NoiseFloor != nil {
 			noiseFloor = *meta.NoiseFloor
 		}
+		// Issue #1290: nil → leave DB column unchanged (COALESCE in
+		// the prepared stmt); 0/1 written when firmware provided
+		// the `repeat` field. INSERT branch defaults to 1 via the
+		// COALESCE in the VALUES clause.
+		if meta.CanRelay != nil {
+			if *meta.CanRelay {
+				canRelay = 1
+			} else {
+				canRelay = 0
+			}
+		}
 	}
 
 	_, err := s.stmtUpsertObserver.Exec(
-		id, name, normalizedIATA, lastSeen, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor,
-		name, normalizedIATA, ingestNow, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor,
+		id, name, normalizedIATA, lastSeen, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
+		name, normalizedIATA, ingestNow, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
 	)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
@@ -1092,7 +1156,8 @@ func (s *Store) InsertMetrics(data *MetricsData) error {
 // PruneOldMetrics deletes observer_metrics rows older than retentionDays.
 func (s *Store) PruneOldMetrics(retentionDays int) (int64, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339)
-	result, err := s.db.Exec(`DELETE FROM observer_metrics WHERE timestamp < ?`, cutoff)
+	// Tagged for /api/perf writer-lock visibility (#1340).
+	result, err := s.instrumentedExec("prune_metrics", `DELETE FROM observer_metrics WHERE timestamp < ?`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("prune metrics: %w", err)
 	}
@@ -1133,11 +1198,11 @@ func (s *Store) CheckAutoVacuum(cfg *Config) {
 		log.Printf("[db] vacuumOnStartup=true — starting one-time full VACUUM (ensure 2x DB size free disk space)...")
 		start := time.Now()
 
-		if _, err := s.db.Exec("PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
+		if _, err := s.instrumentedExec("vacuum", "PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
 			log.Printf("[db] VACUUM failed: could not set auto_vacuum: %v", err)
 			return
 		}
-		if _, err := s.db.Exec("VACUUM"); err != nil {
+		if _, err := s.instrumentedExec("vacuum", "VACUUM"); err != nil {
 			log.Printf("[db] VACUUM failed: %v", err)
 			return
 		}
@@ -1150,7 +1215,8 @@ func (s *Store) CheckAutoVacuum(cfg *Config) {
 // RunIncrementalVacuum returns free pages to the OS (#919).
 // Safe to call on auto_vacuum=NONE databases (noop).
 func (s *Store) RunIncrementalVacuum(pages int) {
-	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages)); err != nil {
+	// Tagged for /api/perf writer-lock visibility (#1340).
+	if _, err := s.instrumentedExec("vacuum", fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages)); err != nil {
 		log.Printf("[vacuum] incremental_vacuum error: %v", err)
 	}
 }
@@ -1365,14 +1431,15 @@ func (s *Store) RemoveStaleObservers(observerDays int) (int64, error) {
 		return 0, nil // keep forever
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -observerDays).Format(time.RFC3339)
-	result, err := s.db.Exec(`UPDATE observers SET inactive = 1 WHERE last_seen < ? AND (inactive IS NULL OR inactive = 0)`, cutoff)
+	// Tagged for /api/perf writer-lock visibility (#1340).
+	result, err := s.instrumentedExec("prune_observers", `UPDATE observers SET inactive = 1 WHERE last_seen < ? AND (inactive IS NULL OR inactive = 0)`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("mark stale observers inactive: %w", err)
 	}
 	removed, _ := result.RowsAffected()
 	if removed > 0 {
 		// Clean up orphaned metrics for now-inactive observers
-		s.db.Exec(`DELETE FROM observer_metrics WHERE observer_id IN (SELECT id FROM observers WHERE inactive = 1)`)
+		_, _ = s.instrumentedExec("prune_observers", `DELETE FROM observer_metrics WHERE observer_id IN (SELECT id FROM observers WHERE inactive = 1)`)
 		log.Printf("Marked %d observer(s) as inactive (not seen in %d days)", removed, observerDays)
 	}
 	return removed, nil
@@ -1467,7 +1534,15 @@ func scopeNameForDB(data *PacketData) *string {
 // node. Skips the UPDATE when the stored value already matches to avoid
 // redundant writes on the hot MQTT ingest path. Updates both nodes and
 // inactive_nodes to stay consistent.
+//
+// Defense-in-depth (#1534): an empty scope is treated as a no-op. The call
+// site at handleMessage is the primary guard (shouldUpdateDefaultScope),
+// but this layer refuses the invalid write so a future caller cannot
+// reintroduce the bug by passing "" directly.
 func (s *Store) UpdateNodeDefaultScope(pubkey, scope string) error {
+	if scope == "" {
+		return nil
+	}
 	// Short-circuit: skip if already stored.
 	var cur sql.NullString
 	row := s.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey)
@@ -1603,4 +1678,293 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 	}
 
 	return pd
+}
+
+
+// ─── Writer-lock instrumentation (issue #1340) ────────────────────────────
+//
+// Make SQLite writer-lock starvation visible to operators. Per-component
+// wait_ms / hold_ms / contention_total histograms, surfaced via
+// /api/perf/write-sources under the "writer_perf" key. Component tags:
+// neighbor_builder, mqtt_handler, prune_packets, prune_observers,
+// prune_metrics, mbcap_persist (deferred — see PR body), vacuum.
+//
+// The single writer connection (SetMaxOpenConns(1)) means writes serialise
+// inside the driver and the wait is invisible to Go. writerMu measures the
+// wait Go can see (everyone queueing behind the current holder) by gating
+// every wrapped call site through the same package-level mutex.
+
+// WriterStatsSnapshot is a per-component wait/hold latency snapshot
+// surfaced via /api/perf to make SQLite writer-lock starvation visible
+// to operators (issue #1340). Times are in milliseconds.
+type WriterStatsSnapshot struct {
+	Count           int64   `json:"count"`
+	ContentionTotal int64   `json:"contention_total"`
+	WaitMsP50       float64 `json:"wait_ms_p50"`
+	WaitMsP95       float64 `json:"wait_ms_p95"`
+	WaitMsP99       float64 `json:"wait_ms_p99"`
+	WaitMsMax       float64 `json:"wait_ms_max"`
+	HoldMsP50       float64 `json:"hold_ms_p50"`
+	HoldMsP95       float64 `json:"hold_ms_p95"`
+	HoldMsP99       float64 `json:"hold_ms_p99"`
+	HoldMsMax       float64 `json:"hold_ms_max"`
+}
+
+const (
+	// writerSampleWindow bounds the per-component rolling window so a
+	// long-running ingestor doesn't grow this unbounded.
+	writerSampleWindow = 1024
+	// contentionThresholdMs: wait_ms above this counts as a "contended"
+	// write (per #1340 spec).
+	contentionThresholdMs = 100.0
+	defaultSlowWriterMs   = 500.0
+)
+
+// slowWriterThresholdMsAtomic — hold_ms threshold above which writes
+// emit a [db-slow-writer] log line. Read on the hot path; written once
+// at startup by SetSlowWriterThresholdMs.
+var slowWriterThresholdMsAtomic atomic.Uint64
+
+// SetSlowWriterThresholdMs sets the [db-slow-writer] log threshold.
+// ms<=0 restores the 500ms default. Operators can also set
+// CORESCOPE_DB_SLOW_WRITER_MS at process start — see initSlowWriterFromEnv.
+func SetSlowWriterThresholdMs(ms float64) {
+	if ms <= 0 {
+		ms = defaultSlowWriterMs
+	}
+	slowWriterThresholdMsAtomic.Store(uint64(ms))
+}
+
+func getSlowWriterThresholdMs() float64 {
+	v := slowWriterThresholdMsAtomic.Load()
+	if v == 0 {
+		return defaultSlowWriterMs
+	}
+	return float64(v)
+}
+
+// initSlowWriterFromEnv is called once from package init so operators can
+// override the threshold via CORESCOPE_DB_SLOW_WRITER_MS without a
+// Go-side Config change.
+func initSlowWriterFromEnv() {
+	v := os.Getenv("CORESCOPE_DB_SLOW_WRITER_MS")
+	if v == "" {
+		return
+	}
+	var ms float64
+	if _, err := fmt.Sscanf(v, "%f", &ms); err == nil && ms > 0 {
+		SetSlowWriterThresholdMs(ms)
+	}
+}
+
+func init() { initSlowWriterFromEnv() }
+
+type writerComponentStats struct {
+	mu              sync.Mutex
+	count           int64
+	contentionTotal int64
+	waitMs          []float64
+	holdMs          []float64
+	waitMax         float64
+	holdMax         float64
+}
+
+func (c *writerComponentStats) record(waitMs, holdMs float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.count++
+	if waitMs > contentionThresholdMs {
+		c.contentionTotal++
+	}
+	if waitMs > c.waitMax {
+		c.waitMax = waitMs
+	}
+	if holdMs > c.holdMax {
+		c.holdMax = holdMs
+	}
+	c.waitMs = appendBoundedFloat(c.waitMs, waitMs, writerSampleWindow)
+	c.holdMs = appendBoundedFloat(c.holdMs, holdMs, writerSampleWindow)
+}
+
+func appendBoundedFloat(s []float64, v float64, max int) []float64 {
+	if len(s) < max {
+		return append(s, v)
+	}
+	copy(s, s[1:])
+	s[len(s)-1] = v
+	return s
+}
+
+func (c *writerComponentStats) snapshot() WriterStatsSnapshot {
+	c.mu.Lock()
+	wait := append([]float64(nil), c.waitMs...)
+	hold := append([]float64(nil), c.holdMs...)
+	snap := WriterStatsSnapshot{
+		Count:           c.count,
+		ContentionTotal: c.contentionTotal,
+		WaitMsMax:       c.waitMax,
+		HoldMsMax:       c.holdMax,
+	}
+	c.mu.Unlock()
+	sort.Float64s(wait)
+	sort.Float64s(hold)
+	snap.WaitMsP50 = nearestRankPercentile(wait, 0.50)
+	snap.WaitMsP95 = nearestRankPercentile(wait, 0.95)
+	snap.WaitMsP99 = nearestRankPercentile(wait, 0.99)
+	snap.HoldMsP50 = nearestRankPercentile(hold, 0.50)
+	snap.HoldMsP95 = nearestRankPercentile(hold, 0.95)
+	snap.HoldMsP99 = nearestRankPercentile(hold, 0.99)
+	return snap
+}
+
+func nearestRankPercentile(sorted []float64, p float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		return sorted[0]
+	}
+	idx := int(p*float64(n-1) + 0.5)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	return sorted[idx]
+}
+
+type writerStatsAggregator struct {
+	mu         sync.Mutex
+	components map[string]*writerComponentStats
+}
+
+var writerStatsAgg = &writerStatsAggregator{
+	components: make(map[string]*writerComponentStats),
+}
+
+func (a *writerStatsAggregator) get(component string) *writerComponentStats {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	c, ok := a.components[component]
+	if !ok {
+		c = &writerComponentStats{}
+		a.components[component] = c
+	}
+	return c
+}
+
+// reset clears all per-component samples. Test-only: lets a single
+// scenario assert against a clean aggregator without prior-test noise
+// in the same package run (TestWriterStarvationVisibleInPerf would
+// otherwise mix this run's 5 starved samples with thousands of fast
+// InsertTransmission samples from earlier tests and the p99 would
+// collapse below the 50s threshold).
+func (a *writerStatsAggregator) reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.components = make(map[string]*writerComponentStats)
+}
+
+// ResetWriterStatsForTest wipes the per-component writer stats
+// aggregator. Test-only; not safe to call from production code paths.
+func ResetWriterStatsForTest() { writerStatsAgg.reset() }
+
+func (a *writerStatsAggregator) snapshot() map[string]WriterStatsSnapshot {
+	a.mu.Lock()
+	keys := make([]string, 0, len(a.components))
+	stats := make([]*writerComponentStats, 0, len(a.components))
+	for k, v := range a.components {
+		keys = append(keys, k)
+		stats = append(stats, v)
+	}
+	a.mu.Unlock()
+	out := make(map[string]WriterStatsSnapshot, len(keys))
+	for i, k := range keys {
+		out[k] = stats[i].snapshot()
+	}
+	return out
+}
+
+// WriterStatsSnapshot returns a per-component wait/hold/contention
+// snapshot for exposure on /api/perf/write-sources (issue #1340).
+func (s *Store) WriterStatsSnapshot() map[string]WriterStatsSnapshot {
+	return writerStatsAgg.snapshot()
+}
+
+// recordWriterTiming aggregates a single sample under component and
+// emits [db-slow-writer] if hold_ms > configured threshold (default
+// 500ms). queryForLog is truncated to 200 chars.
+func recordWriterTiming(component string, wait, hold time.Duration, queryForLog string) {
+	waitMs := float64(wait.Nanoseconds()) / 1e6
+	holdMs := float64(hold.Nanoseconds()) / 1e6
+	writerStatsAgg.get(component).record(waitMs, holdMs)
+	if holdMs > getSlowWriterThresholdMs() {
+		q := queryForLog
+		if len(q) > 200 {
+			q = q[:200]
+		}
+		log.Printf("[db-slow-writer] component=%s duration=%.1fms query=%s", component, holdMs, q)
+	}
+}
+
+// writerMu serialises every wrapped writer call so the wait the next
+// caller sees is the wait the perf snapshot can attribute. The
+// SQLite driver also enforces serial writes (SetMaxOpenConns(1)),
+// but the wait inside the driver is invisible to Go — writerMu makes
+// it Go-visible.
+var writerMu sync.Mutex
+
+// WriterExec wraps s.db.Exec with per-component wait/hold/contention
+// instrumentation (issue #1340).
+func (s *Store) WriterExec(component, query string, args ...interface{}) (sql.Result, error) {
+	waitStart := time.Now()
+	writerMu.Lock()
+	wait := time.Since(waitStart)
+	holdStart := time.Now()
+	res, err := s.db.Exec(query, args...)
+	hold := time.Since(holdStart)
+	writerMu.Unlock()
+	recordWriterTiming(component, wait, hold, query)
+	return res, err
+}
+
+// WriterTx wraps Begin → fn → Commit under component tagging.
+// hold_ms covers the whole tx so a slow body counts against its owner.
+func (s *Store) WriterTx(component string, fn func(*sql.Tx) error) error {
+	waitStart := time.Now()
+	writerMu.Lock()
+	wait := time.Since(waitStart)
+	holdStart := time.Now()
+	tx, err := s.db.Begin()
+	if err != nil {
+		hold := time.Since(holdStart)
+		writerMu.Unlock()
+		recordWriterTiming(component, wait, hold, "BEGIN")
+		return err
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		hold := time.Since(holdStart)
+		writerMu.Unlock()
+		recordWriterTiming(component, wait, hold, "tx-body")
+		return err
+	}
+	err = tx.Commit()
+	hold := time.Since(holdStart)
+	writerMu.Unlock()
+	recordWriterTiming(component, wait, hold, "COMMIT")
+	return err
+}
+
+// Wrap helpers below tag existing call sites with the canonical
+// component names so the call sites read naturally. These keep the
+// instrumentation out of the hot-path business logic.
+
+// instrumentedExec is the package-internal pass-through used by call
+// sites already inside db.go (PruneOldMetrics, RemoveStaleObservers,
+// vacuum). Equivalent to WriterExec, kept short for readability.
+func (s *Store) instrumentedExec(component, query string, args ...interface{}) (sql.Result, error) {
+	return s.WriterExec(component, query, args...)
 }

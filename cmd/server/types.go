@@ -68,8 +68,6 @@ type StatsResponse struct {
 	Commit             string     `json:"commit"`
 	BuildTime          string     `json:"buildTime"`
 	Counts             RoleCounts `json:"counts"`
-	Backfilling            bool       `json:"backfilling"`
-	BackfillProgress       float64    `json:"backfillProgress"`
 	SignatureDrops         int64      `json:"signatureDrops,omitempty"`
 	HashMigrationComplete  bool       `json:"hashMigrationComplete"`
 
@@ -911,6 +909,11 @@ type ObserverResp struct {
 	ClockSkewSeconds  interface{} `json:"clock_skew_seconds"`
 	ClockSkewCount24h int         `json:"clock_skew_count_24h"`
 	ClockLastNaiveAt  interface{} `json:"clock_last_naive_at"`
+	// Issue #1290: firmware 1.16 `repeat` flag — true=repeater,
+	// false=listener-only, nil=unknown (legacy observer never sent the
+	// field). UI tri-state badge renders nothing when nil so legacy
+	// rows don't masquerade as confirmed repeaters (PR #1624 MAJOR-2).
+	CanRelay *bool `json:"can_relay,omitempty"`
 }
 
 type ObserverListResponse struct {
@@ -992,7 +995,8 @@ type MapConfigResponse struct {
 type ClientConfigResponse struct {
 	Roles              interface{} `json:"roles"`
 	HealthThresholds   interface{} `json:"healthThresholds"`
-	Tiles              interface{} `json:"tiles"`
+	Map                interface{} `json:"map"`
+	Tiles              interface{} `json:"tiles,omitempty"` // deprecated
 	SnrThresholds      interface{} `json:"snrThresholds"`
 	DistThresholds     interface{} `json:"distThresholds"`
 	MaxHopDist         interface{} `json:"maxHopDist"`
@@ -1002,11 +1006,19 @@ type ClientConfigResponse struct {
 	CacheInvalidateMs  interface{} `json:"cacheInvalidateMs"`
 	ExternalUrls       interface{} `json:"externalUrls"`
 	PropagationBufferMs float64         `json:"propagationBufferMs"`
+	LiveMapMaxNodes     int             `json:"liveMapMaxNodes"`
 	Timestamps          TimestampConfig `json:"timestamps"`
 	DebugAffinity       bool            `json:"debugAffinity,omitempty"`
-	// #1420 — server default for dark-tile provider picker. Client uses this
-	// as the fallback when no localStorage override is set.
-	MapDarkTileProvider string `json:"mapDarkTileProvider,omitempty"`
+	MapDarkTileProvider string          `json:"mapDarkTileProvider,omitempty"` // deprecated. TODO: remove after v3.5.0
+	Customizer          CustomizerClientConfig `json:"customizer"`
+}
+
+// CustomizerClientConfig is the operator-side customizer-modal knobs that
+// /api/config/client surfaces to the frontend. Issue #1508. The field is
+// always present (DisabledTabs defaults to an empty slice) so the frontend
+// can blindly call `.disabledTabs.includes(...)` without an undefined guard.
+type CustomizerClientConfig struct {
+	DisabledTabs []string `json:"disabledTabs"`
 }
 
 // ─── IATA Coords ───────────────────────────────────────────────────────────────
