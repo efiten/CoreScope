@@ -115,7 +115,7 @@
   async function load(container, pubkey, days, isInitial) {
     var myGen = ++loadGen;
     current = { pubkey: pubkey, days: days };
-    coverageOn = (typeof getHashParams === 'function' && getHashParams().get('coverage') === '1');
+    coverageOn = window.MC_CLIENT_RX_COVERAGE === true && (typeof getHashParams === 'function' && getHashParams().get('coverage') === '1');
     if (covHandle) { try { covHandle.off(); } catch (e) {} covHandle = null; }
     if (qmap) { qmap.destroy(); qmap = null; }
     if (isInitial) {
@@ -184,16 +184,16 @@
       '<label for="nqIncoming"><input type="checkbox" id="nqIncoming"> incoming <span class="nq-dir">(we hear them)</span></label>' +
       '<label for="nqOutgoing"><input type="checkbox" id="nqOutgoing"> outgoing <span class="nq-dir">(they hear us)</span></label>' +
       '</fieldset>' +
-      '<label for="nqCoverage"><input type="checkbox" id="nqCoverage"' + (coverageOn ? ' checked' : '') + '> coverage <span class="nq-dir">(where clients heard it)</span></label>' +
+      (window.MC_CLIENT_RX_COVERAGE ? '<label for="nqCoverage"><input type="checkbox" id="nqCoverage"' + (coverageOn ? ' checked' : '') + '> coverage <span class="nq-dir">(where clients heard it)</span></label>' : '') +
       '<span id="nqCount" class="nq-count" aria-live="polite"></span>' +
       '<button id="nqPrintBtn" class="btn-primary nq-print-btn">Print / PDF</button>' +
       '</div>' +
-      '<div class="nq-cov-legend nq-noprint" id="nqCovLegend" style="display:' + (coverageOn ? 'flex' : 'none') + '">' +
+      (window.MC_CLIENT_RX_COVERAGE ? '<div class="nq-cov-legend nq-noprint" id="nqCovLegend" style="display:' + (coverageOn ? 'flex' : 'none') + '">' +
       '<span><i style="background:var(--nq-cov-strong)"></i>strong</span>' +
       '<span><i style="background:var(--nq-cov-mid)"></i>medium</span>' +
       '<span><i style="background:var(--nq-cov-weak)"></i>weak</span>' +
       '<span><i style="background:var(--nq-cov-grey)"></i>no signal</span>' +
-      '</div>' +
+      '</div>' : '') +
       '<div id="nqNoGps" class="nq-nogps"></div>' +
       '<div id="nqMap" class="nq-map"></div>' +
       '<table class="nq-table"><thead><tr><th>#</th><th>Neighbour</th><th>we hear</th>' +
@@ -246,7 +246,8 @@
       }
       if (qmap) qmap.setLinks(coverageOn ? [] : lastList);
     }
-    document.getElementById('nqCoverage').addEventListener('change', function (e) {
+    var covCb = document.getElementById('nqCoverage');
+    if (covCb) covCb.addEventListener('change', function (e) {
       coverageOn = e.target.checked;
       setCoverageHash(coverageOn);
       applyCoverage();
