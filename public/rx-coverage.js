@@ -141,6 +141,10 @@
   }
 
   function init(container) {
+    if (!window.MC_CLIENT_RX_COVERAGE) {
+      container.innerHTML = '<div class="nq-msg">Coverage is not enabled on this deployment.</div>';
+      return;
+    }
     destroyed = false; selectedRx = ''; selectedName = ''; days = 7; boardCache = [];
     try {
       var p = (typeof getHashParams === 'function') ? getHashParams() : null;
