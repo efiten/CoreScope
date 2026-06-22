@@ -75,8 +75,55 @@
     </tbody>
   </table>
 
+  <h2>Alternative: radio-actief.be convention</h2>
+  <p>Some operators use the <a href="https://meshcore.radio-actief.be/meshcore-repeater-instellen/" target="_blank">radio-actief.be</a> convention instead — both are used interchangeably and CoreScope decodes either. It shares the <code>CC-LOC</code> prefix but replaces the name/type fields with an operator ID and an optional power-source emoji.</p>
+  <div class="format-box">
+    <span class="field">CC</span>-<span class="field">REGION</span>-<span class="field">OPERATOR-ID</span><span class="field">⚡ emoji</span>
+  </div>
+  <table>
+    <thead><tr><th>Field</th><th>Description</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>CC</code></td><td>ISO 3166-1 country code</td><td><code>BE</code></td></tr>
+      <tr><td><code>REGION</code></td><td>UN/LOCODE city code (or ISO 3166-2 region)</td><td><code>GNE</code>, <code>LGG</code></td></tr>
+      <tr><td><code>OPERATOR-ID</code></td><td>Operator identity (see table below)</td><td><code>RRY01</code>, <code>ON7MHZ</code></td></tr>
+      <tr><td>emoji</td><td>Optional power source (see table below)</td><td>☀️ ⚡️ 🔋</td></tr>
+    </tbody>
+  </table>
+  <p>Maximum total length: <strong>32 characters</strong>.</p>
+
+  <h2>Operator ID Types</h2>
+  <table>
+    <thead><tr><th>Pattern</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>RRY##</code></td><td>Radio-Actief member number</td><td><code>RRY01</code></td></tr>
+      <tr><td><code>ON…</code> (callsign)</td><td>HAM radio callsign</td><td><code>ON7MHZ</code></td></tr>
+      <tr><td><code>#A###</code></td><td>Emergency comms operator</td><td><code>1A001</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Power Source Emoji</h2>
+  <table>
+    <thead><tr><th>Emoji</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>☀️</td><td>Solar-powered with battery</td></tr>
+      <tr><td>⚡️</td><td>Grid-powered only</td></tr>
+      <tr><td>🔋</td><td>Grid-powered with battery backup</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Examples (radio-actief)</h2>
+  <table>
+    <thead><tr><th>Name</th><th>Decoded</th></tr></thead>
+    <tbody>
+      <tr><td><code>BE-GNE-RRY01</code></td><td>Belgium · Gent · Radio-Actief member 01</td></tr>
+      <tr><td><code>BE-VLD-ON7MHZ☀️</code></td><td>Belgium · Oedelem · HAM callsign ON7MHZ · Solar + battery</td></tr>
+      <tr><td><code>BE-LGG-RRY01⚡️</code></td><td>Belgium · Liège · Radio-Actief member 01 · Grid only</td></tr>
+      <tr><td><code>BE-BGS-1A001</code></td><td>Belgium · Brugge · Emergency comms operator</td></tr>
+    </tbody>
+  </table>
+
   <p style="margin-top:40px;color:var(--text-muted);font-size:12px;">
-    Convention defined by <a href="https://nodenet.be/instellingen/naam-repeater/" target="_blank">nodenet.be</a>. CoreScope displays decoded location and type on hover for conforming names.
+    Conventions defined by <a href="https://nodenet.be/instellingen/naam-repeater/" target="_blank">nodenet.be</a> and <a href="https://meshcore.radio-actief.be/meshcore-repeater-instellen/" target="_blank">radio-actief.be</a>. CoreScope displays decoded location, type, operator, and power source on hover for conforming names.
   </p>
 </body>
 </html>

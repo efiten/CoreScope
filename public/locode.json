@@ -16,6 +16,16 @@
     "EMP": "Edge · Mains Powered",
     "RP": "Repeater"
   },
+  "operators": {
+    "ra": "Radio-Actief member",
+    "ham": "HAM callsign",
+    "emcomm": "Emergency comms operator"
+  },
+  "power": {
+    "solar": "Solar + battery",
+    "grid": "Grid only",
+    "gridbattery": "Grid + battery backup"
+  },
   "locations": {
     "BE": {
       "ALB": "Aalbeke",
