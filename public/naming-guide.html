@@ -83,21 +83,38 @@
   <table>
     <thead><tr><th>Field</th><th>Description</th><th>Example</th></tr></thead>
     <tbody>
-      <tr><td><code>CC</code></td><td>ISO 3166-1 country code</td><td><code>BE</code></td></tr>
-      <tr><td><code>REGION</code></td><td>UN/LOCODE city code (or ISO 3166-2 region)</td><td><code>GNE</code>, <code>LGG</code></td></tr>
+      <tr><td><code>CC</code></td><td>ISO 3166-1 country code</td><td><code>BE</code>, <code>DE</code></td></tr>
+      <tr><td><code>REGION</code></td><td>3-letter UN/LOCODE city code, or a 2–3 letter ISO 3166-2 region (e.g. a German Bundesland)</td><td><code>GNE</code>, <code>NW</code></td></tr>
       <tr><td><code>OPERATOR-ID</code></td><td>Operator identity (see table below)</td><td><code>RRY01</code>, <code>ON7MHZ</code></td></tr>
       <tr><td>emoji</td><td>Optional power source (see table below)</td><td>☀️ ⚡️ 🔋</td></tr>
     </tbody>
   </table>
-  <p>Maximum total length: <strong>32 characters</strong>.</p>
+  <p>Maximum total length: <strong>32 characters</strong>. The separator after the region code may be a dash <code>-</code> or a space.</p>
 
   <h2>Operator ID Types</h2>
   <table>
     <thead><tr><th>Pattern</th><th>Meaning</th><th>Example</th></tr></thead>
     <tbody>
       <tr><td><code>RRY##</code></td><td>Radio-Actief member number</td><td><code>RRY01</code></td></tr>
-      <tr><td><code>ON…</code> (callsign)</td><td>HAM radio callsign</td><td><code>ON7MHZ</code></td></tr>
+      <tr><td><code>ON</code> + digit + 2–3 letters</td><td>Belgian HAM callsign (detected anywhere in the name)</td><td><code>ON7MHZ</code></td></tr>
+      <tr><td><code>P[ABCEFGHI]</code> + digit + 2–3 letters</td><td>Dutch HAM callsign</td><td><code>PA3ABC</code></td></tr>
       <tr><td><code>#A###</code></td><td>Emergency comms operator</td><td><code>1A001</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Region Codes (ISO 3166-2)</h2>
+  <p>Besides UN/LOCODE city codes, a region position may hold an ISO 3166-2 region code. German Bundesländer are recognised by their 2-letter code (and <code>NRW</code> as an alias for <code>NW</code>):</p>
+  <table>
+    <thead><tr><th>Code</th><th>Bundesland</th><th>Code</th><th>Bundesland</th></tr></thead>
+    <tbody>
+      <tr><td><code>BW</code></td><td>Baden-Württemberg</td><td><code>NI</code></td><td>Niedersachsen</td></tr>
+      <tr><td><code>BY</code></td><td>Bayern</td><td><code>NW</code> / <code>NRW</code></td><td>Nordrhein-Westfalen</td></tr>
+      <tr><td><code>BE</code></td><td>Berlin</td><td><code>RP</code></td><td>Rheinland-Pfalz</td></tr>
+      <tr><td><code>BB</code></td><td>Brandenburg</td><td><code>SL</code></td><td>Saarland</td></tr>
+      <tr><td><code>HB</code></td><td>Bremen</td><td><code>SN</code></td><td>Sachsen</td></tr>
+      <tr><td><code>HH</code></td><td>Hamburg</td><td><code>ST</code></td><td>Sachsen-Anhalt</td></tr>
+      <tr><td><code>HE</code></td><td>Hessen</td><td><code>SH</code></td><td>Schleswig-Holstein</td></tr>
+      <tr><td><code>MV</code></td><td>Mecklenburg-Vorpommern</td><td><code>TH</code></td><td>Thüringen</td></tr>
     </tbody>
   </table>
 
@@ -119,6 +136,9 @@
       <tr><td><code>BE-VLD-ON7MHZ☀️</code></td><td>Belgium · Oedelem · HAM callsign ON7MHZ · Solar + battery</td></tr>
       <tr><td><code>BE-LGG-RRY01⚡️</code></td><td>Belgium · Liège · Radio-Actief member 01 · Grid only</td></tr>
       <tr><td><code>BE-BGS-1A001</code></td><td>Belgium · Brugge · Emergency comms operator</td></tr>
+      <tr><td><code>BE-VLD ON7MHZ</code></td><td>Belgium · Oedelem · HAM callsign ON7MHZ <em>(space separator)</em></td></tr>
+      <tr><td><code>DE-NW-Köln-EDG-01</code></td><td>Germany · Nordrhein-Westfalen · Edge · unit 01</td></tr>
+      <tr><td><code>NL-RTM-PA3ABC</code></td><td>Netherlands · Rotterdam · HAM callsign PA3ABC</td></tr>
     </tbody>
   </table>
 

@@ -31,9 +31,15 @@ const { parseLocodeName, locodeAttr, buildLocodeHtml } = ctx;
 
 // Data fixture for buildLocodeHtml (mirrors locode.json shape)
 const DATA = {
-  countries: { BE: 'Belgium' },
-  types: { EBP: 'Edge · Battery Powered' },
-  locations: { BE: { GNE: 'Gent', VLD: 'Oedelem', BLZ: 'Bilzen', BGS: 'Brugge' } },
+  countries: { BE: 'Belgium', NL: 'Netherlands', DE: 'Germany' },
+  types: { EBP: 'Edge · Battery Powered', RP: 'Repeater' },
+  locations: {
+    BE: { GNE: 'Gent', VLD: 'Oedelem', BLZ: 'Bilzen', BGS: 'Brugge', ANT: 'Antwerpen', BRE: 'Bree' },
+    NL: { RTM: 'Rotterdam', AMS: 'Amsterdam' },
+  },
+  regions: {
+    DE: { NW: 'Nordrhein-Westfalen', NRW: 'Nordrhein-Westfalen', BY: 'Bayern' },
+  },
   power: { solar: 'Solar + battery', grid: 'Grid only', gridbattery: 'Grid + battery backup' },
   operators: { ra: 'Radio-Actief member', ham: 'HAM callsign', emcomm: 'Emergency comms operator' },
 };
@@ -128,6 +134,48 @@ test('plain LOCODE description not mistaken for operator', () => {
   assert.strictEqual(parseLocodeName('BE-BLZ-SomeNode').operator, null);
 });
 
+// HAM callsign recognition: Belgian ON + digit + 2-3 letters, Dutch P[ABCEFGHI] + digit + 2-3 letters
+test('Belgian callsign ON + digit + 2 letters', () => {
+  const r = parseLocodeName('BE-ANT-ON4AB');
+  assert.strictEqual(r.operator.kind, 'ham'); assert.strictEqual(r.operator.call, 'ON4AB');
+});
+test('Dutch callsign PA + digit + 3 letters', () => {
+  const r = parseLocodeName('NL-RTM-PA3ABC');
+  assert.strictEqual(r.cc, 'NL'); assert.strictEqual(r.loc, 'RTM');
+  assert.strictEqual(r.operator.kind, 'ham'); assert.strictEqual(r.operator.call, 'PA3ABC');
+});
+test('Dutch callsign PH + digit + 2 letters', () => {
+  assert.strictEqual(parseLocodeName('NL-AMS-PH9XY').operator.call, 'PH9XY');
+});
+test('Dutch PD prefix is NOT recognized as callsign', () => {
+  assert.strictEqual(parseLocodeName('NL-RTM-PD3ABC').operator, null);
+});
+// separator after LOCODE may be a space, not only a dash
+test('space separator after LOC: RRY operator parsed', () => {
+  const r = parseLocodeName('BE-GNE RRY01');
+  assert.strictEqual(r.cc, 'BE'); assert.strictEqual(r.loc, 'GNE');
+  assert.strictEqual(r.operator.kind, 'ra'); assert.strictEqual(r.operator.num, '01');
+});
+test('space separator after LOC: callsign parsed', () => {
+  assert.strictEqual(parseLocodeName('BE-VLD ON7MHZ').operator.call, 'ON7MHZ');
+});
+// callsign anywhere in the name, including the " | " suffix on a LOCODE-typed name
+test('callsign in pipe-suffix detected alongside LOCODE type', () => {
+  const r = parseLocodeName('BE-BRE-RP01 | ON8AR');
+  assert.strictEqual(r.type, 'RP');
+  assert.strictEqual(r.operator.kind, 'ham'); assert.strictEqual(r.operator.call, 'ON8AR');
+});
+
+// region codes: 2-letter (ISO 3166-2) as well as 3-letter
+test('2-letter region code DE-NW parses (loc=NW)', () => {
+  const r = parseLocodeName('DE-NW-Cologne-EDG-01');
+  assert.ok(r, 'should parse'); assert.strictEqual(r.cc, 'DE'); assert.strictEqual(r.loc, 'NW');
+});
+test('bare 2-letter region DE-NW parses', () => {
+  const r = parseLocodeName('DE-NW');
+  assert.ok(r); assert.strictEqual(r.loc, 'NW');
+});
+
 // buildLocodeHtml: full tooltip rendering against data
 test('radio-actief full tooltip: country/city + member + power', () => {
   const h = buildLocodeHtml('BE-GNE-RRY01☀️', DATA);
@@ -149,6 +197,32 @@ test('LOCODE tooltip still renders country/city + type label', () => {
 test('unknown city but operator present: still renders operator line', () => {
   const h = buildLocodeHtml('BE-XXX-RRY09', DATA);
   assert.ok(h && h.includes('Radio-Actief member 09'), `got: ${h}`);
+});
+test('Dutch tooltip: country/city + callsign', () => {
+  const h = buildLocodeHtml('NL-RTM-PA3ABC', DATA);
+  assert.ok(h.includes('Netherlands · Rotterdam'), `city: ${h}`);
+  assert.ok(h.includes('HAM callsign: PA3ABC'), `call: ${h}`);
+});
+test('LOCODE-typed name with pipe-suffix callsign shows both type and callsign', () => {
+  const h = buildLocodeHtml('BE-BRE-RP01 | ON8AR', DATA);
+  assert.ok(h.includes('Repeater'), `type: ${h}`);
+  assert.ok(h.includes('HAM callsign: ON8AR'), `call: ${h}`);
+});
+test('German Bundesland tooltip: 2-letter DE-NW -> region name', () => {
+  const h = buildLocodeHtml('DE-NW-Cologne-EDG-01', DATA);
+  assert.ok(h.includes('Germany · Nordrhein-Westfalen'), `got: ${h}`);
+});
+test('German Bundesland tooltip: 3-letter alias DE-NRW -> region name', () => {
+  const h = buildLocodeHtml('DE-NRW', DATA);
+  assert.ok(h && h.includes('Germany · Nordrhein-Westfalen'), `got: ${h}`);
+});
+test('region code wins over a colliding UN/LOCODE city code', () => {
+  // real data: NRW is also a UN/LOCODE city (Neuweier) — Bundesland must win
+  const data = JSON.parse(JSON.stringify(DATA));
+  data.locations.DE = { NRW: 'Neuweier' };
+  const h = buildLocodeHtml('DE-NRW', data);
+  assert.ok(h.includes('Nordrhein-Westfalen'), `region should win: ${h}`);
+  assert.ok(!h.includes('Neuweier'), `city should not show: ${h}`);
 });
 test('nothing resolvable: buildLocodeHtml returns null', () => {
   assert.strictEqual(buildLocodeHtml('SomeRandomName', DATA), null);

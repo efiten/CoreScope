@@ -14,29 +14,44 @@ function parsePower(name) {
   return null;
 }
 
-// radio-actief operator-ID: the segment right after CC-LOC. Trailing non-alnum
-// (e.g. an appended power emoji) is stripped before matching. The embedded digit
-// distinguishes operator-IDs from plain LOCODE city descriptions like "Tabaart".
-function parseOperator(seg) {
+// HAM callsign anywhere in the name. Belgian: ON + digit + 2-3 letters.
+// Dutch: P[ABCEFGHI] + digit + 2-3 letters (PD and other prefixes excluded by
+// design). Tokenised on any non-alphanumeric (dash, space, '|', emoji) so the
+// callsign is found wherever it sits — operator-ID position or " | suffix".
+function findCallsign(name) {
+  const tokens = name.toUpperCase().split(/[^A-Z0-9]+/);
+  for (const t of tokens) {
+    if (/^ON\d[A-Z]{2,3}$/.test(t)) return t;
+    if (/^P[ABCEFGHI]\d[A-Z]{2,3}$/.test(t)) return t;
+  }
+  return null;
+}
+
+// radio-actief member / emergency operator-IDs: the token right after CC-LOC.
+// Trailing non-alnum (e.g. an appended power emoji) is stripped before matching.
+function parseOperatorId(seg) {
   if (!seg) return null;
   const s = seg.replace(/[^A-Za-z0-9].*$/, '').toUpperCase();
   let m;
   if ((m = s.match(/^RRY(\d+)$/))) return { kind: 'ra', num: m[1] };
   if (/^\dA\d+$/.test(s)) return { kind: 'emcomm', code: s };
-  if (/^[A-Z]{1,2}\d[A-Z]{1,4}$/.test(s)) return { kind: 'ham', call: s };
   return null;
 }
 
 function parseLocodeName(name) {
   if (!name || typeof name !== 'string') return null;
   const stripped = name.split(' | ')[0].trim();
-  const m = stripped.match(/^([A-Z]{2})-([A-Z]{3})-/);
+  // CC-LOC: country (2) + location code (2-3 letters — a UN/LOCODE city or an
+  // ISO 3166-2 region). The separator after the code may be a dash, a space, or
+  // the end of the name.
+  const m = stripped.match(/^([A-Z]{2})-([A-Z]{2,3})(?=[-\s]|$)/);
   if (!m) return null;
   const cc = m[1];
   const loc = m[2];
-  const segments = stripped.split('-');
+  // Tokens after the location code; handles both '-' and ' ' separators.
+  const restTokens = stripped.slice(m[0].length).split(/[^A-Za-z0-9]+/).filter(Boolean);
   let type = null;
-  for (const seg of segments.slice(2)) {
+  for (const seg of restTokens) {
     const upper = seg.toUpperCase();
     for (const code of TYPE_CODES) {
       if (upper === code || (upper.startsWith(code) && /^\d+$/.test(upper.slice(code.length)))) {
@@ -47,8 +62,10 @@ function parseLocodeName(name) {
     if (type) break;
   }
   // radio-actief extras (independent of the LOCODE type code; both conventions
-  // share the CC-LOC prefix and are used interchangeably).
-  const operator = type ? null : parseOperator(segments[2]);
+  // share the CC-LOC prefix and are used interchangeably). A HAM callsign may
+  // appear anywhere; RRY/emergency IDs sit in the token right after CC-LOC.
+  const call = findCallsign(name);
+  const operator = call ? { kind: 'ham', call } : parseOperatorId(restTokens[0]);
   const power = parsePower(name);
   return { cc, loc, type, operator, power };
 }
@@ -87,8 +104,11 @@ function buildLocodeHtml(name, data) {
   const { cc, loc, type, operator, power } = parsed;
   const lines = [];
   const countryName = (data.countries || {})[cc];
-  const cityName = countryName && ((data.locations || {})[cc] || {})[loc];
-  if (countryName && cityName) lines.push(`<div class="lc-line1">${countryName} · ${cityName}</div>`);
+  // The location code resolves to an ISO 3166-2 region (e.g. a German Bundesland
+  // like NW / NRW) or a UN/LOCODE city. Regions are checked first so an explicit
+  // region code wins over a colliding city code (NRW is also the city Neuweier).
+  const place = countryName && (((data.regions || {})[cc] || {})[loc] || ((data.locations || {})[cc] || {})[loc]);
+  if (countryName && place) lines.push(`<div class="lc-line1">${countryName} · ${place}</div>`);
   const typeLabel = type && data.types && data.types[type];
   if (typeLabel) lines.push(`<div class="lc-line2">${typeLabel}</div>`);
   const ops = data.operators || {};
