@@ -22,6 +22,17 @@
     } catch (e) { return '#888'; }
   }
 
+  // coverageFillOpacity gives the SNR tier a redundant, non-hue cue (stronger =
+  // more opaque) so colour-blind users can distinguish tiers (#a11y).
+  function coverageFillOpacity(props) {
+    switch (coverageColorVar(props)) {
+      case '--nq-cov-strong': return 0.6;
+      case '--nq-cov-mid': return 0.48;
+      case '--nq-cov-weak': return 0.34;
+      default: return 0.22;
+    }
+  }
+
   // addLayer fetches coverage for the current map bbox/zoom and draws hex
   // polygons. Returns a handle with off() so the caller can remove it.
   function addLayer(map, pubkey) {
@@ -35,22 +46,28 @@
         (fc.features || []).forEach(function (f) {
           var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; }); // [lon,lat]→[lat,lon]
           var col = cssColor(coverageColorVar(f.properties));
-          L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: 0.45 })
+          L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: coverageFillOpacity(f.properties) })
             .addTo(group)
             .bindTooltip('n=' + f.properties.count +
               (f.properties.best_snr != null ? ' · SNR ' + f.properties.best_snr : ' · no signal'));
         });
-      }).catch(function () { /* leave layer empty on error; never crash the reach page */ });
+      }).catch(function (e) {
+        // Leave the layer empty on error; never crash the reach page.
+        console.warn('node-reach-coverage: coverage fetch failed', e);
+      });
     }
-    map.on('moveend zoomend', refresh);
+    // Debounce pan/zoom redraws so dragging doesn't storm the coverage endpoint
+    // (#6). Keep the reference so off() can unbind the same handler.
+    var debouncedRefresh = (typeof debounce === 'function') ? debounce(refresh, 200) : refresh;
+    map.on('moveend zoomend', debouncedRefresh);
     refresh();
     return {
       off: function () {
-        map.off('moveend zoomend', refresh);
+        map.off('moveend zoomend', debouncedRefresh);
         try { map.removeLayer(group); } catch (e) {}
       }
     };
   }
 
-  window.NodeReachCoverage = { coverageColorVar: coverageColorVar, addLayer: addLayer };
+  window.NodeReachCoverage = { coverageColorVar: coverageColorVar, coverageFillOpacity: coverageFillOpacity, addLayer: addLayer };
 })();

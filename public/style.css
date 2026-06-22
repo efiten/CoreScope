@@ -247,6 +247,15 @@
   --accent-border: rgba(59, 130, 246, 0.25);
   --geo-filter-color: #3b82f6;
   --status-green: #22c55e;
+  /* #1719 — `--status-green` (#22c55e) is the BACKGROUND swatch hue
+     (used as `background:` on badges + dots over white card surfaces).
+     As TEXT on a white .analytics-stat-card it is only 2.28:1 (BLOCKER).
+     `--status-green-text` is the text-only variant for surfaces that
+     render numbers/labels in the green palette over light cards — pinned
+     to palette-green-700 (#15803d) → 5.06:1 on #fff (AA pass). Dark
+     theme overrides keep the bright #22c55e since it reads ≥6:1 on the
+     card-bg #232340. */
+  --status-green-text: var(--palette-green-700, #15803d);
   --status-yellow: #eab308;
   --status-red: #ef4444;
   --status-orange: #f97316;
@@ -254,12 +263,31 @@
   --status-amber: #f59e0b;
   --status-amber-light: #fef3c7;
   --status-amber-text: #92400e;
+  /* #1719 — `--skew-badge-no-clock-bg` carries the muted "no clock data"
+     badge background (was --text-muted which renders #d1d5db in dark
+     theme → #fff text = 1.47:1, BLOCKER × 137 on clock-health). Pinned
+     to palette-gray-600 (#4b5563) so #fff text reads 7.56:1 on both
+     themes (light: 7.56:1, dark: 7.56:1). */
+  --skew-badge-no-clock-bg: var(--palette-gray-600, #4b5563);
   /* #1648 M6 (M4 CDP carry-forward): named token for the neutral/info
      accent used as the unrolled-route hop fallback color (was #3b82f6
      baked in route-render.js). Themes via dark-mode block below. */
   --status-info: #3b82f6;
   --path-inspector-speculative: #d97706;
-  --role-observer: #8b5cf6;
+  /* #1715 — neighbor-graph role swatches (`#ngRoleChecks` labels) read
+   * these tokens via the role-suffixed `.role-swatch--ROLE` class (analytics.js).
+   * Light-theme values are palette-700 shades that clear WCAG AA ≥4.5:1
+   * against the white analytics surface (#ffffff). Dark-theme overrides
+   * live in the [data-theme="dark"] block further down and use palette-400
+   * shades that clear AA against the dark card-bg (#1a1a2e). Keeping the
+   * swatch palette as CSS custom properties is what kept #1715 from
+   * regressing — never reintroduce inline `style="color:#..."` on these
+   * spans. */
+  --role-repeater:  #dc2626;  /* 4.83:1 on #fff */
+  --role-companion: #2563eb;  /* 5.17:1 on #fff */
+  --role-room:      #15803d;  /* 5.02:1 on #fff */
+  --role-sensor:    #b45309;  /* 5.02:1 on #fff */
+  --role-observer:  #7c3aed;  /* 5.70:1 on #fff */
   --accent-hover: #6db3ff;
   --text: #1a1a2e;
   /* #1668 M2 — bumped from #5b6370 (~5.7:1 on white) to palette-gray-700
@@ -355,6 +383,11 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --status-green: #22c55e;
+    /* #1719 — on dark card-bg (#232340) #22c55e gives 6.65:1, AA pass.
+       Keep the bright hue for text rather than darkening it. */
+    --status-green-text: #22c55e;
+    /* #1719 — keep --skew-badge-no-clock-bg dark enough for #fff text. */
+    --skew-badge-no-clock-bg: var(--palette-gray-600, #4b5563);
     --status-yellow: #eab308;
     --status-red: #ef4444;
     --status-orange: #f97316;
@@ -363,6 +396,15 @@
     --status-amber-light: #422006;
     --status-amber-text: #fcd34d;
     --path-inspector-speculative: #f59e0b;
+    /* #1715 — dark-theme role swatch overrides. Light values (palette-700)
+     * fail 4.5:1 on the dark analytics card-bg #1a1a2e (e.g. #dc2626 →
+     * 3.53:1). Palette-400/500 shades clear AA on dark. Mirror these in
+     * the [data-theme="dark"] block below. */
+    --role-repeater:  #ef4444;  /* 4.53:1 on #1a1a2e */
+    --role-companion: #3b82f6;  /* 4.64:1 on #1a1a2e */
+    --role-room:      #16a34a;  /* 5.18:1 on #1a1a2e */
+    --role-sensor:    #d97706;  /* 5.35:1 on #1a1a2e */
+    --role-observer:  #a78bfa;  /* 6.27:1 on #1a1a2e */
     --status-info: #60a5fa;
     /* #1668 M5 — bump link text up two stops on dark surfaces (4a9eff
        was OK but borderline on card-bg; #60a5fa = palette-blue-400 ≈
@@ -407,6 +449,9 @@
   --link-weak: #f85149;
   --link-oneway: #768390;
   --status-green: #22c55e;
+  /* #1719 — see :root[prefers-color-scheme:dark] block; mirror here. */
+  --status-green-text: #22c55e;
+  --skew-badge-no-clock-bg: var(--palette-gray-600, #4b5563);
   --status-yellow: #eab308;
   --status-red: #ef4444;
   --status-orange: #f97316;
@@ -415,6 +460,13 @@
   --status-amber-light: #422006;
   --status-amber-text: #fcd34d;
   --status-info: #60a5fa;
+  /* #1715 — dark-theme role swatch overrides (mirrors the media-query
+   * block above). Palette-400/500 shades clear WCAG AA on #1a1a2e. */
+  --role-repeater:  #ef4444;  /* 4.53:1 on #1a1a2e */
+  --role-companion: #3b82f6;  /* 4.64:1 on #1a1a2e */
+  --role-room:      #16a34a;  /* 5.18:1 on #1a1a2e */
+  --role-sensor:    #d97706;  /* 5.35:1 on #1a1a2e */
+  --role-observer:  #a78bfa;  /* 6.27:1 on #1a1a2e */
   /* #1668 M5 — see :root[data-theme="dark"] media block above for rationale */
   --link-color: var(--palette-blue-400);
   --success: var(--palette-green-400, #4ade80);
@@ -2899,7 +2951,8 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
   transition: background 0.1s;
 }
 .node-filter-option:hover { background: var(--surface-2, rgba(255,255,255,0.08)); }
-.node-filter-option.node-filter-active { background: var(--accent); color: #fff; }
+/* .node-filter-option.node-filter-active — #1719 round-1 polish: bg/color
+   consolidated into the .btn-active-accent rule. */
 
 /* Hide low-value columns on mobile */
 @media (max-width: 640px) {
@@ -2997,8 +3050,22 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .subpath-meta { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; }
 .subpath-section { margin: 16px 0; }
 .subpath-section h5 { margin: 0 0 6px; font-size: 0.9em; }
-.subpath-selected { background: var(--accent, #3b82f6) !important; color: #fff; }
-.subpath-selected .hop-prefix { color: rgba(255,255,255,0.6); }
+/* #1705 — was background:var(--accent) (#4a9eff) + color:#fff = 2.75:1, and
+   the muted hop-prefix line at rgba(255,255,255,0.6) composited over that
+   accent to 1.87:1 (hard BLOCKER). Pin the row to --accent-strong
+   (#2563eb, palette-blue-600) with --text-on-accent (#f9fafb): primary
+   text 4.95:1, hop-prefix at --text-on-accent (full alpha) on the same
+   bg = 4.95:1 — clears WCAG AA (≥4.5:1). The hop-prefix used to be
+   visually "muted" via 60% alpha white; we drop the alpha-muting because
+   no other token in either theme composites to ≥4.5:1 on this background.
+   Trade-off accepted: the prefix and primary line are now equal-weight
+   visually — the previous secondary styling was itself the source of the
+   1.87:1 BLOCKER, so visual hierarchy here is recovered via type/weight,
+   not color.
+   #1719 polish r1: !important on color also, to consolidate with
+   .btn-active-accent override pattern. */
+.subpath-selected { background: var(--accent-strong) !important; color: var(--text-on-accent) !important; }
+.subpath-selected .hop-prefix { color: var(--text-on-accent); }
 tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 
 /* Hour distribution chart */
@@ -3053,7 +3120,7 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 /* Subpath jump nav */
 .subpath-jump-nav { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; font-size: 0.9em; flex-wrap: wrap; }
 .subpath-jump-nav span { color: var(--text-muted); }
-.subpath-jump-nav a { padding: 4px 12px; border-radius: 4px; background: var(--accent, #3b82f6); color: #fff; text-decoration: none; font-size: 0.85em; }
+.subpath-jump-nav a { padding: 4px 12px; border-radius: 4px; text-decoration: none; font-size: 0.85em; }
 .subpath-jump-nav a:hover { opacity: 0.8; }
 
 /* Route patterns table breathing room */
@@ -3272,7 +3339,8 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .analytics-heatmap-label { font-size: 10px; color: var(--text-muted); display: flex; align-items: center; }
 .analytics-time-range { display: flex; gap: 8px; margin-bottom: 16px; }
 .analytics-time-range button { padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--card-bg); color: var(--text); cursor: pointer; font-size: 12px; }
-.analytics-time-range button.active { background: var(--accent); color: white; border-color: var(--accent); }
+/* .analytics-time-range button.active — #1719 round-1 polish: bg/color
+   consolidated into the .btn-active-accent rule. */
 .analytics-peer-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .analytics-peer-table th { text-align: left; padding: 6px 8px; border-bottom: 2px solid var(--border); color: var(--text-muted); font-size: 11px; text-transform: uppercase; }
 .analytics-peer-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
@@ -4038,7 +4106,27 @@ button.region-pill-active:hover { opacity: 0.85; color: var(--text-on-accent); }
   cursor: pointer; font-size: 12px; transition: background 0.15s;
 }
 .rf-range-btn:hover { background: var(--bg-hover, #333); }
-.rf-range-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* #1719 — consolidated active-button accent: was background:var(--accent)
+   (#4a9eff) + color:#fff = 2.75:1 (BLOCKER × N selectors). All four
+   recurring sites (.rf-range-btn.active, .clock-filter-btn.active,
+   .subpath-jump-nav a, inline ptCheckBtn / ptGenBtn) now route through
+   the shared `.btn-active-accent` style or this same token pair so a
+   future regression is fixable in one place. --accent-strong
+   (#2563eb) + --text-on-accent (#f9fafb) = 8.59:1 (AA pass). */
+.btn-active-accent,
+.rf-range-btn.active,
+.clock-filter-btn.active,
+.subpath-jump-nav a,
+/* #1719 round-1 polish: three additional active-state surfaces
+   consolidated here. Their inline `background:var(--accent); color:#fff`
+   rules (2.75:1) are removed below — they now inherit this token pair. */
+.node-filter-option.node-filter-active,
+.subpath-selected,
+.analytics-time-range button.active {
+  background: var(--accent-strong);
+  color: var(--text-on-accent);
+  border-color: var(--accent-strong);
+}
 .rf-custom-inputs { display: inline-flex; gap: 4px; align-items: center; margin-left: 8px; }
 .rf-datetime {
   padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px;
@@ -4292,7 +4380,7 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .skew-badge--warning { background: var(--status-yellow); color: #000; }
 .skew-badge--critical { background: var(--status-orange); color: #fff; }
 .skew-badge--absurd { background: var(--status-purple); color: #fff; }
-.skew-badge--no_clock { background: var(--text-muted); color: #fff; }
+.skew-badge--no_clock { background: var(--skew-badge-no-clock-bg); color: #fff; }
 .skew-badge--bimodal_clock { background: var(--status-amber-light); color: var(--status-amber-text); border: 1px solid var(--status-amber); }
 
 .skew-detail-section { padding: 10px 16px; margin-bottom: 8px; }
@@ -4306,7 +4394,6 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .clock-fleet-row--no_clock { background: color-mix(in srgb, var(--text-muted) 10%, transparent); }
 
 .clock-filter-btn { font-size: 12px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--card-bg, #fff); color: var(--text); cursor: pointer; margin-right: 4px; }
-.clock-filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
 /* === Path Inspector (issue #944) === */
 .path-inspector-page { padding: 16px; max-width: 900px; margin: 0 auto; }
@@ -5449,3 +5536,20 @@ body.embed #app.app-fixed {
   margin: 0;
   padding: 0.1rem 0;
 }
+
+/* ============================================================
+ * #1715 — Neighbor-graph role swatches (`#ngRoleChecks` labels).
+ *
+ * Replaces inline `style="color:#..."` spans (which bypassed the
+ * theme tokens entirely and produced different contrast results
+ * on light vs dark) with class-based DOM. The `--role-*` tokens
+ * are defined per-theme in :root + [data-theme="dark"] above and
+ * clear WCAG AA ≥4.5:1 against #ffffff (light) and #1a1a2e (dark).
+ * Never reintroduce inline color hex on these swatches.
+ * ============================================================ */
+.role-swatch        { color: var(--text, inherit); }
+.role-swatch--repeater  { color: var(--role-repeater); }
+.role-swatch--companion { color: var(--role-companion); }
+.role-swatch--room      { color: var(--role-room); }
+.role-swatch--sensor    { color: var(--role-sensor); }
+.role-swatch--observer  { color: var(--role-observer); }

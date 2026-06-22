@@ -5,7 +5,34 @@ Crowdsourced RF coverage from mobile clients: a phone connects over BLE to a Mes
 with the phone's GPS position, and publishes it to MQTT. CoreScope ingests these into
 `client_receptions` and renders per-node H3-style hex coverage on the Reach page.
 
-This is the contract the mobile capture app (separate repo, "Plan 2") implements.
+## Companion app — where to get it
+
+The mobile capture side is **[corescope-rx](https://github.com/efiten/corescope-rx)** — an
+open-source (GPL-3.0) Android PWA. Operators who enable coverage point their users at it: it connects
+over BLE to a MeshCore companion radio, captures directly-heard nodes + the phone's GPS, and publishes
+the payload defined below. It's self-hostable and generic — a runtime `config.json` aims it at your
+own MQTT broker + CoreScope instance (see its README).
+
+## Enabling coverage (operators)
+
+Coverage is **off by default**. To turn it on:
+
+1. In CoreScope's `config.json`, set `"clientRxCoverage": { "enabled": true }` and restart the server
+   and ingestor. This is a **single flag read by both processes** — the ingestor and server each parse
+   the same `config.json`, so you set `clientRxCoverage.enabled` once and it gates both the ingest write
+   path and the read endpoints. There is no separate per-process flag.
+2. **Required: an ACL-capable broker.** Bind `meshcore/client/{PUBLIC_KEY}/packets` so each client may
+   publish **only** under its own pubkey (e.g. an EMQX ACL keyed on the connected client's identity).
+   This is the trust boundary, not an optimization — see [Trust](#trust). The ingestor already
+   subscribes under `meshcore/#`.
+3. Optionally set `retention.clientRxDays` to bound the coverage tables (see
+   [Storage](#storage--client_receptions-ingestor-owned)).
+4. Point your users at [corescope-rx](https://github.com/efiten/corescope-rx) and they start
+   contributing. Results show on each node's Reach page (coverage toggle) and the `#/rx-coverage`
+   dashboard. **Warn them first that their contribution is world-readable and a per-observer view can
+   reconstruct their movements — see [Privacy](#privacy--contributor-location-is-public).**
+
+The rest of this document is the MQTT payload contract the companion app implements.
 
 ## Companion BLE source (verified against firmware)
 
@@ -88,6 +115,14 @@ client_receptions(
 `heard_keylen` is 32 for a full pubkey (0-hop advert) or 2/3 for a multibyte prefix. `src` is
 `advert` or `rxlog`. No hex cell is stored — binning is computed server-side from lat/lon.
 
+Indexes: a composite `(heard_key, heard_keylen, lat, lon)` and a `(lat, lon)` index back the coverage
+queries; the per-node query matches a sargable `heard_key IN (pubkey, prefix6, prefix4)` list so the
+composite is used instead of a table scan (see the benchmark in `cmd/ingestor`).
+
+Retention: the table grows on every submission, so set `retention.clientRxDays` (ingestor) to delete
+rows older than N days (and stale `client_observers`); `0` disables it. Without it the table is
+unbounded.
+
 ## Read API — coverage GeoJSON
 
 `GET /api/nodes/{pubkey}/rx-coverage?bbox={minLat,minLon,maxLat,maxLon}&z={zoom}`
@@ -98,14 +133,22 @@ server-side (read-only). Each feature:
 ```json
 { "type": "Feature",
   "geometry": { "type": "Polygon", "coordinates": [[[lon,lat], ...]] },
-  "properties": { "cell": "9:123:-45", "count": 7, "best_snr": -6, "has_sig": true } }
+  "properties": { "cell": "9:123:-45", "count": 7, "best_snr": -6, "has_sig": true,
+                  "nodes": [{ "prefix": "aabbcc", "name": "Alice", "snr": -6, "count": 3 }],
+                  "nodes_truncated": false } }
 ```
 
 - Hex binning is a pure-Go pointy-top grid over Web Mercator (`cmd/server/hexgrid.go`). We do **not**
-  use `uber/h3-go` because it is CGO and the project builds with `CGO_ENABLED=0`.
+  use `uber/h3-go` because it is CGO and the project builds with `CGO_ENABLED=0`. Latitude is only
+  defined within ±85.05° (Web Mercator limit) and is clamped to that range.
 - `z` (Leaflet zoom) selects the hex resolution (zoom-adaptive). Raw points never leave the server
   (privacy: contributors' tracks are not exposed).
 - `best_snr` / `has_sig` drive the colour: green→orange by best SNR, grey when no signal metric.
+- Features are sorted by `cell` for a deterministic (cacheable) payload.
+- **Bounds:** the per-cell `nodes` list is capped (with `nodes_truncated`), and the collection is
+  capped at a fixed feature count — when exceeded, the densest cells are kept and the top-level
+  `truncated` flag is set. The per-node endpoint also returns `mobile_receptions` and `mobile_clients`
+  totals (node-wide, independent of the bbox).
 
 ## Frontend
 
@@ -116,10 +159,50 @@ frontend dependencies. Colours come from CSS variables in `public/node-reach.css
 
 ## Trust
 
-Identity = the companion pubkey (`rx_pubkey`). The broker ACL binds each client to its own
-`{PUBLIC_KEY}` topic, so a client can only contribute under the key it physically holds. Optional
-future hardening: have the companion sign a broker-issued token (the firmware exposes on-device
-signing) — not required for the MVP.
+Identity = the companion pubkey (`rx_pubkey`), taken from the `{PUBLIC_KEY}` topic segment.
+
+**The feature requires an ACL-capable broker.** The reported GPS position is the contributor's own
+claim, so the only thing anchoring a reception to a real identity is the broker ACL binding
+`meshcore/client/{PUBLIC_KEY}/packets` to the client that holds that key. **Without such an ACL, the
+topic — and therefore the GPS and the heard-node attribution — is spoofable:** anyone who can publish
+to the broker could inject coverage under any pubkey. Do not enable this feature on an open/no-ACL
+broker if you trust the resulting map.
+
+Server/ingestor-side defense-in-depth (these reduce blast radius but do **not** replace the ACL):
+
+- The ingestor rejects any topic pubkey that is not lowercase hex before writing, and never falls back
+  to a payload-supplied id (`cmd/ingestor/client_reception.go`, #2/#10).
+- A blacklisted operator cannot contribute via the client topic (the blacklist is enforced before the
+  coverage write, #1).
+- The frontend HTML-escapes the pubkey it renders, so a junk pubkey can't inject markup (#14).
+- `/api/nodes/resolve` and coverage tooltips never reveal blacklisted or hidden-prefix node identities
+  (#15).
+
+## Privacy — contributor location is public
+
+⚠️ **Enabling coverage publishes contributors' GPS-tagged receptions, and the per-observer view can
+reconstruct a contributor's movements.** The hex map is read without authentication. The leaderboard
+exposes each companion's pubkey, and clicking one filters the map to that single companion
+(`/api/rx-coverage?rx=<pubkey>`); at high zoom over the retention window this is effectively a public
+movement trail (home / work / commute) of whoever carries that companion. **A pseudonymous companion
+name does not mitigate this** — the *locations themselves* are identifying (overnight clustering = home),
+and all of one contributor's points are linked by the pubkey.
+
+This is an accepted tradeoff of the feature, not a bug: fine resolution is what makes the aggregate
+coverage map useful, the feature is opt-in and OFF by default, and contributors choose to run the
+companion. But the consent must be **informed**:
+
+- **Operators:** tell your users, before they contribute, that their coverage (including a per-observer
+  view of their own track) is world-readable for as long as `retention.clientRxDays` keeps it.
+- **Contributors:** do not contribute from a device you carry on your person if a public record of where
+  you have been is a concern. Use a dedicated/stationary node, or accept that the trail is public.
+
+Operators who want to harden this further can lower `retention.clientRxDays`, run the dashboard behind
+their own auth/proxy, or (future hardening) coarsen stored coordinates / apply a k-anonymity threshold
+to the per-observer view.
+
+Optional future hardening: have the companion sign a broker-issued token (the firmware exposes
+on-device signing) — not required for the MVP, tracked as a follow-up.
 
 ## Configurable values (future customizer)
 

@@ -22,12 +22,12 @@
     return '--nq-cov-weak';
   }
 
-  function dayBtn(d) { return '<button data-days="' + d + '"' + (d === days ? ' class="active"' : '') + '>' + (d === 1 ? '24h' : d + 'd') + '</button>'; }
+  function dayBtn(d) { return '<button data-days="' + d + '"' + (d === days ? ' class="active"' : '') + ' aria-pressed="' + (d === days ? 'true' : 'false') + '">' + (d === 1 ? '24h' : d + 'd') + '</button>'; }
 
   function pageHtml() {
     return '<div style="max-width:1100px;margin:0 auto;padding:12px 16px">' +
       '<h2 style="margin:4px 0 2px;font-size:18px">🗺️ Mobile RX coverage</h2>' +
-      '<div style="color:var(--text-muted);font-size:11px">Where roaming CoreScope-RX clients heard nodes. Colour = best signal per cell.</div>' +
+      '<div style="color:var(--text-muted);font-size:11px">Where roaming CoreScope-RX clients heard nodes. Colour = best signal per cell. <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a></div>' +
       '<div class="analytics-time-range" id="rxDays" style="margin:8px 0">' + dayBtn(1) + dayBtn(7) + dayBtn(14) + dayBtn(30) + '</div>' +
       '<div class="nq-cov-legend"><span><i style="background:var(--nq-cov-strong)"></i>strong</span><span><i style="background:var(--nq-cov-mid)"></i>medium</span><span><i style="background:var(--nq-cov-weak)"></i>weak</span><span><i style="background:var(--nq-cov-grey)"></i>no signal</span></div>' +
       '<div id="rxMap" style="height:60vh;min-height:360px;border:1px solid var(--border,#d0d7de);border-radius:6px;margin:8px 0"></div>' +
@@ -62,6 +62,18 @@
     return head + '<div style="min-width:180px">' + rows + '</div>' + more;
   }
 
+  // fillOpacityFor adds a redundant, non-hue cue to the SNR tier so the map is
+  // distinguishable for colour-blind users (orange vs red): stronger signal =
+  // more opaque. Pairs with the hue and the per-cell SNR in the tooltip (#a11y).
+  function fillOpacityFor(p) {
+    switch (colorVar(p)) {
+      case '--nq-cov-strong': return 0.6;
+      case '--nq-cov-mid': return 0.48;
+      case '--nq-cov-weak': return 0.34;
+      default: return 0.22;
+    }
+  }
+
   function drawCoverage() {
     if (!map || destroyed) return;
     var b = map.getBounds();
@@ -73,28 +85,90 @@
       (fc.features || []).forEach(function (f) {
         var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
         var col = cssColor(colorVar(f.properties));
-        L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: 0.45 }).addTo(covLayer)
+        L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: fillOpacityFor(f.properties) }).addTo(covLayer)
           .bindTooltip(coverageNodesHtml(f.properties));
       });
-    }).catch(function () {});
+    }).catch(function (e) { console.warn('rx-coverage: coverage fetch failed', e); });
+  }
+
+  // Leaderboard sort state. Default = frontier score, descending. The rank (#)
+  // column is not sortable (it just reflects the current order). Numeric columns
+  // default to descending on first click; the name column to ascending.
+  var boardSort = { key: 'score', dir: 'desc' };
+  var BOARD_COLS = [
+    { key: 'name', label: 'Observer (companion)', cls: 'rxb-name' },
+    { key: 'score', label: 'score', cls: 'rxb-score',
+      title: 'Score telt je gedekte cellen, waarbij elke cel zwaarder weegt naarmate minder andere waarnemers ze bereikt hebben — grensverleggende dekking weegt meer dan drukke zones opnieuw afrijden.' },
+    { key: 'cells', label: 'cells', cls: 'rxb-cells',
+      title: 'Aantal unieke ~150 m-cellen waar deze waarnemer iets hoorde.' },
+    { key: 'nodes', label: 'nodes', cls: 'rxb-nodes' },
+    { key: 'receptions', label: 'pkts', cls: 'rxb-rec' }
+  ];
+
+  function sortBoard() {
+    var k = boardSort.key, dir = boardSort.dir === 'asc' ? 1 : -1;
+    boardCache.sort(function (a, b) {
+      if (k === 'name') {
+        var an = (a.name || a.pubkey).toLowerCase(), bn = (b.name || b.pubkey).toLowerCase();
+        return an < bn ? -dir : an > bn ? dir : 0;
+      }
+      return (Number(a[k]) - Number(b[k])) * dir;
+    });
+  }
+
+  function boardHeadHtml() {
+    var cells = BOARD_COLS.map(function (c) {
+      var arrow = boardSort.key === c.key ? (boardSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+      return '<span class="' + c.cls + ' rxb-sort" data-sort="' + c.key + '"' +
+        (c.title ? ' title="' + escapeHtml(c.title) + '"' : '') +
+        ' role="button" tabindex="0">' + escapeHtml(c.label) + arrow + '</span>';
+    }).join('');
+    return '<div class="rxb-row rxb-head"><span class="rxb-rank">#</span>' + cells + '</div>';
   }
 
   function renderBoard() {
     var el = document.getElementById('rxBoard');
     if (!el) return;
     if (!boardCache.length) { el.innerHTML = '<div class="muted" style="color:var(--text-muted);font-size:13px">No mobile observers in this window yet.</div>'; return; }
+    sortBoard();
     var rows = boardCache.map(function (o, i) {
-      var nm = o.name ? escapeHtml(o.name) : (o.pubkey.slice(0, 10) + '…');
-      return '<div class="rxb-row' + (o.pubkey === selectedRx ? ' sel' : '') + '" data-rx="' + o.pubkey + '" data-name="' + escapeHtml(o.name || '') + '">' +
+      var nm = o.name ? escapeHtml(o.name) : (escapeHtml(o.pubkey.slice(0, 10)) + '…');
+      return '<div class="rxb-row' + (o.pubkey === selectedRx ? ' sel' : '') + '" data-rx="' + escapeHtml(o.pubkey) + '" data-name="' + escapeHtml(o.name || '') + '"' +
+        ' role="button" tabindex="0" aria-pressed="' + (o.pubkey === selectedRx ? 'true' : 'false') + '" aria-label="Show coverage for ' + escapeHtml(o.name || o.pubkey.slice(0, 10)) + '">' +
         '<span class="rxb-rank">' + (i + 1) + '</span><span class="rxb-name">' + nm + '</span>' +
-        '<span class="rxb-rec">' + o.receptions + '</span><span class="rxb-nodes">' + o.nodes + '</span></div>';
+        '<span class="rxb-score">' + Number(o.score).toFixed(1) + '</span>' +
+        '<span class="rxb-cells">' + o.cells + '</span>' +
+        '<span class="rxb-nodes">' + o.nodes + '</span>' +
+        '<span class="rxb-rec">' + o.receptions + '</span></div>';
     }).join('');
     el.innerHTML = (selectedRx ? '<button id="rxAll" class="btn-primary" style="margin:0 0 8px">← Show all observers</button>' : '') +
-      '<div class="rxb-row rxb-head"><span class="rxb-rank">#</span><span class="rxb-name">Observer (companion)</span><span class="rxb-rec">pkts</span><span class="rxb-nodes">nodes</span></div>' + rows;
+      boardHeadHtml() + rows;
+    // Column sort handlers (click + keyboard).
+    el.querySelectorAll('.rxb-sort[data-sort]').forEach(function (h) {
+      function applySort() {
+        var k = h.dataset.sort;
+        if (boardSort.key === k) {
+          boardSort.dir = boardSort.dir === 'asc' ? 'desc' : 'asc';
+        } else {
+          boardSort.key = k;
+          boardSort.dir = (k === 'name') ? 'asc' : 'desc';
+        }
+        renderBoard();
+      }
+      h.addEventListener('click', applySort);
+      h.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); applySort(); }
+      });
+    });
+    // Row click-to-filter (preserved from the original).
     el.querySelectorAll('.rxb-row[data-rx]').forEach(function (r) {
-      r.addEventListener('click', function () {
+      function activate() {
         selectedRx = r.dataset.rx; selectedName = r.dataset.name || '';
         renderBoard(); fitToObserver(); syncHash();
+      }
+      r.addEventListener('click', activate);
+      r.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); activate(); }
       });
     });
     var all = document.getElementById('rxAll');
@@ -120,12 +194,17 @@
       if (!any) { drawCoverage(); return; } // observer has no data in window → keep view
       map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [30, 30], maxZoom: 15 });
       drawCoverage(); // fitBounds may not fire moveend if the view is unchanged
-    }).catch(function () { drawCoverage(); });
+    }).catch(function (e) { console.warn('rx-coverage: observer extent fetch failed', e); drawCoverage(); });
   }
 
   function loadBoard() {
     fetch('/api/rx-leaderboard?days=' + days + '&limit=25').then(function (r) { return r.json(); })
-      .then(function (d) { if (destroyed) return; boardCache = d.observers || []; renderBoard(); }).catch(function () {});
+      .then(function (d) { if (destroyed) return; boardCache = d.observers || []; renderBoard(); })
+      .catch(function (e) {
+        console.warn('rx-coverage: leaderboard fetch failed', e);
+        var el = document.getElementById('rxBoard');
+        if (el) el.innerHTML = '<div class="muted" style="color:var(--text-muted);font-size:13px">Could not load mobile observers.</div>';
+      });
   }
 
   function setDays(d) {
@@ -141,11 +220,21 @@
   }
 
   function init(container) {
+    destroyed = false;
+    // A direct land on #/rx-coverage can run before MeshConfigReady resolves, at
+    // which point MC_CLIENT_RX_COVERAGE is still undefined and the page would
+    // wrongly show "not enabled". Defer until server config is loaded (#13).
+    Promise.resolve(window.MeshConfigReady).then(function () {
+      if (!destroyed) start(container);
+    });
+  }
+
+  function start(container) {
     if (!window.MC_CLIENT_RX_COVERAGE) {
       container.innerHTML = '<div class="nq-msg">Coverage is not enabled on this deployment.</div>';
       return;
     }
-    destroyed = false; selectedRx = ''; selectedName = ''; days = 7; boardCache = [];
+    selectedRx = ''; selectedName = ''; days = 7; boardCache = [];
     try {
       var p = (typeof getHashParams === 'function') ? getHashParams() : null;
       if (p) { var dd = parseInt(p.get('days'), 10); if ([1, 7, 14, 30].indexOf(dd) >= 0) days = dd; selectedRx = (p.get('rx') || '').toLowerCase(); }
@@ -155,7 +244,9 @@
     if (typeof window._applyTilesToNodeMap === 'function') window._applyTilesToNodeMap(map);
     else L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
     covLayer = L.layerGroup().addTo(map);
-    map.on('moveend zoomend', drawCoverage);
+    // Debounce pan/zoom redraws so dragging the map doesn't fire a storm of
+    // /api/rx-coverage requests (#6). Direct calls (setDays, fit) stay immediate.
+    map.on('moveend zoomend', debounce(drawCoverage, 200));
     var bar = document.getElementById('rxDays');
     if (bar) bar.addEventListener('click', function (e) { var b = e.target.closest('button[data-days]'); if (b) setDays(+b.dataset.days); });
     setTimeout(function () { if (!destroyed && map) { map.invalidateSize(); if (selectedRx) fitToObserver(); else drawCoverage(); } }, 150);

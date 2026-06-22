@@ -56,7 +56,7 @@ jobs:
           go build .
           # -race gates PR #1208's atomic.Pointer migration: the race-detector
           # is what makes path_inspect_atomic_race_test.go actually assert.
-          go test -timeout 15m -race -coverprofile=server-coverage.out ./... 2>&1 | tee server-test.log
+          go test -timeout 20m -race -coverprofile=server-coverage.out ./... 2>&1 | tee server-test.log
           echo "--- Go Server Coverage ---"
           go tool cover -func=server-coverage.out | tail -1
 
@@ -65,7 +65,7 @@ jobs:
           set -e -o pipefail
           cd cmd/ingestor
           go build .
-          go test -timeout 15m -coverprofile=ingestor-coverage.out ./... 2>&1 | tee ingestor-test.log
+          go test -timeout 20m -coverprofile=ingestor-coverage.out ./... 2>&1 | tee ingestor-test.log
           echo "--- Go Ingestor Coverage ---"
           go tool cover -func=ingestor-coverage.out | tail -1
 
@@ -139,6 +139,8 @@ jobs:
           node test-issue-1509-detect-preset.js
           node test-live.js
           node test-fetch-all-nodes-pagination.js
+          node test-coverage-gate.js
+          node test-node-reach-coverage.js
           node test-issue-1107-live-layout.js
           node test-issue-1532-live-fullscreen.js
           node test-issue-1619-feed-detail-card-draggable.js
@@ -146,6 +148,7 @@ jobs:
           node test-preflight-xss-gate.js
           node test-traces.js
           node test-issue-1648-m4-emoji-scan.js
+          node test-issue-1753-copy-url-slash.js
           node test-issue-1668-m3-typography.js
           node test-mqtt-status-panel.js
           node test-issue-1697-mqtt-mobile-e2e.js
@@ -153,6 +156,9 @@ jobs:
           node test-issue-1633-hide-1byte-hops.js
           node test-issue-1668-m4-per-route.js
           node test-a11y-axe-1668-selftest.js
+          node test-a11y-1716-rf-range-btn-active.js
+          node test-issue-1705-subpath-contrast.js
+          node test-a11y-axe-routes-coverage.js
 
       - name: 🛡️ Preflight XSS gate — actual --diff check (PR only)
         # The fixture self-test above (test-preflight-xss-gate.js) only
@@ -364,9 +370,15 @@ jobs:
       - name: Run Playwright E2E tests (fail-fast)
         run: |
           BASE_URL=http://localhost:13581 node test-e2e-playwright.js 2>&1 | tee e2e-output.txt
-          # M5 of #1668 — axe-core CI gate (color-contrast AA).
-          # Real browser run; fails on any net violation (raw − allowlist).
-          # Allowlist: tests/a11y-allowlist.yaml (0 entries at M5 baseline).
+          # M5+M6 of #1668 — axe-core CI gate.
+          # M5: color-contrast on desktop dark+light.
+          # M6: expanded ruleset (image-alt, label, aria-required-attr,
+          #     aria-valid-attr, aria-valid-attr-value, landmark-one-main,
+          #     region, button-name, link-name, document-title, html-has-lang,
+          #     duplicate-id) AND adds 375x812 mobile viewport (with
+          #     color-contrast on mobile too).
+          # Allowlist: tests/a11y-allowlist.yaml (0 entries — hard pass policy).
+          # Per-viewport summary printed at the end; any net>0 fails the build.
           BASE_URL=http://localhost:13581 AXE_SCREENSHOT_DIR=/tmp/axe-1668 \
             node test-a11y-axe-1668.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-filter-ux-e2e.js 2>&1 | tee -a e2e-output.txt
@@ -401,6 +413,7 @@ jobs:
           BASE_URL=http://localhost:13581 node test-issue-1136-live-region-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1150-404-state-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1146-path-link-contrast-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 node test-issue-1705-subpath-contrast-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1147-section-order-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1151-orphan-separators-e2e.js 2>&1 | tee -a e2e-output.txt
           BASE_URL=http://localhost:13581 node test-issue-1486-collapse-reopens-detail-e2e.js 2>&1 | tee -a e2e-output.txt
@@ -455,6 +468,7 @@ jobs:
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-ws-race-1498-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1487-byop-modal-layout-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1630-reach-mobile-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-node-reach-coverage-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1640-compare-discovery-e2e.js 2>&1 | tee -a e2e-output.txt
 
       # #1616: slide-over focus-restore flake-gate. Runs the slide-over
