@@ -120,6 +120,7 @@
             <button class="tab-btn" data-tab="collisions">Hash Issues</button>
             <button class="tab-btn" data-tab="subpaths">Route Patterns</button>
             <button class="tab-btn" data-tab="nodes">Nodes</button>
+            <button class="tab-btn" data-tab="my-repeaters">My Repeaters</button>
             <button class="tab-btn" data-tab="distance">Distance</button>
             <button class="tab-btn" data-tab="neighbor-graph">Neighbor Graph</button>
             <button class="tab-btn" data-tab="rf-health">RF Health</button>
@@ -138,7 +139,7 @@
       </div>`;
 
     // Tabs where the area filter is meaningful (transmitter GPS attribution)
-    const AREA_FILTER_TABS = new Set(['overview', 'rf', 'topology', 'hashsizes', 'collisions', 'nodes', 'clock-health']);
+    const AREA_FILTER_TABS = new Set(['overview', 'rf', 'topology', 'hashsizes', 'collisions', 'nodes', 'my-repeaters', 'clock-health']);
 
     function setAreaFilterVisibility(tab) {
       const el = document.getElementById('analyticsAreaFilter');
@@ -284,6 +285,7 @@
       case 'collisions': await renderCollisionTab(el, d.hashData, d.collisionData); break;
       case 'subpaths': await renderSubpaths(el); break;
       case 'nodes': await renderNodesTab(el); break;
+      case 'my-repeaters': await renderMyRepeatersTab(el); break;
       case 'distance': await renderDistanceTab(el); break;
       case 'neighbor-graph': await renderNeighborGraphTab(el); break;
       case 'rf-health': await renderRFHealthTab(el); break;
@@ -406,7 +408,7 @@
       <div class="analytics-row">
         <div class="analytics-card flex-1">
           <h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Relay Airtime Share</h3>
-          <p class="text-muted" style="margin-top:-4px;font-size:12px">Score = payload bytes × distinct repeaters that forwarded the packet. Counts relay re-transmissions; originator TX excluded. Not comparable across meshes.</p>
+          <p class="text-muted" style="margin-top:-4px;font-size:12px">Score = LoRa Time-on-Air × distinct repeaters that forwarded the packet (issue #1768). Counts relay re-transmissions; originator TX excluded. Not comparable across meshes — see preset caption below.</p>
           ${renderRelayAirtimeDumbbell(d.airtimeData)}
         </div>
       </div>
@@ -474,9 +476,33 @@
     if (totalScore <= 0) {
       return '<div class="text-muted" style="padding:20px">No relay activity observed in this window (all packets direct).</div>';
     }
+    // Issue #1768 — surface the LoRa preset baked into the ToA score. Share
+    // numbers are only meaningful relative to one PHY preset; operators must
+    // know what was assumed. All fields are run through esc() defensively
+    // (preset.sf/cr/preamble/bw_khz/freq_hz arrive from the server JSON,
+    // which the operator can configure — never inject untrusted text raw).
+    // BW formatted consistent with home.js / customize-v2.js presets
+    // (e.g. `62.5 kHz`, `125 kHz`) — strip trailing `.0` for integer kHz.
+    var preset = data && data.preset;
+    var presetCaption = '';
+    if (preset && typeof preset === 'object') {
+      var freqMHz = Number(preset.freq_hz || 0) / 1e6;
+      var bwKhz = Number(preset.bw_khz || 0);
+      var bwStr = bwKhz ? bwKhz.toFixed(1).replace(/\.0$/, '') : '0';
+      presetCaption =
+        '<div class="dumbbell-preset text-muted" style="font-size:11px;padding:0 4px 6px 4px">' +
+        'Assumed LoRa preset: ' +
+        (freqMHz ? esc(freqMHz.toFixed(3)) + ' MHz / ' : '') +
+        'BW ' + esc(bwStr) + ' kHz / ' +
+        'SF ' + esc(String(Number(preset.sf || 0))) + ' / ' +
+        'CR 4/' + esc(String(Number(preset.cr || 0))) +
+        ' (preamble ' + esc(String(Number(preset.preamble || 0))) + ' sym)' +
+        '</div>';
+    }
     // Layout: per row → label | track 0..100% | values
     var palette = ['#ef4444','#f59e0b','#22c55e','#3b82f6','#8b5cf6','#ec4899','#14b8a6','#64748b','#f97316','#06b6d4','#84cc16'];
     var html = '<div class="dumbbell-chart" style="display:flex;flex-direction:column;gap:8px;padding:8px 4px">';
+    if (presetCaption) html += presetCaption;
     rows.forEach(function (r, i) {
       var name = r.payload_type || 'UNK';
       var cnt = Number(r.count || 0);
@@ -487,11 +513,18 @@
       var loPct = Math.min(cpct, apct);
       var hiPct = Math.max(cpct, apct);
       // Tooltip per row — payload_type, count %, count N, airtime %, raw score, caveat.
+      // Score is summed (ToA in ns) × distinct repeaters across packets of
+      // this type; converted to ms for human-readable display per #1768
+      // round-1 review.
+      var scoreMs = score / 1e6;
+      var scoreStr = scoreMs >= 1000
+        ? (scoreMs / 1000).toFixed(2) + ' s'
+        : scoreMs.toFixed(2) + ' ms';
       var tip =
         name + '\n' +
         'Count: ' + cnt.toLocaleString() + ' (' + cpct.toFixed(2) + '%)\n' +
-        'Airtime: ' + apct.toFixed(2) + '% (score ' + score.toLocaleString() + ')\n' +
-        'Score = bytes × distinct repeaters. Within-mesh only.';
+        'Airtime: ' + apct.toFixed(2) + '% (score ' + scoreStr + ' · airtime × repeaters)\n' +
+        'Score = LoRa Time-on-Air × distinct repeaters. Within-mesh only.';
       html += '<div class="dumbbell-row" title="' + esc(tip) + '" style="display:grid;grid-template-columns:80px 1fr 180px;align-items:center;gap:10px;font-size:12px">' +
         '<div class="dumbbell-label" style="font-weight:600;color:var(--text)">' + esc(name) + '</div>' +
         '<div class="dumbbell-track" style="position:relative;height:18px;background:var(--bg-elev,rgba(127,127,127,0.12));border-radius:9px">' +
@@ -2345,6 +2378,222 @@
     }
   }
 
+  // ===================== MY REPEATERS (favorites monitoring dashboard) =====================
+  // An at-a-glance monitor over the repeaters the operator has starred
+  // (meshcore-favorites). Pure frontend aggregation over existing endpoints:
+  //   /api/nodes                      relay activity + traffic/bridge scores
+  //   /api/nodes/clock-skew           per-node "is the clock OK" severity
+  //   /api/analytics/neighbor-graph   affinity edges, filtered to favorites
+  //                                   ("throughput between my repeaters")
+  function _mrSummaryCard(value, label, color) {
+    return `<div class="analytics-stat-card" style="flex:1;min-width:110px;text-align:center;padding:16px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:26px;font-weight:700${color ? ';color:' + color : ''}">${esc(String(value))}</div>
+      <div style="font-size:11px;text-transform:uppercase;color:var(--text-muted)">${esc(label)}</div>
+    </div>`;
+  }
+
+  // Status is carried by colour AND text — never colour alone — so it is
+  // legible to color-blind users and screen readers.
+  const MR_STATUS_META = {
+    active: { color: 'var(--status-green)', label: 'Active' },
+    degraded: { color: 'var(--status-yellow)', label: 'Degraded' },
+    silent: { color: 'var(--status-red)', label: 'Silent' },
+    unknown: { color: 'var(--text-muted)', label: 'Unknown' },
+  };
+  function _mrStatusCell(status) {
+    // Fall back to an explicit "Unknown" rather than silently mislabelling an
+    // unexpected status as "Silent".
+    const m = MR_STATUS_META[status] || MR_STATUS_META.unknown;
+    return `<span style="display:inline-flex;gap:5px;align-items:center;white-space:nowrap"><span style="color:${m.color}" aria-hidden="true"><svg class="ph-icon"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span><span style="font-size:11px">${m.label}</span></span>`;
+  }
+
+  function _mrEmptyState() {
+    return `
+      <div class="analytics-section" style="text-align:center;padding:48px 24px;color:var(--text-muted)">
+        <svg class="ph-icon" aria-hidden="true" style="width:40px;height:40px;opacity:0.6"><use href="/icons/phosphor-sprite.svg#ph-star"/></svg>
+        <h3 style="margin:12px 0 6px">No favorite repeaters yet</h3>
+        <p>Star a repeater (the <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star"/></svg> on the <a href="#/nodes" class="analytics-link">Nodes</a> page or a node's detail) to add it to your watch-list. Starred repeaters show up here for at-a-glance monitoring.</p>
+      </div>`;
+  }
+
+  async function renderMyRepeatersTab(el) {
+    const haveFavs = () => (typeof getFavorites === 'function' ? getFavorites() : []);
+    if (!haveFavs().length) { el.innerHTML = _mrEmptyState(); return; }
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading your repeaters…</div>';
+    try {
+      const rq = RegionFilter.regionQueryString() + AreaFilter.areaQueryString();
+      // When a region/area filter is active the node fetch is scoped, so a
+      // starred repeater outside that scope won't come back. Surface that count
+      // instead of silently dropping it from the watch-list (#1761 MAJOR).
+      const filterActive = rq.length > 0;
+      // Fetch the three sources ONCE; star toggles re-paint from this cache
+      // (paint() below) instead of re-hitting the network. Trade-off: this
+      // pages the full node list (up to ~10k) to keep only the starred few —
+      // fine for a handful of favorites and amortized by CLIENT_TTL.nodeList
+      // across tabs. If favorite counts ever grow large, switch to per-node
+      // Promise.all(favs.map(pk => api('/nodes/' + pk))).
+      const [nodesResp, clockData, graphData] = await Promise.all([
+        fetchAllNodes('&sortBy=lastSeen' + rq, { ttl: CLIENT_TTL.nodeList }),
+        api('/nodes/clock-skew', { ttl: CLIENT_TTL.analyticsRF }).catch(() => []),
+        api('/analytics/neighbor-graph?min_count=1&min_score=0', { ttl: CLIENT_TTL.analyticsRF }).catch(() => ({ nodes: [], edges: [] })),
+      ]);
+      const allNodes = nodesResp.nodes || nodesResp;
+      const clockByPk = {};
+      (Array.isArray(clockData) ? clockData : []).forEach(c => { if (c && c.pubkey) clockByPk[c.pubkey] = c; });
+
+      const now = Date.now();
+      function ageOf(n) {
+        const ms = n.last_heard ? new Date(n.last_heard).getTime() : n.last_seen ? new Date(n.last_seen).getTime() : 0;
+        return ms ? now - ms : Infinity;
+      }
+      function statusOf(n) {
+        const th = (typeof getHealthThresholds === 'function') ? getHealthThresholds(n.role) : { degradedMs: 3600000, silentMs: 86400000 };
+        const age = ageOf(n);
+        return age < th.degradedMs ? 'active' : age < th.silentMs ? 'degraded' : 'silent';
+      }
+      const pct = v => (v != null ? (v * 100).toFixed(1) + '%' : '—');
+      // #1456: prefer traffic_share_score, fall back to usefulness_score.
+      const trafficOf = n => (n.traffic_share_score != null ? n.traffic_share_score : (n.usefulness_score != null ? n.usefulness_score : null));
+      function roleBadge(role) {
+        // Route the unknown-role fallback through ROLE_COLORS.unknown (backed by
+        // --mc-role-unknown / the shared Wong palette) instead of a hard-coded
+        // literal, so every swatch color flows through the CSS-variable system
+        // (#1761 nit). ROLE_COLORS always resolves .unknown.
+        const rc = window.ROLE_COLORS || {};
+        const c = rc[role] || rc.unknown || 'var(--role-unknown, #6b7280)';
+        const style = (window.aaBadgeStyle && window.aaBadgeStyle(c)) || ('background:' + c + ';color:#fff');
+        return `<span class="badge" style="${style}">${esc(role)}</span>`;
+      }
+
+      // Re-renders from the cached fetch using the LIVE favorites set, so an
+      // un-star drops the row with no refetch. Re-binds its stars after each
+      // paint (the innerHTML reset clears listeners).
+      function paint() {
+        const favs = new Set(haveFavs());
+        if (!favs.size) { el.innerHTML = _mrEmptyState(); return; }
+        const myNodes = allNodes.filter(n => favs.has(n.public_key) && (n.role === 'repeater' || n.role === 'room'));
+        const myKeys = new Set(myNodes.map(n => n.public_key));
+
+        // Favorites the scoped fetch didn't return — with a region/area filter
+        // active these are (most likely) outside the current scope. Surface the
+        // count so a hidden favorite isn't silently missing (#1761 MAJOR).
+        const allByPk = new Set(allNodes.map(n => n.public_key));
+        // Favorites absent from the scoped fetch: usually outside the active
+        // region/area filter, but the set also covers deleted/expired stars
+        // and role-filtered clients — so the notice stays causally neutral
+        // ("not shown with the active filter") rather than claiming a cause.
+        const hiddenByFilter = [...favs].filter(pk => !allByPk.has(pk)).length;
+        const filterNotice = (filterActive && hiddenByFilter > 0)
+          ? `<p class="text-muted" style="display:flex;gap:6px;align-items:center"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-funnel"/></svg>${hiddenByFilter} favorite${hiddenByFilter === 1 ? '' : 's'} not shown with the active region/area filter.</p>`
+          : '';
+
+        let active = 0, degraded = 0, silent = 0, clockOk = 0, totalRelay24 = 0;
+        myNodes.forEach(n => {
+          const s = statusOf(n); if (s === 'active') active++; else if (s === 'degraded') degraded++; else silent++;
+          const cs = clockByPk[n.public_key];
+          if (cs && cs.severity === 'ok') clockOk++;
+          totalRelay24 += (n.relay_count_24h || 0);
+        });
+
+        const rank = { silent: 0, degraded: 1, active: 2 };
+        const sorted = myNodes.slice().sort((a, b) => {
+          const d = rank[statusOf(a)] - rank[statusOf(b)];
+          return d !== 0 ? d : (a.name || '').localeCompare(b.name || '');
+        });
+
+        const rowsHtml = sorted.map(n => {
+          const cs = clockByPk[n.public_key];
+          const clockCell = cs ? renderSkewBadge(cs.severity, currentSkewValue(cs), cs) : '<span class="text-muted">—</span>';
+          const battery = n.battery_mv != null ? (n.battery_mv / 1000).toFixed(2) + ' V' : '—';
+          return `<tr>
+            <td>${favStar(n.public_key)}</td>
+            <td><a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link">${esc(n.name || n.public_key.slice(0, 12))}</a></td>
+            <td>${roleBadge(n.role)}</td>
+            <td>${_mrStatusCell(statusOf(n))}</td>
+            <td>${clockCell}</td>
+            <td style="text-align:right">${pct(trafficOf(n))}</td>
+            <td style="text-align:right">${pct(n.bridge_score)}</td>
+            <td style="text-align:right">${n.relay_count_1h != null ? n.relay_count_1h : '—'}</td>
+            <td style="text-align:right">${n.relay_count_24h != null ? n.relay_count_24h : '—'}</td>
+            <td>${n.last_relayed ? timeAgo(n.last_relayed) : '—'}</td>
+            <td>${(n.last_heard || n.last_seen) ? timeAgo(n.last_heard || n.last_seen) : '—'}</td>
+            <td style="text-align:right">${battery}</td>
+          </tr>`;
+        }).join('');
+
+        const nameByPk = {};
+        myNodes.forEach(n => { nameByPk[n.public_key] = n.name || n.public_key.slice(0, 12); });
+        const myEdges = ((graphData && graphData.edges) || [])
+          .filter(e => myKeys.has(e.source) && myKeys.has(e.target))
+          .sort((a, b) => (b.score || 0) - (a.score || 0));
+        let affinityHtml;
+        if (!myEdges.length) {
+          affinityHtml = `<p class="text-muted" style="padding:8px 0">No affinity links detected between your repeaters yet — they may be too far apart, or not enough shared traffic has been observed.</p>`;
+        } else {
+          affinityHtml = `<table class="analytics-table">
+            <thead><tr><th scope="col">Link</th><th scope="col" style="text-align:right">Affinity</th><th scope="col" style="text-align:right">Packets</th><th scope="col" style="text-align:right">Avg SNR</th></tr></thead>
+            <tbody>${myEdges.map(e => {
+              // The affinity graph is undirected — the server marks every edge
+              // bidirectional — so the link glyph is always a double arrow.
+              const arrow = '&harr;';
+              const snr = (e.avg_snr != null) ? e.avg_snr.toFixed(1) + ' dB' : '—';
+              return `<tr>
+                <td>${esc(nameByPk[e.source] || e.source.slice(0, 12))} ${arrow} ${esc(nameByPk[e.target] || e.target.slice(0, 12))}${e.ambiguous ? ' <svg class="ph-icon" role="img" aria-label="Path attribution ambiguous"><title>Path attribution ambiguous</title><use href="/icons/phosphor-sprite.svg#ph-question"/></svg>' : ''}</td>
+                <td style="text-align:right">${pct(e.score)}</td>
+                <td style="text-align:right">${e.weight != null ? e.weight : '—'}</td>
+                <td style="text-align:right">${snr}</td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table>`;
+        }
+
+        el.innerHTML = `
+          <div class="analytics-section">
+            <h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg> My Repeaters</h3>
+            <p class="text-muted">At-a-glance monitoring over the repeaters you have starred. Un-star a row to drop it from this list.</p>
+            ${filterNotice}
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:16px;margin-bottom:20px">
+              ${_mrSummaryCard(myNodes.length, 'My Repeaters')}
+              ${_mrSummaryCard(active, 'Active')}
+              ${_mrSummaryCard(degraded, 'Degraded')}
+              ${_mrSummaryCard(silent, 'Silent')}
+              ${_mrSummaryCard(clockOk + ' / ' + myNodes.length, 'Clock OK')}
+              ${_mrSummaryCard(totalRelay24.toLocaleString(), 'Relays (24h)')}
+            </div>
+
+            <table class="analytics-table" id="my-repeaters-table">
+              <thead><tr>
+                <th scope="col" aria-label="Favorite"></th>
+                <th scope="col">Repeater</th>
+                <th scope="col">Role</th>
+                <th scope="col">Status</th>
+                <th scope="col">Clock</th>
+                <th scope="col" style="text-align:right">Traffic</th>
+                <th scope="col" style="text-align:right">Bridge</th>
+                <th scope="col" style="text-align:right" title="Relays in the last hour">Relays 1h</th>
+                <th scope="col" style="text-align:right" title="Relays in the last 24 hours">Relays 24h</th>
+                <th scope="col">Last Relayed</th>
+                <th scope="col">Last Heard</th>
+                <th scope="col" style="text-align:right">Battery</th>
+              </tr></thead>
+              <tbody>${rowsHtml || '<tr><td colspan="12" class="text-muted">None of your favorites are repeaters/rooms in this view.</td></tr>'}</tbody>
+            </table>
+
+            <h3 style="margin-top:28px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-graph"/></svg> Links Between My Repeaters</h3>
+            <p class="text-muted">Affinity sub-graph filtered to your favorites — how much traffic flows directly between them.</p>
+            ${affinityHtml}
+          </div>`;
+
+        // Live un-star: re-paint from cache (no refetch) when a star toggles.
+        if (typeof bindFavStars === 'function') bindFavStars(el, paint);
+      }
+      paint();
+    } catch (e) {
+      el.innerHTML = `<div style="padding:40px;text-align:center;color:var(--status-red)">Failed to load your repeaters: ${esc(e.message)}</div>`;
+    }
+  }
+  // === MY REPEATERS BLOCK END (test harness slices the renderer block to here) ===
+
   async function renderDistanceTab(el) {
     try {
       const rqs = RegionFilter.regionQueryString();
@@ -2514,8 +2763,11 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     }
 
     _ngState = createGraphState(graphData);
-    renderNGStats(_ngState);
-    startGraphRenderer();
+    // Render through the filter path so the first paint already respects the
+    // default filters (observers unchecked, saved min-score) and the
+    // node-count guard is evaluated against the displayed set, not the full
+    // fetched graph.
+    applyNGFilters();
 
     // Filter listeners
     // Restore saved min score from localStorage
@@ -2526,10 +2778,14 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       applyNGFilters();
     }
 
+    var ngScoreDebounce;
     document.getElementById('ngMinScore').addEventListener('input', function() {
       document.getElementById('ngMinScoreVal').textContent = (this.value / 100).toFixed(2);
       localStorage.setItem('ng-min-score', this.value);
-      applyNGFilters();
+      // Debounce the O(N+E) refilter so dragging the slider doesn't rebuild the
+      // node set on every pixel (review of #1758).
+      clearTimeout(ngScoreDebounce);
+      ngScoreDebounce = setTimeout(applyNGFilters, 50);
     });
     document.getElementById('ngConfidence').addEventListener('change', applyNGFilters);
     rcEl.addEventListener('change', applyNGFilters);
@@ -2552,6 +2808,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       stats: data.stats || {},
       zoom: 1, panX: 0, panY: 0,
       dragging: null, panning: false,
+      hoverNode: null,
       lastMouseX: 0, lastMouseY: 0,
       cooling: 1.0, animId: null
     };
@@ -2588,8 +2845,15 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     _ngState.nodeIdx = {};
     _ngState.nodes.forEach((n, i) => { _ngState.nodeIdx[n.pubkey] = i; });
 
+    // A full re-anneal (cooling back to 1.0) on every filter change is
+    // deliberate: the displayed node set just changed, so the prior layout
+    // is stale and we want the simulation to settle the new graph. This is
+    // acceptable at the current 1000-node limit; revisit if the limit grows.
     _ngState.cooling = 1.0;
     renderNGStats(_ngState);
+    // Re-evaluate the node-count guard against the new filtered set and
+    // (re)start or stop the force-simulation loop accordingly.
+    startGraphRenderer();
   }
 
   function renderNGStats(st) {
@@ -2650,35 +2914,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     listEl.innerHTML = html;
   }
 
-  function startGraphRenderer() {
-    if (!_ngState) return;
-
-    // Node count guard: skip force simulation for very large graphs
-    var NODE_LIMIT = 1000;
-    if (_ngState.allNodes.length > NODE_LIMIT) {
-      var el = document.getElementById('ngCanvas');
-      if (el) {
-        el.style.display = 'none';
-        var msg = document.createElement('div');
-        msg.className = 'analytics-card';
-        msg.innerHTML = '<p class="text-muted">Graph has ' + _ngState.allNodes.length + ' nodes (limit: ' + NODE_LIMIT + '). Force simulation skipped for performance. Use filters to reduce the node count.</p>';
-        el.parentNode.insertBefore(msg, el);
-      }
-      return;
-    }
-
-    const canvas = document.getElementById('ngCanvas');
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = canvas.clientWidth * dpr;
-    canvas.height = canvas.clientHeight * dpr;
-    ctx.scale(dpr, dpr);
-    const W = canvas.clientWidth, H = canvas.clientHeight;
-
-    // Interaction
-    let hoverNode = null;
-
+  function bindNGCanvasInteraction(canvas) {
     function canvasToGraph(cx, cy) {
       return { x: (cx - _ngState.panX) / _ngState.zoom, y: (cy - _ngState.panY) / _ngState.zoom };
     }
@@ -2727,8 +2963,8 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
         _ngState.lastMouseY = e.clientY;
       } else {
         const n = findNode(cx, cy);
-        if (n !== hoverNode) {
-          hoverNode = n;
+        if (n !== _ngState.hoverNode) {
+          _ngState.hoverNode = n;
           canvas.style.cursor = n ? 'pointer' : 'grab';
           const tip = document.getElementById('ngTooltip');
           if (n && tip) {
@@ -2739,7 +2975,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
           } else if (tip) {
             tip.style.display = 'none';
           }
-        } else if (hoverNode) {
+        } else if (_ngState.hoverNode) {
           const tip = document.getElementById('ngTooltip');
           if (tip) { tip.style.left = (cx + 12) + 'px'; tip.style.top = (cy - 8) + 'px'; }
         }
@@ -2753,7 +2989,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       }
       _ngState.dragging = null;
       _ngState.panning = false;
-      canvas.style.cursor = hoverNode ? 'pointer' : 'grab';
+      canvas.style.cursor = _ngState.hoverNode ? 'pointer' : 'grab';
     });
 
     canvas.addEventListener('mouseleave', function() {
@@ -2762,7 +2998,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       _ngState._wasDragging = false;
       const tip = document.getElementById('ngTooltip');
       if (tip) tip.style.display = 'none';
-      hoverNode = null;
+      _ngState.hoverNode = null;
     });
 
     canvas.addEventListener('click', function(e) {
@@ -2797,6 +3033,71 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       _ngState.panY = cy - (cy - _ngState.panY) * (newZoom / _ngState.zoom);
       _ngState.zoom = newZoom;
     }, { passive: false });
+  }
+
+  function startGraphRenderer() {
+    if (!_ngState) return;
+
+    // Re-entrant: the filter path calls this to restart against the new node
+    // set, so cancel any loop already running before deciding what to do.
+    if (_ngState.animId) {
+      cancelAnimationFrame(_ngState.animId);
+      _ngState.animId = null;
+    }
+    // Re-entrancy epoch: a just-cancelled in-flight tick() (or one re-entered
+    // from a microtask) must not schedule a second loop. Each run bumps the
+    // epoch; tick() captures its own and early-returns once a newer run starts.
+    _ngState._runEpoch = (_ngState._runEpoch || 0) + 1;
+    var myEpoch = _ngState._runEpoch;
+
+    const canvas = document.getElementById('ngCanvas');
+    if (!canvas) return;
+    var skipMsg = document.getElementById('ngSkipMsg');
+
+    // Node count guard: skip the force simulation for graphs too large to
+    // render usefully. Keyed off the DISPLAYED (filtered) set — _ngState.nodes
+    // — NOT the full fetched graph (_ngState.allNodes), so narrowing the
+    // filters re-enables rendering. The "skipped" notice has a stable id so
+    // it can be toggled on the next call.
+    var NODE_LIMIT = 1000;
+    if (_ngState.nodes.length > NODE_LIMIT) {
+      canvas.style.display = 'none';
+      if (!skipMsg) {
+        skipMsg = document.createElement('div');
+        skipMsg.id = 'ngSkipMsg';
+        skipMsg.className = 'analytics-card';
+        canvas.parentNode.insertBefore(skipMsg, canvas);
+      }
+      // Build via textContent (never innerHTML) per the project's XSS rule —
+      // these are Numbers today, but a future coercion bug must not inject. Show
+      // filtered-of-total so the operator sees the rest were filtered out, not
+      // lost (review of #1758).
+      var ngTotal = (_ngState.allNodes || _ngState.nodes).length;
+      skipMsg.textContent = '';
+      var skipP = document.createElement('p');
+      skipP.className = 'text-muted';
+      skipP.textContent = _ngState.nodes.length + ' of ' + ngTotal + ' nodes match the current filters (limit: ' + NODE_LIMIT + '). Force simulation skipped for performance — tighten the filters to render.';
+      skipMsg.appendChild(skipP);
+      return;
+    }
+    if (skipMsg) skipMsg.remove();
+    canvas.style.display = '';
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = canvas.clientHeight * dpr;
+    ctx.scale(dpr, dpr);
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+
+    // Interaction listeners are bound once per tab session (the #ngCanvas
+    // element and _ngState persist across filter re-renders); re-attaching on
+    // every applyNGFilters() would leak handlers (review of #1758). Binding
+    // once also means transient flags like _wasDragging survive re-renders.
+    // Hover state lives on _ngState so listeners and the draw loop agree.
+    if (!_ngState._listenersBound) {
+      bindNGCanvasInteraction(canvas);
+      _ngState._listenersBound = true;
+    }
 
     // Cache text color to avoid getComputedStyle every frame
     const _labelColor = cssVar('--text-primary') || '#e0e0e0';
@@ -2805,6 +3106,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     // Performance: 500 nodes brute-force repulsion: avg ~4ms/frame = 250fps headroom (measured Chrome 120, M1)
     var _perfFrameTimes = [], _perfLastTime = 0;
     function tick() {
+      if (_ngState._runEpoch !== myEpoch) { return; } // a newer startGraphRenderer run superseded this loop
       if (!document.getElementById('ngCanvas')) { _ngState.animId = null; return; }
       var now = performance.now();
       if (_perfLastTime) _perfFrameTimes.push(now - _perfLastTime);
@@ -2897,7 +3199,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
         ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
         ctx.fillStyle = color;
         ctx.fill();
-        if (n === hoverNode) {
+        if (n === _ngState.hoverNode) {
           ctx.strokeStyle = '#fff';
           ctx.lineWidth = 2;
           ctx.stroke();
@@ -4172,7 +4474,10 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     // Fix 5: write static frame only once
     if (!el.querySelector('#scopes-cards')) {
       el.innerHTML =
-        '<h3 style="margin:0 0 12px">Scope Statistics</h3>' +
+        '<h3 style="margin:0 0 4px">Scope Statistics</h3>' +
+        '<p class="text-muted" style="margin:0 0 12px;font-size:0.85em">' +
+          'Denominator is all observed transmissions. Only TRANSPORT_FLOOD (0) and TRANSPORT_DIRECT (3) routes carry a scope; FLOOD (1) and DIRECT (2) are inherently unscoped per MeshCore protocol.' +
+        '</p>' +
         '<div style="margin-bottom:12px">' +
           ['1h', '24h', '7d'].map(function(v) {
             return '<button class="tab-btn' + (selectedWindow === v ? ' active' : '') + '" data-win="' + v + '">' + v + '</button>';
@@ -4224,15 +4529,19 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
 
     function updateData(d, w) {
       var s = d.summary;
+      // #1838: denominator = transport-carrying transmissions (route_type 0,3).
+      // Unscoped now includes non-transport routes (1,2) which are inherently
+      // unscoped by MeshCore protocol, so unscoped can exceed transportTotal.
       var total = s.transportTotal || 0;
+      var overall = (s.scoped || 0) + (s.unscoped || 0);
 
       // Summary cards
       var cardsEl = document.getElementById('scopes-cards');
       if (cardsEl) {
         cardsEl.innerHTML = [
-          { label: 'Transport Total', value: total.toLocaleString(), note: '' },
-          { label: 'Scoped', value: s.scoped.toLocaleString(), note: pct(s.scoped, total) },
-          { label: 'Unscoped', value: s.unscoped.toLocaleString(), note: pct(s.unscoped, total) },
+          { label: 'Transport Total', value: total.toLocaleString(), note: 'routes 0,3 (carry scope)' },
+          { label: 'Scoped', value: s.scoped.toLocaleString(), note: pct(s.scoped, overall) + ' of all traffic' },
+          { label: 'Unscoped', value: s.unscoped.toLocaleString(), note: pct(s.unscoped, overall) + ' of all traffic' },
           { label: 'Unknown Scope', value: s.unknownScope.toLocaleString(), note: pct(s.unknownScope, s.scoped) + ' of scoped' },
         ].map(function(c) {
           return '<div class="stat-card"><div class="stat-value">' + c.value + '</div>' +

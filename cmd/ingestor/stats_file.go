@@ -62,6 +62,25 @@ type IngestorStatsSnapshot struct {
 	// counter view consumed by cmd/server's /api/mqtt/status handler.
 	// Additive; omitempty so older server builds ignore it.
 	SourceStatuses []SourceStatusSnapshot `json:"source_statuses,omitempty"`
+	// WatchdogLastTickUnix (#1749) is the unix-seconds timestamp of the
+	// most recent runLivenessWatchdogLoop tick. Surfaced via
+	// /api/mqtt/status so external monitoring can assert the watchdog
+	// goroutine is still alive — a value older than ~2× the watchdog
+	// scan interval (typically 60s) indicates the watchdog itself has
+	// wedged or panicked. 0 means the watchdog has never ticked
+	// (e.g. cold start before the first scan). Additive — omitempty
+	// so older server builds ignore it.
+	WatchdogLastTickUnix int64 `json:"watchdogLastTickUnix,omitempty"`
+	// WatchdogPanicCount (#1810 round-1) is the running total of
+	// recovered panics inside the watchdog per-source work IIFE.
+	// Exposed alongside WatchdogLastTickUnix because the tick clock is
+	// stamped BEFORE the per-source work — a loop that panics on every
+	// source still advances WatchdogLastTickUnix and looks healthy by
+	// that signal alone. A rapidly-growing WatchdogPanicCount means
+	// the loop is alive but per-source processing is broken (typically
+	// a panic in emit / log sink). Monotonic; 0 means no recovered
+	// panics yet. Additive — omitempty so older server builds ignore.
+	WatchdogPanicCount int64 `json:"watchdogPanicCount,omitempty"`
 }
 
 // SourceLivenessSnapshot is the per-source two-clock view exposed for
@@ -237,21 +256,23 @@ func StartStatsFileWriter(s *Store, interval time.Duration) {
 			ioRate := procIORate(prevIO, curIO, stamp)
 			prevIO = curIO
 			snap := IngestorStatsSnapshot{
-				SampledAt:          stamp,
-				TxInserted:         s.Stats.TransmissionsInserted.Load(),
-				ObsInserted:        s.Stats.ObservationsInserted.Load(),
-				DuplicateTx:        s.Stats.DuplicateTransmissions.Load(),
-				NodeUpserts:        s.Stats.NodeUpserts.Load(),
-				ObserverUpserts:    s.Stats.ObserverUpserts.Load(),
-				WriteErrors:        s.Stats.WriteErrors.Load(),
-				SignatureDrops:     s.Stats.SignatureDrops.Load(),
-				WALCommits:         s.Stats.WALCommits.Load(),
-				GroupCommitFlushes: 0, // group commit reverted (refs #1129)
-				BackfillUpdates:    s.Stats.SnapshotBackfills(),
-				ProcIO:             ioRate,
-				WriterPerf:         s.WriterStatsSnapshot(),
-				SourceLiveness:     SnapshotLivenessClocks(),
-				SourceStatuses:     SnapshotSourceStatuses(tickAt),
+				SampledAt:            stamp,
+				TxInserted:           s.Stats.TransmissionsInserted.Load(),
+				ObsInserted:          s.Stats.ObservationsInserted.Load(),
+				DuplicateTx:          s.Stats.DuplicateTransmissions.Load(),
+				NodeUpserts:          s.Stats.NodeUpserts.Load(),
+				ObserverUpserts:      s.Stats.ObserverUpserts.Load(),
+				WriteErrors:          s.Stats.WriteErrors.Load(),
+				SignatureDrops:       s.Stats.SignatureDrops.Load(),
+				WALCommits:           s.Stats.WALCommits.Load(),
+				GroupCommitFlushes:   0, // group commit reverted (refs #1129)
+				BackfillUpdates:      s.Stats.SnapshotBackfills(),
+				ProcIO:               ioRate,
+				WriterPerf:           s.WriterStatsSnapshot(),
+				SourceLiveness:       SnapshotLivenessClocks(),
+				SourceStatuses:       SnapshotSourceStatuses(tickAt),
+				WatchdogLastTickUnix: WatchdogLastTickUnix(),
+				WatchdogPanicCount:   WatchdogPanicCount(),
 			}
 			buf.Reset()
 			if err := enc.Encode(&snap); err != nil {

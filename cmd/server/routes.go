@@ -22,6 +22,10 @@ import (
 	"github.com/meshcore-analyzer/prunequeue"
 )
 
+// memBreakdownNote is the static accounting caveat attached to the opt-in
+// /api/perf?mem=1 store memory breakdown (PerfResponse.MemoryBreakdownNote).
+const memBreakdownNote = "Per-component *MB count string content + one Go string header each and are a deliberate upper bound (the header is also in the *EstimatedMB base figures). struct/index/map overhead, the neighbor graph and analytics caches are excluded, so the totals sit below goHeapInuseMB. floodTxSharePct sizes the flood-forward multiplication: each flood hop is stored as its own transmission."
+
 // Server holds shared state for route handlers.
 type Server struct {
 	db        *DB
@@ -579,18 +583,29 @@ func (s *Server) handleConfigTheme(w http.ResponseWriter, r *http.Request) {
 		"surface3":     "#2d2d50",
 		"sectionBg":    "#1e1e34",
 	}, s.cfg.ThemeDark, theme.ThemeDark)
+	// #1799 PR #1804 r1 item 6: REQUEST→REQ rename is a BREAKING change to
+	// the /api/config/theme shape. Compat policy for >=1 release cycle:
+	//   - INCOMING: if an operator's config.json / theme.json carries the
+	//     legacy "REQUEST" key, normalise it to "REQ" before mergeMap so
+	//     the override wins the canonical slot.
+	//   - OUTGOING: dual-emit REQ AND REQUEST in the GET response so any
+	//     consumer still reading the legacy key keeps working.
 	typeColors := mergeMap(map[string]interface{}{
 		"ADVERT":   "#22c55e",
 		"GRP_TXT":  "#3b82f6",
 		"TXT_MSG":  "#f59e0b",
 		"ACK":      "#6b7280",
-		"REQUEST":  "#a855f7",
+		"REQ":      "#a855f7",
 		"RESPONSE": "#06b6d4",
 		"TRACE":    "#ec4899",
 		"PATH":     "#14b8a6",
 		"ANON_REQ": "#f43f5e",
 		"UNKNOWN":  "#6b7280",
-	}, s.cfg.TypeColors, theme.TypeColors)
+	}, normaliseTypeColorsLegacyKeys(s.cfg.TypeColors), normaliseTypeColorsLegacyKeys(theme.TypeColors))
+	// Dual-emit REQUEST = REQ for back-compat (drop after >=1 release cycle).
+	if v, ok := typeColors["REQ"]; ok {
+		typeColors["REQUEST"] = v
+	}
 
 	defaultHome := map[string]interface{}{
 		"heroTitle":    "CoreScope",
@@ -905,6 +920,15 @@ func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
 		pktStoreStats = &ps
 	}
 
+	// Opt-in store memory diagnostic: an O(tx+obs) walk, only when explicitly
+	// requested so the hot /api/perf path stays cheap.
+	var memBreakdown *StoreMemoryBreakdown
+	var breakdownNote string
+	if s.store != nil && r.URL.Query().Get("mem") == "1" {
+		memBreakdown = s.store.GetStoreMemoryBreakdown()
+		breakdownNote = memBreakdownNote
+	}
+
 	// SQLite stats
 	var sqliteStats *SqliteStats
 	if s.db != nil {
@@ -913,14 +937,16 @@ func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, PerfResponse{
-		Uptime:        uptimeSec,
-		TotalRequests: totalRequests,
-		AvgMs:         safeAvg(totalMs, float64(totalRequests)),
-		Endpoints:     summary,
-		SlowQueries:   slowQueries,
-		Cache:         perfCS,
-		PacketStore:   pktStoreStats,
-		Sqlite:        sqliteStats,
+		Uptime:              uptimeSec,
+		TotalRequests:       totalRequests,
+		AvgMs:               safeAvg(totalMs, float64(totalRequests)),
+		Endpoints:           summary,
+		SlowQueries:         slowQueries,
+		Cache:               perfCS,
+		PacketStore:         pktStoreStats,
+		Sqlite:              sqliteStats,
+		MemoryBreakdown:     memBreakdown,
+		MemoryBreakdownNote: breakdownNote,
 		GoRuntime: func() *GoRuntimeStats {
 			ms := s.getMemStats()
 			return &GoRuntimeStats{
@@ -1347,6 +1373,18 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		// — safe to call regardless of needsRelay, and we want the
 		// score on repeater rows specifically.
 		bridgeMap := s.store.GetBridgeScoreMap()
+		// Coverage + Redundancy axes (#672 axes 3 & 4). Atomic snapshots,
+		// same discipline as the bridge map.
+		coverageMap := s.store.GetCoverageScoreMap()
+		redundancyMap := s.store.GetRedundancyScoreMap()
+		// Whether the structural-axis recomputer has produced a snapshot yet:
+		// distinguishes a genuinely isolated repeater (real "F") from cold
+		// start (grade withheld) for the all-zero node (#1762 MAJOR-4).
+		axesComputed := s.store.UsefulnessAxesComputed()
+		// Population max of the raw Traffic axis, used to max-normalize
+		// traffic into the composite (the other three axes are already
+		// max-normalized; #1762 review).
+		maxUseful := maxFloat(usefulMap)
 		for _, node := range nodes {
 			if pk, ok := node["public_key"].(string); ok {
 				EnrichNodeWithHashSize(node, hashInfo[pk])
@@ -1361,16 +1399,28 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 					node["relay_active"] = info.RelayActive
 					node["relay_count_1h"] = info.RelayCount1h
 					node["relay_count_24h"] = info.RelayCount24h
-					// usefulness_score retained for API compat; new
-					// consumers should read traffic_share_score
-					// (issue #1456). When the #672 composite ships
-					// usefulness_score will become the composite
-					// and traffic_share_score will keep the
-					// per-axis value.
-					us := lookupUsefulnessScore(usefulMap, pk)
-					node["usefulness_score"] = us
-					node["traffic_share_score"] = us
-					node["bridge_score"] = lookupUsefulnessScore(bridgeMap, pk)
+					node["unscoped_relay_count_24h"] = info.UnscopedRelayCount24h
+					// #1751: region scopes this repeater has transported.
+					// Set only when non-empty so the field is absent for
+					// nodes without scopes / on older schemas.
+					if len(info.TransportedScopes) > 0 {
+						node["transported_scopes"] = info.TransportedScopes
+					}
+					// #672 4-axis usefulness. traffic_share_score keeps the
+					// raw per-axis Traffic value (#1456); the structural axes
+					// are surfaced individually; the composite uses the
+					// max-normalized traffic so its 0.20 weight is real.
+					trafficRaw := lookupUsefulnessScore(usefulMap, pk)
+					trafficNorm := 0.0
+					if maxUseful > 0 {
+						trafficNorm = trafficRaw / maxUseful
+					}
+					enrichNodeUsefulness(node, trafficRaw, usefulnessAxes{
+						Traffic:    trafficNorm,
+						Bridge:     lookupUsefulnessScore(bridgeMap, pk),
+						Coverage:   lookupUsefulnessScore(coverageMap, pk),
+						Redundancy: lookupUsefulnessScore(redundancyMap, pk),
+					}, axesComputed)
 				}
 			}
 		}
@@ -1547,18 +1597,44 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 			node["relay_window_hours"] = info.WindowHours
 			node["relay_count_1h"] = info.RelayCount1h
 			node["relay_count_24h"] = info.RelayCount24h
-			// usefulness_score retained for API compat; new
-			// consumers should read traffic_share_score (#1456).
-			us := s.store.GetRepeaterUsefulnessScore(pubkey)
-			node["usefulness_score"] = us
-			node["traffic_share_score"] = us
-			node["bridge_score"] = s.store.GetBridgeScore(pubkey)
+			node["unscoped_relay_count_24h"] = info.UnscopedRelayCount24h
+			// #1751: region scopes this repeater has transported. Set only
+			// when non-empty (absent for no-scope nodes / older schemas).
+			if len(info.TransportedScopes) > 0 {
+				node["transported_scopes"] = info.TransportedScopes
+			}
+			// #672 4-axis usefulness (see handleNodes for the field
+			// contract). traffic_share_score keeps the raw per-axis
+			// Traffic value (#1456); the composite uses the
+			// population-max-normalized traffic (#1762 review).
+			usefulMap := s.store.GetRepeaterUsefulnessScoreMap()
+			trafficRaw := lookupUsefulnessScore(usefulMap, pubkey)
+			trafficNorm := 0.0
+			if mx := maxFloat(usefulMap); mx > 0 {
+				trafficNorm = trafficRaw / mx
+			}
+			enrichNodeUsefulness(node, trafficRaw, usefulnessAxes{
+				Traffic:    trafficNorm,
+				Bridge:     s.store.GetBridgeScore(pubkey),
+				Coverage:   s.store.GetCoverageScore(pubkey),
+				Redundancy: s.store.GetRedundancyScore(pubkey),
+			}, s.store.UsefulnessAxesComputed())
 		}
 	}
 
 	// #1143: GetRecentTransmissionsForNode no longer accepts a name fallback;
 	// attribution is strict exact-match on the indexed from_pubkey column.
 	recentAdverts, _ := s.db.GetRecentTransmissionsForNode(pubkey, 20)
+
+	// Windowed flood-advert count (7d): only the mesh-wide-airtime advert kind,
+	// separated from zero-hop adverts so a nearby observer hearing a node's
+	// cheap local adverts does not inflate the number. Consumed by the ArcScope
+	// repeater advisor to rate advert hygiene.
+	if n, err := s.db.CountFloodAdvertsForNode(pubkey, 7*24, floodAdvertRowCap); err == nil {
+		node["flood_advert_count_7d"] = n
+	} else {
+		log.Printf("WARN CountFloodAdvertsForNode(%s): %v", pubkey, err)
+	}
 
 	writeJSON(w, NodeDetailResponse{
 		Node:          node,
@@ -2764,11 +2840,12 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// #1828 Phase A: aggregate builders extracted into observer_analytics.go.
+	// Single snapshot under RLock (#1481 P0-2), then five composable helpers
+	// off the snapshot. No behavior change; JSON output is byte-identical.
 	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	s.store.mu.RLock()
 	obsList := s.store.byObserver[id]
-	// #1481 P0-2: snapshot pointer slice and release RLock immediately —
-	// don't iterate + json-decode + time-parse under the lock.
 	obsSnapshot := make([]*StoreObs, len(obsList))
 	copy(obsSnapshot, obsList)
 	s.store.mu.RUnlock()
@@ -2784,109 +2861,12 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 	}
 	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Timestamp > filtered[j].Timestamp })
 
-	bucketDur := 24 * time.Hour
-	if days <= 1 {
-		bucketDur = time.Hour
-	} else if days <= 7 {
-		bucketDur = 4 * time.Hour
-	}
-	formatLabel := func(t time.Time) string {
-		if days <= 1 {
-			return t.UTC().Format("15:04")
-		}
-		if days <= 7 {
-			return t.UTC().Format("Mon 15:04")
-		}
-		return t.UTC().Format("Jan 02")
-	}
-
-	packetTypes := map[string]int{}
-	timelineCounts := map[int64]int{}
-	nodeBucketSets := map[int64]map[string]struct{}{}
-	snrBuckets := map[int]*SnrDistributionEntry{}
-	recentPackets := make([]map[string]interface{}, 0, 20)
-
-	for i, obs := range filtered {
-		ts, ok := obs.ParsedTime()
-		if !ok {
-			continue
-		}
-		bucketStart := ts.UTC().Truncate(bucketDur).Unix()
-		timelineCounts[bucketStart]++
-		if nodeBucketSets[bucketStart] == nil {
-			nodeBucketSets[bucketStart] = map[string]struct{}{}
-		}
-
-		enriched := s.store.enrichObs(obs)
-		if pt, ok := enriched["payload_type"].(int); ok {
-			packetTypes[strconv.Itoa(pt)]++
-		}
-		if decodedRaw, ok := enriched["decoded_json"].(string); ok && decodedRaw != "" {
-			var decoded map[string]interface{}
-			if json.Unmarshal([]byte(decodedRaw), &decoded) == nil {
-				for _, k := range []string{"pubKey", "srcHash", "destHash"} {
-					if v, ok := decoded[k].(string); ok && v != "" {
-						nodeBucketSets[bucketStart][v] = struct{}{}
-					}
-				}
-			}
-		}
-		for _, hop := range parsePathJSON(obs.PathJSON) {
-			if hop != "" {
-				nodeBucketSets[bucketStart][hop] = struct{}{}
-			}
-		}
-		if obs.SNR != nil {
-			bucket := int(*obs.SNR) / 2 * 2
-			if *obs.SNR < 0 && int(*obs.SNR) != bucket {
-				bucket -= 2
-			}
-			if snrBuckets[bucket] == nil {
-				snrBuckets[bucket] = &SnrDistributionEntry{Range: fmt.Sprintf("%d to %d", bucket, bucket+2)}
-			}
-			snrBuckets[bucket].Count++
-		}
-		if i < 20 {
-			recentPackets = append(recentPackets, enriched)
-		}
-	}
-	// #1481 P0-2: RLock was released earlier after snapshotting the
-	// observation pointer slice; no Unlock needed here.
-
-	buildTimeline := func(counts map[int64]int) []TimeBucket {
-		keys := make([]int64, 0, len(counts))
-		for k := range counts {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-		out := make([]TimeBucket, 0, len(keys))
-		for _, k := range keys {
-			lbl := formatLabel(time.Unix(k, 0))
-			out = append(out, TimeBucket{Label: &lbl, Count: counts[k]})
-		}
-		return out
-	}
-
-	nodeCounts := make(map[int64]int, len(nodeBucketSets))
-	for k, nodes := range nodeBucketSets {
-		nodeCounts[k] = len(nodes)
-	}
-	snrKeys := make([]int, 0, len(snrBuckets))
-	for k := range snrBuckets {
-		snrKeys = append(snrKeys, k)
-	}
-	sort.Ints(snrKeys)
-	snrDistribution := make([]SnrDistributionEntry, 0, len(snrKeys))
-	for _, k := range snrKeys {
-		snrDistribution = append(snrDistribution, *snrBuckets[k])
-	}
-
 	writeJSON(w, ObserverAnalyticsResponse{
-		Timeline:        buildTimeline(timelineCounts),
-		PacketTypes:     packetTypes,
-		NodesTimeline:   buildTimeline(nodeCounts),
-		SnrDistribution: snrDistribution,
-		RecentPackets:   recentPackets,
+		Timeline:        buildTimeline(filtered, days),
+		PacketTypes:     buildPacketTypes(s.store, filtered),
+		NodesTimeline:   buildNodesTimeline(s.store, filtered, days),
+		SnrDistribution: buildSnrDistribution(filtered),
+		RecentPackets:   buildRecentPackets(s.store, filtered, 20),
 	})
 }
 
@@ -2909,6 +2889,8 @@ var iataCoords = map[string]IataCoord{
 	"LAX": {Lat: 33.9425, Lon: -118.4081},
 	"SAN": {Lat: 32.7338, Lon: -117.1933},
 	"SMF": {Lat: 38.6954, Lon: -121.5908},
+	"APC": {Lat: 38.2132, Lon: -122.2807}, // Napa County
+	"STS": {Lat: 38.509, Lon: -122.8128},  // Charles M. Schulz–Sonoma County
 	"MRY": {Lat: 36.587, Lon: -121.843},
 	"EUG": {Lat: 44.1246, Lon: -123.2119},
 	"RDD": {Lat: 40.509, Lon: -122.2934},
@@ -3044,6 +3026,29 @@ func queryInt(r *http.Request, key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// normaliseTypeColorsLegacyKeys returns a copy of `m` with the legacy
+// "REQUEST" key renamed to the canonical "REQ". If both keys are present
+// the canonical wins (caller already chose the new name explicitly).
+// #1799 PR #1804 r1 item 6: keeps stale operator config.json working
+// after the REQUEST→REQ rename for >=1 release cycle. Returns nil for
+// a nil input so mergeMap's nil-skip continues to work.
+func normaliseTypeColorsLegacyKeys(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	if legacy, ok := out["REQUEST"]; ok {
+		if _, hasCanon := out["REQ"]; !hasCanon {
+			out["REQ"] = legacy
+		}
+		delete(out, "REQUEST")
+	}
+	return out
 }
 
 func mergeMap(base map[string]interface{}, overlays ...map[string]interface{}) map[string]interface{} {

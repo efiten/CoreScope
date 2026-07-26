@@ -245,7 +245,7 @@
       nodeColors: { repeater: '#ff0000', companion: '#0066ff', room: '#009900', sensor: '#cc8800', observer: '#9933ff' },
       typeColors: {
         ADVERT: '#009900', GRP_TXT: '#0066ff', TXT_MSG: '#cc8800', ACK: '#666666',
-        REQUEST: '#9933ff', RESPONSE: '#0099cc', TRACE: '#cc0066', PATH: '#009999', ANON_REQ: '#cc3355'
+        REQ: '#9933ff', RESPONSE: '#0099cc', TRACE: '#cc0066', PATH: '#009999', ANON_REQ: '#cc3355'
       }
     },
     midnight: {
@@ -328,19 +328,35 @@
   };
   var NODE_EMOJI = { repeater: 'ph:diamond', companion: 'ph:circle-fill', room: 'ph:square-fill', sensor: 'ph:triangle', observer: 'ph:star-fill' };
 
-  var TYPE_LABELS = {
-    ADVERT: 'Advertisement', GRP_TXT: 'Channel Message', TXT_MSG: 'Direct Message', ACK: 'Acknowledgment',
-    REQUEST: 'Request', RESPONSE: 'Response', TRACE: 'Traceroute', PATH: 'Path', ANON_REQ: 'Anonymous Request'
-  };
+  // PR #1804 r1 item 3 (tufte3): consume canonical PayloadLabels shorts so
+  // the v2 customizer matches every other surface. Defensive literal
+  // fallback mirrors packets.js.
+  var TYPE_LABELS = (function () {
+    var FALLBACK = {
+      ADVERT: 'Advert', GRP_TXT: 'Channel Msg', TXT_MSG: 'Direct Msg', ACK: 'ACK',
+      REQ: 'Request', RESPONSE: 'Response', TRACE: 'Trace', PATH: 'Path',
+      ANON_REQ: 'Anon Req'
+    };
+    var PL = window.PayloadLabels;
+    if (!PL || !PL.SHORT_BY_ID) {
+      console.error('customize-v2.js: window.PayloadLabels missing — using inline TYPE_LABELS fallback.');
+      return FALLBACK;
+    }
+    var out = {};
+    for (var k in FALLBACK) {
+      out[k] = (PL[k] && PL[k].short) || FALLBACK[k];
+    }
+    return out;
+  })();
   var TYPE_HINTS = {
     ADVERT: 'Node advertisements', GRP_TXT: 'Group/channel messages', TXT_MSG: 'Direct messages',
-    ACK: 'Acknowledgments', REQUEST: 'Requests', RESPONSE: 'Responses',
+    ACK: 'Acknowledgments', REQ: 'Requests', RESPONSE: 'Responses',
     TRACE: 'Traceroute', PATH: 'Path packets', ANON_REQ: 'Encrypted anonymous requests'
   };
   // #1648 M5: defaults use 'ph:<name>' tokens. renderConfigGlyph() below
   // accepts both new ph tokens AND legacy emoji strings (back-compat).
   var TYPE_EMOJI = {
-    ADVERT: 'ph:broadcast', GRP_TXT: 'ph:chat-circle', TXT_MSG: 'ph:envelope', ACK: 'ph:check', REQUEST: 'ph:question',
+    ADVERT: 'ph:broadcast', GRP_TXT: 'ph:chat-circle', TXT_MSG: 'ph:envelope', ACK: 'ph:check', REQ: 'ph:question',
     RESPONSE: 'ph:envelope-simple', TRACE: 'ph:magnifying-glass', PATH: 'ph:path', ANON_REQ: 'ph:lock'
   };
 
@@ -710,8 +726,12 @@
     var tc = effectiveConfig.typeColors;
     if (tc) {
       for (var type in tc) {
-        root.setProperty('--type-' + type.toLowerCase(), tc[type]);
-        if (window.TYPE_COLORS && type in window.TYPE_COLORS) window.TYPE_COLORS[type] = tc[type];
+        // #1799 r1 item 6: legacy stored configs use 'REQUEST'; canonical
+        // key is 'REQ'. Migrate at read time so operator color choices
+        // survive the rename.
+        var canon = (type === 'REQUEST') ? 'REQ' : type;
+        root.setProperty('--type-' + canon.toLowerCase(), tc[type]);
+        if (window.TYPE_COLORS && canon in window.TYPE_COLORS) window.TYPE_COLORS[canon] = tc[type];
       }
       if (window.syncBadgeColors) window.syncBadgeColors();
     }
@@ -2699,7 +2719,9 @@
     }
     if (earlyOverrides.typeColors && window.TYPE_COLORS) {
       for (var type in earlyOverrides.typeColors) {
-        if (type in window.TYPE_COLORS) window.TYPE_COLORS[type] = earlyOverrides.typeColors[type];
+        // #1799 r1 item 6: REQUEST → REQ migration (see comment above).
+        var canon = (type === 'REQUEST') ? 'REQ' : type;
+        if (canon in window.TYPE_COLORS) window.TYPE_COLORS[canon] = earlyOverrides.typeColors[type];
       }
       if (window.syncBadgeColors) window.syncBadgeColors();
     }

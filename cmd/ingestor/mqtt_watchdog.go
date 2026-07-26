@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +19,60 @@ const livenessHeartbeatInterval = time.Hour
 // forceReconnectThrottle is the minimum interval between forced
 // reconnects on the SAME source. See processLivenessTransition.
 const forceReconnectThrottle = 60 * time.Second
+
+// disconnectedReconnectMultiplier (#1749) governs how long a source may
+// stay in LivenessDisconnected before the watchdog escalates with a
+// forced reconnect. paho's SetAutoReconnect(true) normally recovers a
+// dropped connection; in production we have observed paho's reconnect
+// machinery silently dying for a single source while another source on
+// the same binary reconnects fine (prod 2026-06-30: connectCount=1,
+// disconnectCount=1, lastError="EOF", zero retries for 18h). When the
+// source stays !IsConnected for more than `multiplier × threshold`,
+// the watchdog forces a reconnect rather than trusting paho to recover.
+const disconnectedReconnectMultiplier = 5
+
+// watchdogLastTickUnix (#1749) is the wall-clock unix-seconds timestamp
+// of the most recent runLivenessWatchdogLoop tick. The watchdog
+// goroutine has itself gone silent in production (#1749: 3 sources
+// stalled simultaneously for 75 min with zero WATCHDOG log lines),
+// suggesting goroutine-level failure. Exposing this clock via
+// /api/mqtt/status lets external monitoring assert that the watchdog
+// is still ticking — a stale value (e.g. > 2× the scan interval)
+// indicates the watchdog itself is dead.
+//
+// Style note (#1810 round-1, adv #5): new package-level counters in
+// this file use atomic.Int64 (typed, method-based) while per-source
+// state on SourceLivenessState uses plain int64 + atomic.StoreInt64.
+// The struct fields stay int64 because they are accessed through
+// pointer receivers all over the codebase and atomic.Int64 inside a
+// struct breaks the "noCopy" semantics expected of value receivers
+// in a few callsites; package-level vars have no such constraint and
+// the typed form catches misuse at compile time. Kept-both is
+// intentional, not drift.
+var watchdogLastTickUnix atomic.Int64
+
+// watchdogPanicCount (#1810 round-1, Taleb #3) counts recovered panics
+// inside the per-source watchdog work IIFE. A loop that panic-loops
+// every tick currently looks healthy by WatchdogLastTickUnix alone —
+// the tick stamp lands BEFORE the per-source work, so a panic on every
+// source still advances the clock. This counter, surfaced via
+// /api/mqtt/status and the stats snapshot, lets external monitoring
+// alarm on a rapidly-growing value (= the loop is alive but the work
+// is broken).
+var watchdogPanicCount atomic.Int64
+
+// WatchdogLastTickUnix returns the unix-seconds timestamp of the most
+// recent watchdog tick. Returns 0 if the watchdog has never ticked.
+func WatchdogLastTickUnix() int64 {
+	return watchdogLastTickUnix.Load()
+}
+
+// WatchdogPanicCount returns the running total of recovered panics
+// inside the watchdog per-source work IIFE (#1810). Monotonic across
+// the process lifetime; never decreases.
+func WatchdogPanicCount() int64 {
+	return watchdogPanicCount.Load()
+}
 
 // LivenessKind enumerates the watchdog verdicts for a source. Edge-triggered
 // transitions use this to decide whether to emit (and what severity).
@@ -55,8 +111,8 @@ const (
 //     window. r1's StartedAt-as-grace-clock conflated transient-stall
 //     suppression with cold-start grace; r2 separates them.
 type SourceLivenessState struct {
-	Tag    string
-	Broker string
+	Tag             string
+	Broker          string
 	LastMessageUnix int64 // atomic; unix seconds of last successfully WRITTEN MQTT message (handleMessage post-write)
 	// LastReceiptUnix (PR #1609 M1) is stamped at MQTT receipt time —
 	// BEFORE the message is handed to the buffer/writer. STUB: unused
@@ -88,6 +144,15 @@ type SourceLivenessState struct {
 	// recent forced reconnect for this source; the watchdog reads it
 	// to enforce forceReconnectThrottle. atomic.
 	LastForceReconnectUnix int64
+	// DisconnectedSinceUnix (#1749) is the unix-seconds timestamp of
+	// the FIRST tick on which the watchdog observed this source in
+	// LivenessDisconnected (paho reports !IsConnected). Cleared back
+	// to 0 on any tick where the source is NOT disconnected. When the
+	// gap (now - DisconnectedSinceUnix) exceeds
+	// disconnectedReconnectMultiplier × threshold, the watchdog
+	// escalates with a forced reconnect on the assumption that paho's
+	// own auto-reconnect machinery has silently died. atomic.
+	DisconnectedSinceUnix int64
 	// AttemptCount is incremented on every TCP/TLS connection attempt. Used
 	// by ConnectionAttemptHandler to log attempt # independent of paho's
 	// internal reconnect-loop state. atomic.
@@ -127,6 +192,14 @@ func (s *SourceLivenessState) MarkReconnected(now time.Time) {
 	atomic.StoreInt64(&s.LastMessageUnix, 0)
 	atomic.StoreInt64(&s.StartedAt, now.Unix())
 	atomic.StoreInt64(&s.LastAlertUnix, 0)
+	// #1810 round-1 (Taleb #5): clear DisconnectedSinceUnix so the
+	// next LivenessDisconnected observation is treated as a NEW outage
+	// and starts its escalation timer from scratch. Without this, a
+	// post-recovery disconnect immediately satisfies (now -
+	// DisconnectedSinceUnix > multiplier × threshold) and force-
+	// reconnects on the first tick — making the escalation a
+	// trigger-on-flap instead of trigger-on-persistent-failure.
+	atomic.StoreInt64(&s.DisconnectedSinceUnix, 0)
 }
 
 // checkSourceLiveness returns (message, kind) describing the source's
@@ -315,6 +388,13 @@ func runLivenessWatchdogLoop(tick <-chan time.Time, done <-chan struct{}, thresh
 			if !ok {
 				return
 			}
+			// #1749: stamp the watchdog clock BEFORE per-source work so
+			// a panic or hang inside processLivenessTransition does
+			// not freeze the heartbeat that /api/mqtt/status exposes.
+			// External monitoring on WatchdogLastTickUnix detects a
+			// wedged loop only if this clock is fresh-while-ticking
+			// and stale-when-dead.
+			watchdogLastTickUnix.Store(now.Unix())
 			livenessRegistryMu.RLock()
 			states := make([]*SourceLivenessState, 0, len(livenessRegistry))
 			for _, s := range livenessRegistry {
@@ -322,11 +402,126 @@ func runLivenessWatchdogLoop(tick <-chan time.Time, done <-chan struct{}, thresh
 			}
 			livenessRegistryMu.RUnlock()
 			for _, s := range states {
+				// #1749: handle disconnect-escalation bookkeeping
+				// BEFORE the transition dispatch. checkSourceLiveness
+				// returns LivenessDisconnected when paho reports
+				// !IsConnected; we track how long that has persisted
+				// and escalate with a forced reconnect when paho's
+				// own auto-reconnect machinery has clearly failed
+				// (multiplier × threshold without recovery).
 				msg, kind := checkSourceLiveness(s, threshold, now)
-				processLivenessTransition(s, kind, msg, now, emit)
+				// #1749: a panic in emit (blocked log pipe, full
+				// Docker JSON-file driver, etc.) MUST NOT kill the
+				// watchdog goroutine. Recover per-source so one bad
+				// source — or one bad log call — does not silence
+				// all monitoring across all sources. Both
+				// maybeEscalateDisconnected and processLivenessTransition
+				// call emit, so both must be inside the recover scope.
+				func(state *SourceLivenessState, k LivenessKind, m string) {
+					defer func() {
+						if r := recover(); r != nil {
+							// #1810 round-1 (Taleb #2 + #3):
+							// (a) Write to os.Stderr DIRECTLY rather than via
+							// log.Printf. The original log sink is the prime
+							// suspect for a panic in emit (blocked stderr pipe,
+							// full Docker JSON-file driver) — using the same
+							// sink to report the recovery risks a second
+							// panic-on-recover that kills the goroutine the
+							// recover was meant to save. os.Stderr.Write is a
+							// raw syscall and bypasses log's own mutex.
+							// (b) Increment watchdogPanicCount so a panic-per-
+							// tick loop is visible to external monitoring even
+							// though WatchdogLastTickUnix continues to advance.
+							watchdogPanicCount.Add(1)
+							fmt.Fprintf(os.Stderr, "[ingestor] WATCHDOG RECOVERED panic processing source %q: %v\n", state.Tag, r)
+						}
+					}()
+					maybeEscalateDisconnected(state, k, threshold, now, emit)
+					processLivenessTransition(state, k, m, now, emit)
+				}(s, kind, msg)
 			}
 		}
 	}
+}
+
+// maybeEscalateDisconnected (#1749) tracks how long a source has
+// continuously been observed in LivenessDisconnected and triggers a
+// forced reconnect (subject to forceReconnectThrottle) once the gap
+// exceeds disconnectedReconnectMultiplier × threshold.
+//
+// Background: paho's SetAutoReconnect(true) is supposed to recover
+// dropped connections on its own. In production we have observed paho
+// silently giving up on one source — connectCount=1, disconnectCount=1,
+// lastError="EOF", zero retries for 18h — while another source on the
+// same binary reconnects fine. The existing watchdog's
+// processLivenessTransition stays silent on LivenessDisconnected to
+// avoid double-logging paho's own disconnect line; this escalation
+// path is the recovery hook for the case where paho never tries again.
+//
+// Behavior:
+//   - kind != LivenessDisconnected: clear DisconnectedSinceUnix (reset
+//     the timer; recovery or other state).
+//   - kind == LivenessDisconnected, first observation: stamp
+//     DisconnectedSinceUnix = now.
+//   - kind == LivenessDisconnected, gap >= multiplier × threshold:
+//     emit a WARN and call maybeForceReconnect (throttled). The
+//     timestamp is NOT advanced beyond the original observation so the
+//     emit fires on every tick past the boundary; the throttle inside
+//     maybeForceReconnect handles the broker-hammering concern.
+//
+// emit is wrapped in defer/recover by the caller — a panic here does
+// not kill the loop.
+// disconnectedEscalationGap returns the gap (now - DisconnectedSinceUnix)
+// at which the watchdog escalates a persistent LivenessDisconnected
+// observation into a forced reconnect. Hoisted out of
+// maybeEscalateDisconnected (#1810 round-1, adv #6) so it is computed
+// once per call site rather than per-source-per-tick. The result
+// includes a per-source jitter offset (#1810 round-1, Taleb #4) so
+// that a shared-broker outage across N sources does NOT cause a
+// synchronized thundering-herd reconnect at the multiplier × threshold
+// boundary. Jitter range: 0..forceReconnectThrottle, deterministic per
+// tag (hash-based, no RNG state) so retries do not phase-walk.
+func disconnectedEscalationGap(tag string, threshold time.Duration) time.Duration {
+	base := disconnectedReconnectMultiplier * threshold
+	if forceReconnectThrottle <= 0 {
+		return base
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(tag))
+	jitter := time.Duration(h.Sum32()%uint32(forceReconnectThrottle/time.Millisecond)) * time.Millisecond
+	return base + jitter
+}
+
+func maybeEscalateDisconnected(s *SourceLivenessState, kind LivenessKind, threshold time.Duration, now time.Time, emit func(...any)) {
+	if kind != LivenessDisconnected {
+		atomic.StoreInt64(&s.DisconnectedSinceUnix, 0)
+		return
+	}
+	disconnectedSince := atomic.LoadInt64(&s.DisconnectedSinceUnix)
+	if disconnectedSince == 0 {
+		atomic.StoreInt64(&s.DisconnectedSinceUnix, now.Unix())
+		return
+	}
+	gap := now.Sub(time.Unix(disconnectedSince, 0))
+	escalateAt := disconnectedEscalationGap(s.Tag, threshold)
+	if gap < escalateAt {
+		return
+	}
+	// #1810 round-1 (adv #2 + Taleb #1): only emit the ESCALATION WARN
+	// when we are actually going to issue a force-reconnect. Without
+	// this throttle, every tick past the boundary re-emits the WARN
+	// — for a 1m scan interval and a 1h outage, that's 55+ duplicate
+	// alert lines. maybeForceReconnect already enforces
+	// forceReconnectThrottle and writes its own "forcing reconnect"
+	// telemetry, so the operator-visible log surface is still
+	// complete; we just no longer drown them in pre-amble.
+	lastForce := atomic.LoadInt64(&s.LastForceReconnectUnix)
+	if lastForce != 0 && now.Sub(time.Unix(lastForce, 0)) < forceReconnectThrottle {
+		return
+	}
+	emit(fmt.Sprintf("MQTT [%s] WATCHDOG ESCALATION: paho disconnected for %s (>%d×threshold=%s) with no auto-reconnect — forcing reconnect (#1749)",
+		s.Tag, gap.Round(time.Second), disconnectedReconnectMultiplier, escalateAt))
+	maybeForceReconnect(s, now, emit)
 }
 
 // processLivenessTransition applies the edge-trigger rules and updates
@@ -407,4 +602,3 @@ func maybeForceReconnect(s *SourceLivenessState, now time.Time, emit func(...any
 		emit(fmt.Sprintf("MQTT [%s] WATCHDOG reconnect attempt issued", s.Tag))
 	}()
 }
-

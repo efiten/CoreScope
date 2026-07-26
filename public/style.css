@@ -2110,7 +2110,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 /* === Observers Page === */
-.observers-page { padding: 20px; max-width: 1200px; margin: 0 auto; }
+.observers-page { padding: 20px; margin: 0 auto; }
 .obs-summary { display: flex; gap: 20px; margin-bottom: 16px; flex-wrap: wrap; }
 .obs-stat { display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--text-muted); }
 /* #1562 — "Last updated: X ago" pill on the observers-page header.
@@ -2432,6 +2432,32 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   .data-table th { padding: 5px 4px; font-size: 10px; }
   .data-table .col-time { min-width: 64px; }
   .panel-left { overflow-x: auto; }
+
+  /* #1770: packets-view virtual-scroller assumes constant row height
+     (VSCROLL_ROW_HEIGHT). The base rule at ~L1097 sets
+     `.data-table td.col-details { white-space: normal; word-break: break-word }`
+     which lets the "Details" cell wrap on narrow viewports, producing
+     variable row heights → visible jitter when scrolling past ~900px on
+     iOS. Quick-fix (S path): clamp the cell to a single line on mobile.
+     The proper L-path fix (per-row measurement) tracks separately.
+
+     v2 (#1805 follow-up): the clamp lives on an INNER `.col-details-clip`
+     wrapper, not the `<td>` itself. Reason: with `white-space: nowrap` on
+     the td and `table-layout: auto`, the cell's min-content becomes the
+     full single-line text width, blowing past the `max-width: 100px`
+     mobile hint. Rows then grow wider than the 360px viewport — which
+     breaks `test-gestures-1062-e2e.js` (a)/(h) because the swipe coords
+     fall outside the viewport and `elementFromPoint` no longer hits the
+     row. Inline-block + fixed `max-width` on the clip caps the column's
+     preferred width so the row stays viewport-bounded and gestures work. */
+  .data-table td.col-details > .col-details-clip {
+    display: inline-block;
+    max-width: 140px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: bottom;
+  }
 
   /* Filters: collapse on mobile */
   .filter-bar { flex-direction: row; flex-wrap: wrap; gap: 4px; }

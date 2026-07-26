@@ -37,6 +37,10 @@ type StoreTx struct {
 	RouteType        *int
 	PayloadType      *int
 	DecodedJSON      string
+	// ScopeName is the transmission's region scope name (transmissions.scope_name,
+	// #899). Empty on schemas without the column (db.hasScopeName=false). Used to
+	// surface the set of region scopes a repeater has transported (#1751).
+	ScopeName        string
 	Observations     []*StoreObs
 	ObservationCount int
 	// Display fields from longest-path observation
@@ -283,6 +287,11 @@ type PacketStore struct {
 	distLazyBuilding  bool
 	distLazyLastBuilt time.Time
 	distLazyLastObs   int // totalObs at last build, for Δobs debounce
+	// distanceBuildHook, if non-nil, runs at the start of the lazy build
+	// goroutine (after distLazyBuilding is set, before any lock is held). Tests
+	// use it to hold the build open so concurrent requests deterministically
+	// observe the "building" window; nil (and zero overhead) in production.
+	distanceBuildHook func()
 
 	// Cached GetNodeHashSizeInfo result — recomputed at most once every 15s
 	hashSizeInfoMu    sync.Mutex
@@ -333,6 +342,23 @@ type PacketStore struct {
 	// pointer load — no lock contention with the per-request enrichment
 	// path in handleNodes (same discipline as #1248).
 	bridgeScoreMap atomic.Pointer[map[string]float64]
+
+	// Coverage + Redundancy axes (issue #672 axes 3 & 4 of 4): atomic
+	// snapshots of pubkey → 0..1 score over the current neighbor graph.
+	// Coverage = normalized harmonic reach centrality; Redundancy =
+	// articulation-point fragmentation criticality. Populated by the
+	// usefulness-axes recomputer (usefulness_axes_recomputer.go); nil until
+	// the first compute lands. Read path is a single atomic pointer load,
+	// matching the bridge axis.
+	coverageScoreMap   atomic.Pointer[map[string]float64]
+	redundancyScoreMap atomic.Pointer[map[string]float64]
+
+	// Start-once latch for the usefulness-axes recomputer
+	// (usefulness_axes_recomputer.go). Per-store rather than package-global so
+	// independent PacketStores each run their own recomputer; guards the
+	// idempotent StartUsefulnessAxesRecomputer (a second call no-ops).
+	usefulnessAxesRecompMu      sync.Mutex
+	usefulnessAxesRecompStarted bool
 
 	// Precomputed distinct advert pubkey count (refcounted for eviction correctness).
 	// Updated incrementally during Load/Ingest/Evict — avoids JSON parsing in GetPerfStoreStats.
@@ -395,6 +421,21 @@ type PacketStore struct {
 	//     Read order MUST be: load backgroundLoadDone first; only if true
 	//     is backgroundLoadFailed meaningful.
 	// 0 = disabled (current behavior). Background loader fills the rest.
+	//
+	// IMMUTABILITY: hotStartupHours is set ONCE in NewPacketStore (with
+	// optional clamp against retentionHours) and is NEVER mutated
+	// afterward. Readers (LoadChunked, RunStartupLoad,
+	// loadBackgroundChunks, GetPerfStoreStats) intentionally read it
+	// without s.mu. Do not add a write path without also adding the
+	// lock to every reader — see #1809 / #1811.
+	//
+	// ENFORCEMENT (dij #5): immutability is enforced indirectly. A
+	// mutation that left oldestLoaded inconsistent with the new
+	// hotStartupHours would trip the loadBackgroundChunks invariant
+	// (see store.go ~line 1442 — the invariantViolation() guard).
+	// That guard is the runtime backstop; this comment is the
+	// compile-time discipline. If you genuinely need to mutate
+	// hotStartupHours at runtime, audit every reader above first.
 	hotStartupHours        float64
 	backgroundLoadDone     atomic.Bool
 	backgroundLoadFailed   atomic.Bool
@@ -402,8 +443,13 @@ type PacketStore struct {
 
 	// #1690: backgroundLoadError captures the human-readable reason when
 	// backgroundLoadFailed flips true (e.g. "loaded 12.3% of 1000 rows").
-	// Guarded by bgErrMu so the perf endpoint can read it without
-	// synchronising on s.mu (held by chunk-merge writers).
+	// Guarded by bgErrMu (RWMutex) so the perf endpoint can read it
+	// without synchronising on s.mu (held by chunk-merge writers).
+	// CONCURRENCY (dij #4): EVERY read and write of backgroundLoadErr
+	// MUST hold bgErrMu (RLock for reads, Lock for writes). Do not
+	// promote to atomic.Pointer without also auditing the two call
+	// sites in chunked_load.go's RunStartupLoad and store.go's
+	// loadBackgroundChunks + GetPerfStoreStats + BackgroundLoadError.
 	bgErrMu            sync.RWMutex
 	backgroundLoadErr  string
 	// loadCoverageRatio: totalLoaded / totalInDB (0.0–1.0). Updated by
@@ -441,6 +487,12 @@ type PacketStore struct {
 	statsCacheTime time.Time
 	statsLastHour  int
 	statsLast24h   int
+
+	// Test-only hook fired at the very start of loadBackgroundChunks
+	// (after the #1809 invariant check). Nil in production. Used by
+	// ordering tests to capture the bg-loader entry timestamp/signal
+	// without polling. See runstartup_load_test.go.
+	bgLoaderEntryHook func()
 }
 
 // Precomputed distance records for fast analytics aggregation.
@@ -704,6 +756,12 @@ func (s *PacketStore) Load() error {
 	if s.db.hasObsRawHex {
 		obsRawHexCol = ", o.raw_hex"
 	}
+	// #1751: scope_name is on the transmission row; append as the last
+	// selected column so the observation fan-out doesn't affect its position.
+	scopeNameCol := ""
+	if s.db.hasScopeName {
+		scopeNameCol = ", t.scope_name"
+	}
 
 	// Build WHERE conditions: retention cutoff (mirrors Evict logic) + optional memory-cap limit.
 	// When hotStartupHours > 0, use it as the initial cutoff (smaller window = fast startup).
@@ -748,7 +806,7 @@ func (s *PacketStore) Load() error {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + `
+				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
 			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + filterClause + `
@@ -757,7 +815,7 @@ func (s *PacketStore) Load() error {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + `
+				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
 			LEFT JOIN observers obs ON obs.id = o.observer_id` + filterClause + `
@@ -795,6 +853,7 @@ func (s *PacketStore) Load() error {
 		var score sql.NullInt64
 		var obsRawHex sql.NullString
 		var resolvedPathStr sql.NullString
+		var scopeName sql.NullString
 
 		scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 			&payloadVersion, &decodedJSON,
@@ -805,6 +864,9 @@ func (s *PacketStore) Load() error {
 		}
 		if s.db.hasResolvedPath {
 			scanArgs = append(scanArgs, &resolvedPathStr)
+		}
+		if s.db.hasScopeName {
+			scanArgs = append(scanArgs, &scopeName)
 		}
 		if err := rows.Scan(scanArgs...); err != nil {
 			log.Printf("[store] scan error: %v", err)
@@ -823,6 +885,7 @@ func (s *PacketStore) Load() error {
 				RouteType:   nullIntPtr(routeType),
 				PayloadType: nullIntPtr(payloadType),
 				DecodedJSON: nullStrVal(decodedJSON),
+				ScopeName:   nullStrVal(scopeName),
 				obsKeys:     make(map[string]bool),
 				observerSet: make(map[string]bool),
 			}
@@ -863,7 +926,6 @@ func (s *PacketStore) Load() error {
 				RSSI:           nullFloatPtr(rssi),
 				Score:          nullIntPtr(score),
 				PathJSON:       obsPJ,
-				RawHex:         nullStrVal(obsRawHex),
 				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
 			}
 
@@ -1026,6 +1088,11 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	if s.db.hasObsRawHex {
 		obsRawHexCol = ", o.raw_hex"
 	}
+	// #1751: scope_name is on the transmission row; append as the last column.
+	scopeNameCol := ""
+	if s.db.hasScopeName {
+		scopeNameCol = ", t.scope_name"
+	}
 
 	// #1690: window on the denormalized last_seen (effective recency)
 	// rather than first_seen. See chunked_load.go for the full rationale.
@@ -1045,7 +1112,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 		chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, obs.id, obs.name, o.direction,
-				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + `
+				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
 			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + filterClause + `
@@ -1054,7 +1121,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 		chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, o.observer_id, o.observer_name, o.direction,
-				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + `
+				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id` + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
@@ -1114,6 +1181,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 		var score sql.NullInt64
 		var obsRawHex sql.NullString
 		var resolvedPathStr sql.NullString
+		var scopeName sql.NullString
 
 		scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 			&payloadVersion, &decodedJSON,
@@ -1124,6 +1192,9 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 		}
 		if s.db.hasResolvedPath {
 			scanArgs = append(scanArgs, &resolvedPathStr)
+		}
+		if s.db.hasScopeName {
+			scanArgs = append(scanArgs, &scopeName)
 		}
 		if err := rows.Scan(scanArgs...); err != nil {
 			log.Printf("[store] loadChunk scan error: %v", err)
@@ -1142,6 +1213,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 				RouteType:   nullIntPtr(routeType),
 				PayloadType: nullIntPtr(payloadType),
 				DecodedJSON: nullStrVal(decodedJSON),
+				ScopeName:   nullStrVal(scopeName),
 				obsKeys:     make(map[string]bool),
 				observerSet: make(map[string]bool),
 			}
@@ -1174,7 +1246,6 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 				RSSI:           nullFloatPtr(rssi),
 				Score:          nullIntPtr(score),
 				PathJSON:       obsPJ,
-				RawHex:         nullStrVal(obsRawHex),
 				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
 			}
 
@@ -1373,6 +1444,37 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 // chunks are merged it rebuilds analytics indexes once. Chunk errors are
 // handled by advancing past the failed window so the loop always terminates.
 func (s *PacketStore) loadBackgroundChunks() {
+	// #1809 invariant: oldestLoaded MUST be set before the bg loader
+	// runs whenever the in-memory store has packets. The original bug
+	// was a parallel spawn that read oldestLoaded="" and silently
+	// bailed → coverage gate trips → backgroundLoadFailed=true. Encode
+	// the precondition here so a future refactor that re-introduces
+	// the race fails loudly instead of silently shipping the same
+	// regression. Empty store + empty oldestLoaded is the legitimate
+	// "empty DB" path and is allowed.
+	s.mu.RLock()
+	oldestAtEntry := s.oldestLoaded
+	packetCountAtEntry := len(s.packets)
+	s.mu.RUnlock()
+	if oldestAtEntry == "" && packetCountAtEntry > 0 {
+		// adv #6 (PR #1811): in prod, a panic dumps every goroutine
+		// stack and exits non-zero with `goroutine X [running]:` noise.
+		// log.Fatalf is the cleaner shutdown: single-line "FATAL"
+		// log, os.Exit(1), no stack spew, supervisor-friendly. Tests
+		// override invariantViolation to panic so they can recover()
+		// and assert the invariant message without crashing the test
+		// runner. The invariant itself (refuse to silently bail on
+		// the #1809 race) is preserved regardless of the handler.
+		invariantViolation(fmt.Sprintf("loadBackgroundChunks: oldestLoaded=\"\" with %d packets in store — LoadChunked must run to completion first (#1809)", packetCountAtEntry))
+		return
+	}
+
+	// Test-only entry hook. Production stores leave bgLoaderEntryHook
+	// nil and pay the nil-check cost only.
+	if s.bgLoaderEntryHook != nil {
+		s.bgLoaderEntryHook()
+	}
+
 	if s.retentionHours <= 0 {
 		s.backgroundLoadDone.Store(true)
 		return
@@ -2268,6 +2370,77 @@ func (s *PacketStore) GetPerfStoreStatsTyped() PerfPacketStoreStats {
 	}
 }
 
+// GetStoreMemoryBreakdown walks the whole store ONCE (under RLock) and returns
+// the flood-forward (route_type 0/1) share of stored transmissions plus a
+// per-component breakdown of the string bytes held in memory. O(tx + obs) — it
+// touches every observation, so it is opt-in (/api/perf?mem=1) and must not be
+// on the hot path.
+//
+// LOCK CONTENTION: this holds s.mu.RLock for the entire scan of the store. On a
+// large store (millions of observations) the walk takes long enough to stall
+// concurrent writers (ingest/eviction take the write lock) for the duration.
+// Operators should poll this infrequently (e.g. on demand, not on a tight
+// dashboard refresh) — do not wire it into a high-frequency scrape.
+//
+// The per-component *MB figures count string CONTENT plus one Go string header
+// per field. For fields that are inline struct members (RawHex, DecodedJSON,
+// PathJSON, observer strings) that header is ALSO part of storeTxBaseBytes /
+// storeObsBaseBytes, so the per-component totals are a deliberate UPPER BOUND,
+// not additive with TotalTxEstimatedMB. struct/index/map overhead, the neighbor
+// graph and analytics caches are excluded entirely — which is why the total
+// here sits below goHeapInuseMB.
+func (s *PacketStore) GetStoreMemoryBreakdown() *StoreMemoryBreakdown {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := &StoreMemoryBreakdown{}
+	var txRawHex, txDecodedJSON, txPathJSON int64
+	var obsPathJSON, obsStrings int64
+	var floodTxBytes, totalTxBytes int64
+
+	for _, tx := range s.packets {
+		if tx == nil {
+			continue
+		}
+		out.TotalTx++
+		isFlood := tx.RouteType != nil && (*tx.RouteType == 0 || *tx.RouteType == 1)
+		if isFlood {
+			out.FloodTx++
+		}
+		txRawHex += int64(len(tx.RawHex) + strHdr)
+		txDecodedJSON += int64(len(tx.DecodedJSON) + strHdr)
+		txPathJSON += int64(len(tx.PathJSON) + strHdr)
+		b := estimateStoreTxBytes(tx)
+		totalTxBytes += b
+		if isFlood {
+			floodTxBytes += b
+		}
+		for _, o := range tx.Observations {
+			if o == nil {
+				continue
+			}
+			out.Observations++
+			obsPathJSON += int64(len(o.PathJSON) + strHdr)
+			obsStrings += int64(len(o.ObserverID)+len(o.ObserverName)+len(o.ObserverIATA)+len(o.Direction)+len(o.Timestamp)) + 5*strHdr
+		}
+	}
+
+	// 2 decimal places so sub-0.1MB components don't round away to 0.
+	mb := func(b int64) float64 { return math.Round(float64(b)/1048576*100) / 100 }
+	out.TxRawHexMB = mb(txRawHex)
+	out.TxDecodedJsonMB = mb(txDecodedJSON)
+	out.TxPathJsonMB = mb(txPathJSON)
+	out.ObsPathJsonMB = mb(obsPathJSON)
+	out.ObsStringsMB = mb(obsStrings)
+	out.FloodTxEstimatedMB = mb(floodTxBytes)
+	out.TotalTxEstimatedMB = mb(totalTxBytes)
+	if out.TotalTx > 0 {
+		out.FloodTxSharePct = math.Round(float64(out.FloodTx)/float64(out.TotalTx)*1000) / 10
+		out.ObsPerTx = math.Round(float64(out.Observations)/float64(out.TotalTx)*10) / 10
+	}
+	return out
+}
+
 // GetTransmissionByID returns a transmission by its DB ID, formatted as a map.
 func (s *PacketStore) GetTransmissionByID(id int) map[string]interface{} {
 	s.mu.RLock()
@@ -2427,11 +2600,16 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	if s.db.hasObsRawHex {
 		obsRHCol = ", o.raw_hex"
 	}
+	// #1751: scope_name is on the transmission row; append as the last column.
+	scopeNameCol := ""
+	if s.db.hasScopeName {
+		scopeNameCol = ", t.scope_name"
+	}
 	if s.db.isV3 {
 		querySQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRHCol + `
+				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRHCol + scopeNameCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
 			LEFT JOIN observers obs ON obs.rowid = o.observer_idx
@@ -2441,7 +2619,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		querySQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRHCol + `
+				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRHCol + scopeNameCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
 			LEFT JOIN observers obs ON obs.id = o.observer_id
@@ -2464,6 +2642,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		obsID                                                              *int
 		observerID, observerName, observerIATA, direction, pathJSON, obsTS string
 		obsRawHex                                                          string
+		scopeName                                                          string
 		snr, rssi                                                          *float64
 		score                                                              *int
 	}
@@ -2481,6 +2660,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		var snrVal, rssiVal sql.NullFloat64
 		var scoreVal sql.NullInt64
 		var obsRawHex sql.NullString
+		var scopeName sql.NullString
 
 		scanArgs2 := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 			&payloadVersion, &decodedJSON,
@@ -2488,6 +2668,9 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 			&snrVal, &rssiVal, &scoreVal, &pathJSON, &obsTimestamp}
 		if s.db.hasObsRawHex {
 			scanArgs2 = append(scanArgs2, &obsRawHex)
+		}
+		if s.db.hasScopeName {
+			scanArgs2 = append(scanArgs2, &scopeName)
 		}
 		if err := rows.Scan(scanArgs2...); err != nil {
 			continue
@@ -2516,6 +2699,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 			pathJSON:     nullStrVal(pathJSON),
 			obsTS:        nullStrVal(obsTimestamp),
 			obsRawHex:    nullStrVal(obsRawHex),
+			scopeName:    nullStrVal(scopeName),
 			snr:          nullFloatPtr(snrVal),
 			rssi:         nullFloatPtr(rssiVal),
 			score:        nullIntPtr(scoreVal),
@@ -2570,6 +2754,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				RouteType:   r.routeType,
 				PayloadType: r.payloadType,
 				DecodedJSON: r.decodedJSON,
+				ScopeName:   r.scopeName,
 				obsKeys:     make(map[string]bool),
 				observerSet: make(map[string]bool),
 			}
@@ -2620,7 +2805,6 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				RSSI:           r.rssi,
 				Score:          r.score,
 				PathJSON:       r.pathJSON,
-				RawHex:         r.obsRawHex,
 				Timestamp:      normalizeTimestamp(r.obsTS),
 			}
 
@@ -2952,8 +3136,10 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 			RSSI:           r.rssi,
 			Score:          r.score,
 			PathJSON:       r.pathJSON,
-			RawHex:         r.rawHex,
-			Timestamp:      normalizeTimestamp(r.timestamp),
+			// obs.RawHex deliberately NOT stored: it duplicates the parent
+			// tx.RawHex and enrichObs falls back to tx.RawHex when obs.RawHex
+			// == "". Live-polled observations must not re-introduce the dup.
+			Timestamp: normalizeTimestamp(r.timestamp),
 		}
 
 		// Resolve path at ingest time for late-arriving observations (review item #2).
@@ -3618,7 +3804,11 @@ func (s *PacketStore) enrichObs(obs *StoreObs) map[string]interface{} {
 
 	if tx != nil {
 		m["hash"] = strOrNil(tx.Hash)
-		// Prefer per-observation raw_hex; fall back to transmission-level (#881)
+		// raw_hex comes from the transmission (#881). obs.RawHex is no longer
+		// retained when loading/ingesting the store — it duplicated this exact
+		// value (same content hash ⇒ same frame) and at ~10.6 observations/tx
+		// wasted ~98MB on a live ~1.7M-observation store. The obs.RawHex branch
+		// stays for callers that build a StoreObs from a response map.
 		if obs.RawHex != "" {
 			m["raw_hex"] = obs.RawHex
 		} else {
@@ -4150,6 +4340,10 @@ func (s *PacketStore) TriggerDistanceIndexBuild() {
 		s.distLazyBuilding = true
 		s.distLazyMu.Unlock()
 
+		if s.distanceBuildHook != nil {
+			s.distanceBuildHook() // test seam: hold the build window open
+		}
+
 		s.mu.Lock()
 		s.buildDistanceIndex()
 		obsAtBuild := s.totalObs
@@ -4214,6 +4408,7 @@ func (s *PacketStore) buildDistanceIndex() {
 const (
 	storeTxBaseBytes  = 384 // StoreTx struct fields + map headers + sync.Once + string headers
 	storeObsBaseBytes = 192 // StoreObs struct fields + string headers
+	strHdr            = 16  // Go string header (ptr + len) on a 64-bit build; used by GetStoreMemoryBreakdown
 	indexEntryBytes   = 48  // average cost of one index map entry (key + pointer + bucket overhead)
 	numIndexesPerTx   = 5   // byHash, byTxID, byNode, byPayloadType, nodeHashes entries
 	numIndexesPerObs  = 2   // byObsID, byObserver entries
@@ -5449,12 +5644,13 @@ func (s *PacketStore) computeAnalyticsChannels(region, area string, window TimeW
 	}
 
 	type decodedGrp struct {
-		Type         string      `json:"type"`
-		Channel      string      `json:"channel"`
-		ChannelHash  interface{} `json:"channelHash"`
-		ChannelHash2 string      `json:"channel_hash"`
-		Text         string      `json:"text"`
-		Sender       string      `json:"sender"`
+		Type             string      `json:"type"`
+		Channel          string      `json:"channel"`
+		ChannelHash      interface{} `json:"channelHash"`
+		ChannelHash2     string      `json:"channel_hash"`
+		Text             string      `json:"text"`
+		Sender           string      `json:"sender"`
+		DecryptionStatus string      `json:"decryptionStatus,omitempty"`
 	}
 
 	// Convert channelHash (number or string in JSON) to string
@@ -5532,9 +5728,17 @@ func (s *PacketStore) computeAnalyticsChannels(region, area string, window TimeW
 		}
 		encrypted := decoded.Text == "" && decoded.Sender == ""
 
-		// Bug #978 fix: validate channel name against hash to reject rainbow-table mismatches.
-		// If the claimed channel name doesn't hash to the observed channelHash byte, discard it.
-		if name != "" && name != "ch"+hash && !channelNameMatchesHash(name, hash) {
+		// Bug #978 fix: validate channel name against hash to reject rainbow-table
+		// mismatches. If the claimed channel name doesn't hash to the observed
+		// channelHash byte, discard it — UNLESS the ingestor marked the packet
+		// `decryptionStatus:"decrypted"`. That flag means the name came from a
+		// successful key-based (PSK) decryption, not a rainbow-table lookup, so
+		// it is trustworthy regardless of the hashtag-derived hash check. This
+		// keeps the firmware-default Public channel (0x11, key-derived hash
+		// SHA256(key)[0]=17, not the hashtag scheme's 186) from being wrongly
+		// discarded and rendered as "Encrypted (0x11)". See #1729.
+		ingestorDecrypted := decoded.DecryptionStatus == "decrypted"
+		if name != "" && name != "ch"+hash && !ingestorDecrypted && !channelNameMatchesHash(name, hash) {
 			name = "ch" + hash
 			encrypted = true
 		}
@@ -8448,7 +8652,19 @@ func (s *PacketStore) computeNodeHashSizeInfo() map[string]*hashSizeNodeInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	info := make(map[string]*hashSizeNodeInfo)
+	// Collect (timestamp, hashSize) per pubkey so we can order adverts
+	// chronologically below. byPayloadType iteration is insertion order, which
+	// is not guaranteed to be chronological (out-of-order MQTT ingest, chunked
+	// cold-load), so we must sort by timestamp before reasoning about "latest"
+	// or "most recent" adverts. We parse FirstSeen rather than string-compare it
+	// so ordering is robust to timestamp-format differences (RFC3339 with or
+	// without fractional seconds); an unparseable/empty FirstSeen sorts oldest
+	// so it can never masquerade as the latest advert.
+	type hsEntry struct {
+		ts   time.Time
+		size int
+	}
+	entries := make(map[string][]hsEntry)
 
 	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format("2006-01-02T15:04:05.000Z")
 
@@ -8504,26 +8720,34 @@ func (s *PacketStore) computeNodeHashSizeInfo() map[string]*hashSizeNodeInfo {
 			continue
 		}
 
-		ni := info[pk]
-		if ni == nil {
-			ni = &hashSizeNodeInfo{AllSizes: make(map[int]bool)}
-			info[pk] = ni
-		}
-		ni.AllSizes[hs] = true
-		ni.Seq = append(ni.Seq, hs)
+		// time.Parse(time.RFC3339, ...) accepts both the ingestor's no-fraction
+		// form ("...05Z") and a fractional form ("...05.000Z"). Zero time on
+		// parse failure → sorts oldest.
+		ts, _ := time.Parse(time.RFC3339, tx.FirstSeen)
+		entries[pk] = append(entries[pk], hsEntry{ts: ts, size: hs})
 	}
 
-	// Post-process: use latest advert hash size and compute flip-flop flag.
-	// The most recent advert reflects the node's current hash size
-	// configuration. The upstream firmware bug causing stale path bytes in
-	// flood adverts was fixed (meshcore-dev/MeshCore#2154).
-	for _, ni := range info {
+	info := make(map[string]*hashSizeNodeInfo)
+	for pk, es := range entries {
+		// Order adverts chronologically. Stable sort so that adverts with equal
+		// (or unparseable) timestamps keep insertion order.
+		sort.SliceStable(es, func(i, j int) bool { return es[i].ts.Before(es[j].ts) })
+
+		ni := &hashSizeNodeInfo{AllSizes: make(map[int]bool), Seq: make([]int, len(es))}
+		for i, e := range es {
+			ni.Seq[i] = e.size
+			ni.AllSizes[e.size] = true
+		}
+		info[pk] = ni
+
 		// Use the most recent advert's hash size (last in chronological order).
+		// The upstream firmware bug causing stale path bytes in flood adverts
+		// was fixed (meshcore-dev/MeshCore#2154).
 		ni.HashSize = ni.Seq[len(ni.Seq)-1]
 
-		// Flip-flop (inconsistent) flag: need >= 3 observations,
+		// Flip-flop (inconsistent) flag: need a minimum number of observations,
 		// >= 2 unique sizes, and >= 2 transitions in the sequence.
-		if len(ni.Seq) < 3 || len(ni.AllSizes) < 2 {
+		if len(ni.Seq) < hashSizeMinObservations || len(ni.AllSizes) < 2 {
 			continue
 		}
 		transitions := 0
@@ -8532,10 +8756,51 @@ func (s *PacketStore) computeNodeHashSizeInfo() map[string]*hashSizeNodeInfo {
 				transitions++
 			}
 		}
-		ni.Inconsistent = transitions >= 2
+		if transitions < 2 {
+			continue
+		}
+		// Recency decay (issue #1726): if the most recent adverts all agree on
+		// a single size, the node has settled on its current hash mode (e.g. an
+		// operator flipped path.hash.mode mid-flight, or a lone stale 1-byte
+		// advert sits earlier in the 7-day window). Don't keep reporting "varies"
+		// over older history once the node is consistent again. A node whose
+		// recent adverts still disagree remains flagged.
+		//
+		// Known limitation: a node that flaps slowly (long stable stretches
+		// between toggles) is not flagged during a stable stretch. This is
+		// intentional — "varies" describes the node's *current* state — and the
+		// full history stays visible via hash_sizes_seen / AllSizes.
+		if recentAdvertsAgree(ni.Seq, hashSizeRecentAgreeCount) {
+			continue
+		}
+		ni.Inconsistent = true
 	}
 
 	return info
+}
+
+// hashSizeMinObservations is the minimum number of non-zero-hop adverts in the
+// window before a node is eligible to be flagged as flip-flopping at all.
+const hashSizeMinObservations = 3
+
+// hashSizeRecentAgreeCount is how many of the most recent non-zero-hop adverts
+// must share a single hash size for a node to be considered "settled", clearing
+// its flip-flop ("varies") flag.
+const hashSizeRecentAgreeCount = 3
+
+// recentAdvertsAgree reports whether the last n entries of a chronologically
+// ordered hash-size sequence are all equal.
+func recentAdvertsAgree(seq []int, n int) bool {
+	if len(seq) < n {
+		return false
+	}
+	last := seq[len(seq)-1]
+	for i := len(seq) - n; i < len(seq)-1; i++ {
+		if seq[i] != last {
+			return false
+		}
+	}
+	return true
 }
 
 // EnrichNodeWithHashSize populates hash_size, hash_size_inconsistent, and

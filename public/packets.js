@@ -623,6 +623,16 @@
   let packets = [];
   let hashIndex = new Map(); // hash → packet group for O(1) dedup
 
+  // #1799 PR #1804 r1 item 9 (adv6): payload-labels.js is loaded
+  // synchronously before this script in index.html. A missing module
+  // is a packaging bug, not a runtime degradation — fail loud.
+  if (typeof window !== 'undefined' && !window.PayloadLabels) {
+    throw new Error('packets.js: window.PayloadLabels missing — payload-labels.js failed to load');
+  }
+  const SHORT_BY_ID = window.PayloadLabels.api
+    ? window.PayloadLabels.api.SHORT_BY_ID
+    : window.PayloadLabels.SHORT_BY_ID;
+
   // Resolve observer_id to friendly name from loaded observers list
   function obsName(id) {
     if (!id) return '—';
@@ -717,7 +727,7 @@
   // already built (decouples observer fetch from row render).
   let _rebuildObserverMenu = null;
   let regionMap = {};
-  const TYPE_NAMES = { 0:'Request', 1:'Response', 2:'Direct Msg', 3:'ACK', 4:'Advert', 5:'Channel Msg', 6:'Group Data', 7:'Anon Req', 8:'Path', 9:'Trace', 10:'Multipart', 11:'Control', 15:'Raw Custom' };
+  const TYPE_NAMES = SHORT_BY_ID;
   function typeName(t) { return TYPE_NAMES[t] ?? `Type ${t}`; }
   const isMobile = window.innerWidth <= 1024;
   const PACKET_LIMIT = isMobile ? 1000 : 50000;
@@ -1745,7 +1755,7 @@
     // --- Type multi-select ---
     const typeMenu = document.getElementById('typeMenu');
     const typeTrigger = document.getElementById('typeTrigger');
-    const typeMap = {0:'Request',1:'Response',2:'Direct Msg',3:'ACK',4:'Advert',5:'Channel Msg',7:'Anon Req',8:'Path',9:'Trace'};
+    const typeMap = SHORT_BY_ID;
     const selectedTypes = new Set(filters.type ? String(filters.type).split(',') : []);
     function buildTypeMenu() {
       const allChecked = selectedTypes.size === 0;
@@ -2234,7 +2244,12 @@
     const groupTypeClass = payloadTypeColor(p.payload_type);
     const groupSize = p.raw_hex ? Math.floor(p.raw_hex.length / 2) : 0;
     const _grpPlOff = getPathLenOffset(p.route_type);
-    const groupHashBytes = ((parseInt(p.raw_hex?.slice(_grpPlOff * 2, _grpPlOff * 2 + 2), 16) || 0) >> 6) + 1;
+    // #1849: TRACE (payload_type=9) header path bytes are per-hop SNR readings,
+    // not truncated hop hashes (see internal/packetpath/route.go PathBytesAreHops).
+    // The (>>6)+1 derivation is meaningless for TRACE — render — with a tooltip.
+    const _grpIsTrace = p.payload_type === 9;
+    const groupHashBytes = _grpIsTrace ? '—' : (((parseInt(p.raw_hex?.slice(_grpPlOff * 2, _grpPlOff * 2 + 2), 16) || 0) >> 6) + 1);
+    const _grpHashSizeTitle = _grpIsTrace ? ' title="TRACE path bytes are SNR readings, not hash prefixes — see sidebar decoder for actual hop count"' : '';
     const isSingle = p.count <= 1;
     // Channel color highlighting (#271)
     const _grpDecoded = getParsedDecoded(p) || {};
@@ -2247,12 +2262,12 @@
           <td class="col-time">${renderTimestampCell(p.latest)}</td>
           <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || '—', 8)}</td>
           <td class="col-size" data-filter-field="size" data-filter-value="${groupSize || ''}">${groupSize ? groupSize + 'B' : '—'}</td>
-          <td class="col-hashsize mono">${groupHashBytes}</td>
+          <td class="col-hashsize mono"${_grpHashSizeTitle}>${groupHashBytes}</td>
           <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(groupTypeName || '')}">${p.payload_type != null ? `<span class="badge badge-${groupTypeClass}">${groupTypeName}</span>${transportBadge(p.route_type)}` : '—'}</td>
           <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(headerObserverId) || '')}">${isSingle ? escapeHtml(truncate(obsNameOnly(headerObserverId), 16)) + obsIataBadge(p) : escapeHtml(truncate(obsNameOnly(headerObserverId), 10)) + groupedObserverIataBadgesHtml(p)}</td>
           <td class="col-path"><span class="path-hops">${groupPathStr}</span></td>
           <td class="col-rpt">${p.observation_count > 1 ? '<span class="badge badge-obs" title="Seen ' + p.observation_count + ' times"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + p.observation_count + '</span>' : (isSingle ? '' : p.count)}</td>
-          <td class="col-details">${getDetailPreview(getParsedDecoded(p))}</td>
+          <td class="col-details"><span class="col-details-clip">${getDetailPreview(getParsedDecoded(p))}</span></td>
         </tr>`;
     if (isExpanded && p._children) {
       let visibleChildren = p._children;
@@ -2265,9 +2280,14 @@
         const size = c.raw_hex ? Math.floor(c.raw_hex.length / 2) : 0;
         const childPath = getParsedPath(c);
         const _cPlOff = getPathLenOffset(p.route_type);
-        const childHashBytes = c.raw_hex
-          ? (((parseInt(c.raw_hex.slice(_cPlOff * 2, _cPlOff * 2 + 2), 16) || 0) >> 6) + 1)
-          : (childPath.length > 0 ? childPath[0].length / 2 : 0);
+        // #1849: TRACE header path bytes are SNR readings, not hop hashes.
+        const _cIsTrace = c.payload_type === 9;
+        const childHashBytes = _cIsTrace
+          ? '—'
+          : (c.raw_hex
+            ? (((parseInt(c.raw_hex.slice(_cPlOff * 2, _cPlOff * 2 + 2), 16) || 0) >> 6) + 1)
+            : (childPath.length > 0 ? childPath[0].length / 2 : 0));
+        const _cHashSizeTitle = _cIsTrace ? ' title="TRACE path bytes are SNR readings, not hash prefixes — see sidebar decoder for actual hop count"' : '';
         const childRegion = c.observer_id ? (observerMap.get(c.observer_id)?.iata || '') : '';
         const childPathStr = renderPath(childPath, c.observer_id);
         const _childHashStripe = _hashStripeStyle(c.hash || p.hash);
@@ -2276,12 +2296,12 @@
               <td class="col-time">${renderTimestampCell(c.timestamp)}</td>
               <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(c.hash || '')}">${truncate(c.hash || '', 8)}</td>
               <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
-              <td class="col-hashsize mono">${childHashBytes}</td>
+              <td class="col-hashsize mono"${_cHashSizeTitle}>${childHashBytes}</td>
               <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(c.route_type)}</td>
               <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(c.observer_id) || '')}">${escapeHtml(truncate(obsNameOnly(c.observer_id), 16))}${obsIataBadge(c)}</td>
               <td class="col-path"><span class="path-hops">${childPathStr}</span></td>
               <td class="col-rpt"></td>
-              <td class="col-details">${getDetailPreview(getParsedDecoded(c))}</td>
+              <td class="col-details"><span class="col-details-clip">${getDetailPreview(getParsedDecoded(c))}</span></td>
             </tr>`;
       }
     }
@@ -2299,7 +2319,10 @@
     const _chanStyle = window.ChannelColors ? window.ChannelColors.getRowStyle(decoded.type || typeName, decoded.channel) : '';
     const size = p.raw_hex ? Math.floor(p.raw_hex.length / 2) : 0;
     const _flatPlOff = getPathLenOffset(p.route_type);
-    const hashBytes = ((parseInt(p.raw_hex?.slice(_flatPlOff * 2, _flatPlOff * 2 + 2), 16) || 0) >> 6) + 1;
+    // #1849: TRACE path bytes = SNR readings, not hop hashes.
+    const _flatIsTrace = p.payload_type === 9;
+    const hashBytes = _flatIsTrace ? '—' : (((parseInt(p.raw_hex?.slice(_flatPlOff * 2, _flatPlOff * 2 + 2), 16) || 0) >> 6) + 1);
+    const _flatHashSizeTitle = _flatIsTrace ? ' title="TRACE path bytes are SNR readings, not hash prefixes — see sidebar decoder for actual hop count"' : '';
     const pathStr = renderPath(pathHops, p.observer_id);
     const detail = getDetailPreview(decoded);
     const _flatHashStripe = _hashStripeStyle(p.hash);
@@ -2309,12 +2332,12 @@
         <td class="col-time">${renderTimestampCell(p.timestamp)}</td>
         <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || String(p.id), 8)}</td>
         <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
-        <td class="col-hashsize mono">${hashBytes}</td>
+        <td class="col-hashsize mono"${_flatHashSizeTitle}>${hashBytes}</td>
         <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(p.route_type)}</td>
         <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(p.observer_id) || '')}">${escapeHtml(truncate(obsNameOnly(p.observer_id), 16))}${obsIataBadge(p)}</td>
         <td class="col-path"><span class="path-hops">${pathStr}</span></td>
         <td class="col-rpt"></td>
-        <td class="col-details">${detail}</td>
+        <td class="col-details"><span class="col-details-clip">${detail}</span></td>
       </tr>`;
   }
 
@@ -2829,6 +2852,43 @@
       const statusLabel = decoded.decryptionStatus === 'no_key' ? 'no key' : 'decryption failed';
       return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> Ch 0x${hashHex} <span class="muted">(${statusLabel})</span>`;
     }
+    // Group data (binary datagrams over channels) — #1792.
+    // Envelope: channel_hash + MAC + ciphertext. When decrypted, inner is
+    // data_type(uint16 LE) + data_len(1) + blob (firmware BaseChatMesh.cpp:382-385).
+    if (decoded.type === 'GRP_DATA' && decoded.channelHash != null) {
+      const hashHex = decoded.channelHashHex || decoded.channelHash.toString(16).padStart(2, '0').toUpperCase();
+      // #1796 r1 DRY: all three GRP_DATA branches below share the same
+      // database-icon + `Ch 0x${hashHex}` prefix. Extract once; behavior is
+      // byte-identical with the prior inline form.
+      const prefix = `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-database"/></svg> Ch 0x${hashHex}`;
+      // Happy path: decrypted with a parsed inner header (dataType present, no parse error).
+      // Per firmware/src/helpers/BaseChatMesh.cpp:387 a data_len of 0 is a LEGITIMATE
+      // empty datagram (the firmware only drops data_len > available_len). Backend
+      // cmd/ingestor/decoder.go:142 marshals DecryptedBlob with `omitempty`, so an
+      // empty blob is normal — render the <code> block ONLY when blob is a non-empty
+      // string. The 'data_len exceeds buffer' malformed branch sets decoded.error,
+      // which falls through to the explicit malformed label below.
+      if (decoded.decryptionStatus === 'decrypted' && decoded.dataType != null && !decoded.error) {
+        const dt = Number(decoded.dataType).toString(16).padStart(4, '0').toUpperCase();
+        const dl = decoded.dataLen != null ? Number(decoded.dataLen) : 0;
+        const blob = decoded.decryptedBlob || '';
+        const blobBlock = blob ? ` <code>${escapeHtml(blob.length > 32 ? blob.slice(0, 32) + '…' : blob)}</code>` : '';
+        return `${prefix} <span class="muted">type=0x${dt} len=${dl}</span>${blobBlock}`;
+      }
+      // #1796 polish: decrypted-but-malformed branch. Backend leaves
+      // status='decrypted' for two failure modes (decoder.go:619-654):
+      //   (a) inner too short → DataType=nil
+      //   (b) inner data_len exceeds buffer → DataType set, blob empty, Error set
+      // Without this explicit branch we would either lie ('encrypted') or
+      // render a misleading "type=0xNN len=N" header with an empty <code></code>.
+      if (decoded.decryptionStatus === 'decrypted') {
+        return `${prefix} <span class="muted">(decrypted, malformed)</span>`;
+      }
+      const statusLabel = decoded.decryptionStatus === 'no_key' ? 'no key'
+        : decoded.decryptionStatus === 'decryption_failed' ? 'decryption failed'
+        : 'encrypted';
+      return `${prefix} <span class="muted">(${statusLabel})</span>`;
+    }
     // Direct messages
     if (decoded.type === 'TXT_MSG') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Path updates
@@ -2837,6 +2897,45 @@
     if (decoded.type === 'REQ' || decoded.type === 'RESPONSE') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Anonymous requests
     if (decoded.type === 'ANON_REQ') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> anon → ${decoded.destHash?.slice(0,8) || '?'}`;
+    // CONTROL packets (#1802) — DISCOVER_REQ / DISCOVER_RESP body fields,
+    // decoded by cmd/ingestor/decoder.go decodeControl(). Wire format:
+    //   firmware/src/Mesh.cpp:69
+    //   firmware/examples/simple_repeater/MyMesh.cpp:773-820
+    // Subtype enum on byte0 high nibble; body fields are length-gated and
+    // may be absent on truncated packets, so each is rendered only when set.
+    if (decoded.type === 'CONTROL') {
+      const subtype = decoded.ctrlSubtype || 'CONTROL';
+      const icon = `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg>`;
+      const parts = [];
+      if (subtype === 'DISCOVER_REQ') {
+        if (decoded.ctrlFilter != null) {
+          parts.push(`filter=0x${Number(decoded.ctrlFilter).toString(16).padStart(2, '0')}`);
+        }
+        if (decoded.ctrlTag != null) {
+          parts.push(`tag=0x${(Number(decoded.ctrlTag) >>> 0).toString(16).padStart(8, '0')}`);
+        }
+        if (decoded.ctrlSince != null) {
+          parts.push(`since=${Number(decoded.ctrlSince) >>> 0}`);
+        }
+      } else if (subtype === 'DISCOVER_RESP') {
+        if (decoded.ctrlNodeType != null) {
+          parts.push(`type=${Number(decoded.ctrlNodeType)}`);
+        }
+        if (decoded.ctrlSNR != null) {
+          parts.push(`snr=${Number(decoded.ctrlSNR)}`);
+        }
+        if (decoded.ctrlTag != null) {
+          parts.push(`tag=0x${(Number(decoded.ctrlTag) >>> 0).toString(16).padStart(8, '0')}`);
+        }
+        if (decoded.ctrlPubKey) {
+          parts.push(`pubkey=${escapeHtml(decoded.ctrlPubKey)}`);
+        }
+      } else if (decoded.ctrlFlags) {
+        parts.push(`flags=0x${escapeHtml(decoded.ctrlFlags)}`);
+      }
+      const tail = parts.length ? ` <span class="muted">${parts.join(' ')}</span>` : '';
+      return `${icon} ${escapeHtml(subtype)}${tail}`;
+    }
     // Companion bridge text
     if (decoded.text) return escapeHtml(decoded.text.length > 80 ? decoded.text.slice(0, 80) + '…' : decoded.text);
     // Bare adverts with just pubkey
