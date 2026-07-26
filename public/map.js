@@ -9,7 +9,7 @@
   let nodes = [];
   let targetNodeKey = null;
   let observers = [];
-  let filters = { repeater: true, companion: true, room: true, sensor: true, observer: true, lastHeard: '30d', neighbors: false, clustering: localStorage.getItem('meshcore-map-clustering') !== 'false', hashLabels: localStorage.getItem('meshcore-map-hash-labels') !== 'false', statusFilter: localStorage.getItem('meshcore-map-status-filter') || 'all', byteSize: localStorage.getItem('meshcore-map-byte-filter') || 'all', multiByteOverlay: localStorage.getItem('meshcore-map-multibyte-overlay') === 'true' };
+  let filters = { repeater: true, companion: true, room: true, sensor: true, observer: true, lastHeard: '30d', neighbors: false, clustering: localStorage.getItem('meshcore-map-clustering') !== 'false', hashLabels: localStorage.getItem('meshcore-map-hash-labels') !== 'false', statusFilter: localStorage.getItem('meshcore-map-status-filter') || 'all', byteSize: localStorage.getItem('meshcore-map-byte-filter') || 'all', multiByteOverlay: localStorage.getItem('meshcore-map-multibyte-overlay') === 'true', scopeRegion: localStorage.getItem('meshcore-map-scope-region') || 'all', hasScope: localStorage.getItem('meshcore-map-has-scope') || 'all' };
   let selectedReferenceNode = null;  // pubkey of the reference node for neighbor filtering
   let neighborPubkeys = null;        // Set of pubkeys that are direct neighbors of selected node
   let wsHandler = null;
@@ -196,6 +196,18 @@
               <button class="btn ${filters.byteSize==='1'?'active':''}" data-byte="1">1-byte</button>
               <button class="btn ${filters.byteSize==='2'?'active':''}" data-byte="2">2-byte</button>
               <button class="btn ${filters.byteSize==='3'?'active':''}" data-byte="3">3-byte</button>
+            </div>
+          </fieldset>
+          <fieldset class="mc-section">
+            <legend class="mc-label">Region Scope</legend>
+            <label for="mcScopeRegion" class="sr-only">Filter repeaters by forwarded region</label>
+            <select id="mcScopeRegion" aria-label="Filter repeaters by forwarded region">
+              <option value="all">All regions</option>
+            </select>
+            <div class="filter-group" id="mcHasScope" style="margin-top:6px">
+              <button class="btn ${filters.hasScope==='all'?'active':''}" data-hasscope="all">All</button>
+              <button class="btn ${filters.hasScope==='yes'?'active':''}" data-hasscope="yes">Has scope</button>
+              <button class="btn ${filters.hasScope==='no'?'active':''}" data-hasscope="no">No scope</button>
             </div>
           </fieldset>
           <fieldset class="mc-section">
@@ -529,6 +541,25 @@
         filters.statusFilter = btn.dataset.status;
         localStorage.setItem('meshcore-map-status-filter', filters.statusFilter);
         document.querySelectorAll('#mcStatusFilter .btn').forEach(b => b.classList.toggle('active', b.dataset.status === filters.statusFilter));
+        renderMarkers();
+      });
+    });
+
+    // #1862: region-scope filters. The dropdown is repopulated from the loaded
+    // nodes (see populateScopeRegions) since the observed scope set varies.
+    const scopeRegionEl = document.getElementById('mcScopeRegion');
+    if (scopeRegionEl) {
+      scopeRegionEl.addEventListener('change', e => {
+        filters.scopeRegion = e.target.value;
+        localStorage.setItem('meshcore-map-scope-region', filters.scopeRegion);
+        renderMarkers();
+      });
+    }
+    document.querySelectorAll('#mcHasScope .btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        filters.hasScope = btn.dataset.hasscope;
+        localStorage.setItem('meshcore-map-has-scope', filters.hasScope);
+        document.querySelectorAll('#mcHasScope .btn').forEach(b => b.classList.toggle('active', b.dataset.hasscope === filters.hasScope));
         renderMarkers();
       });
     });
@@ -1279,6 +1310,19 @@
     }
   }
 
+  // #1862: fill the region dropdown from the scopes actually present in the
+  // loaded nodes. A persisted pick that is no longer observed is kept as an
+  // option so the control still reflects the filter that is hiding markers.
+  function populateScopeRegions() {
+    const el = document.getElementById('mcScopeRegion');
+    if (!el) return;
+    const scopes = collectScopes(nodes);
+    if (filters.scopeRegion !== 'all' && scopes.indexOf(filters.scopeRegion) === -1) scopes.push(filters.scopeRegion);
+    el.innerHTML = '<option value="all">All regions</option>' +
+      scopes.map(s => `<option value="${safeEsc(s)}">${safeEsc(s)}</option>`).join('');
+    el.value = filters.scopeRegion;
+  }
+
   async function loadNodes() {
     try {
       // Load regions from config + observed IATAs
@@ -1297,6 +1341,7 @@
 
       buildRoleChecks(data.counts || {});
       buildJumpButtons();
+      populateScopeRegions();
 
       renderMarkers();
 
@@ -1595,6 +1640,8 @@
         const status = getNodeStatus(role, lastMs);
         if (status !== filters.statusFilter) return false;
       }
+      // #1862: region scope + has-scope filters (repeaters and rooms only)
+      if (!nodePassesScopeFilters(n, filters)) return false;
       // Neighbor filter: show only the reference node and its direct neighbors
       if (filters.neighbors && selectedReferenceNode && neighborPubkeys) {
         const pk = n.public_key;
