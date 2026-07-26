@@ -73,6 +73,9 @@ func Apply(rw *sql.DB, logf Logger) error {
 	if err := ensureDefaultScopeColumns(rw, logf); err != nil {
 		return fmt.Errorf("ensure default_scope: %w", err)
 	}
+	if err := ensureConfiguredScopeColumns(rw, logf); err != nil {
+		return fmt.Errorf("ensure configured_scope: %w", err)
+	}
 	if err := ensureObservationsRawHexColumn(rw, logf); err != nil {
 		return fmt.Errorf("ensure observations.raw_hex: %w", err)
 	}
@@ -87,6 +90,9 @@ func Apply(rw *sql.DB, logf Logger) error {
 	}
 	if err := ensureObserverCanRelaySeenColumn(rw, logf); err != nil {
 		return fmt.Errorf("ensure observers.can_relay_seen: %w", err)
+	}
+	if err := ensurePingTriggersTable(rw, logf); err != nil {
+		return fmt.Errorf("ensure ping_triggers: %w", err)
 	}
 	// #1690: denormalized last_seen on transmissions so cold-load filters
 	// on effective recency rather than first-ever first_seen. The column
@@ -144,6 +150,9 @@ func AssertReady(ro *sql.DB) error {
 	mustCol("transmissions", "scope_name")
 	mustCol("nodes", "default_scope")
 	mustCol("inactive_nodes", "default_scope")
+	// #1865: confirmed region scopes from the observer /neighbors report.
+	mustCol("nodes", "configured_scope")
+	mustCol("inactive_nodes", "configured_scope")
 	mustCol("observations", "raw_hex")
 	// Multi-byte capability cache (#1324 follow-up; PR #903 surface).
 	// Owned by ingestor — server reads these for O(1) /api/nodes
@@ -170,6 +179,7 @@ func AssertReady(ro *sql.DB) error {
 	// an explicit value; can_relay_seen=0 means leave the UI badge
 	// unset (unknown state).
 	mustCol("observers", "can_relay_seen")
+	mustTable("ping_triggers")
 
 	if len(missing) > 0 {
 		return fmt.Errorf("schema not migrated by ingestor; restart ingestor first. missing: %s",
@@ -429,6 +439,39 @@ func ensureDefaultScopeColumns(rw *sql.DB, logf Logger) error {
 	return nil
 }
 
+// ensureConfiguredScopeColumns adds nodes.configured_scope +
+// nodes.configured_scope_at (and mirrors on inactive_nodes) for #1865.
+// Unlike default_scope (inferred from observed advert transport scope, and
+// overwritten on every observation), configured_scope holds the region scopes
+// a node has CONFIGURED, taken as concrete evidence from the observer
+// /neighbors report — written only for the observer's own `self` scopes and
+// for neighbors whose OTA scope query returned status="responded". The
+// server PRAGMA-detects configured_scope as hasConfiguredScope.
+func ensureConfiguredScopeColumns(rw *sql.DB, logf Logger) error {
+	if err := ensureMigrationsTable(rw); err != nil {
+		return err
+	}
+	for _, table := range []string{"nodes", "inactive_nodes"} {
+		for _, col := range []string{"configured_scope", "configured_scope_at"} {
+			has, err := TableHasColumn(rw, table, col)
+			if err != nil {
+				return fmt.Errorf("inspect %s.%s: %w", table, col, err)
+			}
+			if has {
+				continue
+			}
+			if _, err := rw.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT DEFAULT NULL`, table, col)); err != nil {
+				return fmt.Errorf("alter %s add %s: %w", table, col, err)
+			}
+			logf("[dbschema] added %s column to %s (#1865)", col, table)
+		}
+	}
+	if _, err := rw.Exec(`INSERT OR IGNORE INTO _migrations (name) VALUES ('nodes_configured_scope_v1')`); err != nil {
+		return fmt.Errorf("record nodes_configured_scope_v1: %w", err)
+	}
+	return nil
+}
+
 // ensureObservationsRawHexColumn adds observations.raw_hex (#881).
 // Source of truth lives here per #1321 (was previously cmd/ingestor/db.go only):
 // the server PRAGMA-detects this column as hasObsRawHex.
@@ -643,5 +686,44 @@ func ensureTransmissionsLastSeenColumn(rw *sql.DB, logf Logger) error {
 	if _, err := rw.Exec(`DROP INDEX IF EXISTS idx_tx_last_seen`); err != nil {
 		return fmt.Errorf("drop legacy idx_tx_last_seen: %w", err)
 	}
+	return nil
+}
+
+// ensurePingTriggersTable creates ping_triggers for the ping-score
+// highscore/leaderboard feature. One row per CHAN transmission whose text
+// matched the ping-bot trigger (see isPingTrigger, mirrored in three
+// places by hand: public/channels.js, cmd/server/db.go, and
+// cmd/ingestor/db.go -- keep all three in sync).
+//
+// Deliberately just a detection index, not the computed stats themselves:
+// tx_id/hash/channel_hash/sender/first_seen are cheap to write once at
+// ingest time, while farthest/deepest/spread/airtime are derived from the
+// SAME GetPacketPath + airtime-annotation logic View Path already uses,
+// recomputed periodically by the server's ping-scores recomputer
+// (cmd/server/ping_scores.go) rather than persisted here -- so a later
+// observation of an old ping (e.g. a station that only just relayed it
+// upstream) can still improve a standing record without a migration.
+func ensurePingTriggersTable(rw *sql.DB, logf Logger) error {
+	if err := ensureMigrationsTable(rw); err != nil {
+		return err
+	}
+	row := rw.QueryRow(`SELECT 1 FROM _migrations WHERE name = 'ping_triggers_v1'`)
+	var one int
+	if err := row.Scan(&one); err == nil {
+		return nil // already applied
+	}
+	if _, err := rw.Exec(`CREATE TABLE IF NOT EXISTS ping_triggers (
+		tx_id INTEGER PRIMARY KEY,
+		hash TEXT NOT NULL,
+		channel_hash TEXT,
+		sender TEXT,
+		first_seen TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create ping_triggers: %w", err)
+	}
+	if _, err := rw.Exec(`INSERT OR IGNORE INTO _migrations (name) VALUES ('ping_triggers_v1')`); err != nil {
+		return fmt.Errorf("record ping_triggers_v1: %w", err)
+	}
+	logf("[dbschema] created ping_triggers table")
 	return nil
 }

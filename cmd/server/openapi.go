@@ -80,6 +80,9 @@ func routeDescriptions() map[string]routeMeta {
 			QueryParams: []paramMeta{
 				{Name: "role", Description: "Filter by node role", Type: "string"},
 				{Name: "status", Description: "Filter by status (active/stale/offline)", Type: "string"},
+				{Name: "geoFilter", Description: "Overrides the deployment's geo_filter node-list default for this one request: \"1\"/\"true\" excludes nodes outside the configured geo_filter (unless foreign_advert-tagged), \"0\"/\"false\" returns every node regardless. Any other value (including omitting it) uses the deployment default — geo_filter applies to the node list unless config.json sets geoFilterExemptNodeList=true.", Type: "string"},
+				{Name: "hasScope", Description: "Issue #1862. \"true\" keeps only nodes that have ever transported at least one region-scoped (TRANSPORT_FLOOD/DIRECT) packet; \"false\" keeps only nodes that never have. Backed by the same relay-activity signal as the Scopes tab's \"Repeaters Never Relaying Any Scope\" section — pair with role=repeater to match its exact semantics.", Type: "string"},
+				{Name: "hashRegion", Description: "Issue #1862. Comma-separated region scope name(s) (e.g. \"eu,be\"; leading \"#\" optional, case-insensitive) — keeps only nodes that have transported at least one of them. Combines with hasScope as AND, not OR.", Type: "string"},
 			}},
 		"GET /api/nodes/search":             {Summary: "Search nodes", Description: "Search nodes by name or public key prefix.", Tag: "nodes", QueryParams: []paramMeta{{Name: "q", Description: "Search query", Type: "string", Required: true}}},
 		"GET /api/nodes/bulk-health":        {Summary: "Bulk node health", Description: "Returns health status for all nodes in one call.", Tag: "nodes"},
@@ -88,6 +91,10 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/nodes/{pubkey}/health":    {Summary: "Get node health", Tag: "nodes"},
 		"GET /api/nodes/{pubkey}/paths":     {Summary: "Get node routing paths", Tag: "nodes"},
 		"GET /api/nodes/{pubkey}/analytics": {Summary: "Get node analytics", Description: "Per-node packet counts, timing, and RF stats.", Tag: "nodes"},
+		"GET /api/nodes/{pubkey}/hop_analytics": {Summary: "Get node hop-count analytics", Description: "Issue #1812. For each recent transmission that passed through this node as a relay, its hop-count AT THIS NODE — the node's own 0-based index within the packet's resolved relay path, i.e. the number MeshCore firmware compares against flood_max/flood_max_advert/flood_max_unscoped in allowPacketForward. Deliberately not the same number as /analytics' hopDistribution field, which is path length to whichever observer reported the packet (a different, unrelated distance). Only transmissions with a resolved relay path are included.", Tag: "nodes", Response: schemaRef("NodeHopAnalyticsResponse"),
+			QueryParams: []paramMeta{
+				{Name: "days", Description: "Time window in days, 1-365.", Type: "integer"},
+			}},
 		"GET /api/nodes/{pubkey}/neighbors": {Summary: "Get node neighbors", Description: "Returns the queried node's first-hop neighbors with affinity scores and observation metadata (count, SNR, distance, observers). Ambiguous edges carry candidate pubkeys.", Tag: "nodes", Response: schemaRef("NodeNeighborsResponse")},
 
 		// Analytics
@@ -101,6 +108,24 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/analytics/subpaths-bulk":   {Summary: "Bulk subpath analysis", Tag: "analytics"},
 		"GET /api/analytics/subpath-detail":  {Summary: "Subpath detail", Tag: "analytics"},
 		"GET /api/analytics/neighbor-graph":  {Summary: "Neighbor graph", Description: "Full neighbor affinity graph for visualization.", Tag: "analytics"},
+		"GET /api/analytics/wardriving": {Summary: "Wardriving channel analytics", Description: "Activity/entry-point/coverage/signal/session analytics for the #wardriving channel (or another channel via ?channel=): message volume over time, top senders, path[0] entry-point hash-prefix tallies (resolve names via /api/resolve-hops), per-observer coverage (observer's known IATA-derived coordinates, not the sender's — MeshMapper's wardriving messages normally carry an anonymous session token, not live GPS), average SNR/RSSI over the same time buckets as the activity series, each sender's messages grouped into distinct sessions/runs (split on a 15-minute gap, each with an AirtimeMs field — LoRa Time-on-Air × distinct relaying repeaters, same formula as the Overview tab's Relay Airtime Share, omitted in DB-only mode), and any senders who explicitly shared their own position (some clients append plaintext \"<lat>,<lon>\" after the token — a deliberate choice by that sender, confirmed empirically, not something CoreScope infers). Cached 30s per window+channel.", Tag: "analytics",
+			QueryParams: []paramMeta{
+				{Name: "window", Description: "Time window: 1h, 24h (default), or 7d", Type: "string"},
+				{Name: "channel", Description: "Channel name to analyze (default #wardriving)", Type: "string"},
+			}},
+		"GET /api/analytics/hop-depth": {Summary: "Network-wide hop-depth analytics", Description: "Answers three flood-containment questions in one pass over resolved relay paths, using the same 0-based per-node path-index hop count as /api/nodes/{pubkey}/hop_analytics (issue #1812), not the unrelated observer-distance hopDistribution field: (1) does scoped (TRANSPORT_FLOOD/TRANSPORT_DIRECT) traffic actually travel fewer hops network-wide than unscoped (plain FLOOD, non-advert) traffic, (2) which repeater/room nodes are relaying unscoped flood traffic that already traveled far (high hops, a stronger containment-problem signal) vs merely locally (low hops), and (3) is that containment trending better or worse over the window (timeSeries). Plain DIRECT traffic never undergoes flood propagation and is excluded throughout. Cached 30s per window.", Tag: "analytics",
+			QueryParams: []paramMeta{
+				{Name: "window", Description: "Time window: 1h, 24h (default), or 7d", Type: "string"},
+			},
+			Response: schemaRef("HopDepthAnalyticsResponse")},
+		"GET /api/analytics/wardriving/sender-messages": {Summary: "Wardriving sender message drill-down", Description: "Individual #wardriving messages from one sender (drill-down behind Top Senders/Sessions): each message's entry-point path (path[0] first, resolve names via /api/resolve-hops), per-observer SNR/RSSI, and lat/lon when that message carried an explicit shared position. Pass since+until (RFC3339) to scope to one session's exact range; otherwise window covers the sender's whole activity in that period. Capped at 200 messages, most-recent-first. Not cached.", Tag: "analytics",
+			QueryParams: []paramMeta{
+				{Name: "sender", Description: "Sender display name to look up (required, exact match)", Type: "string"},
+				{Name: "channel", Description: "Channel name (default #wardriving)", Type: "string"},
+				{Name: "window", Description: "Time window when since/until aren't given: 1h, 24h (default), or 7d", Type: "string"},
+				{Name: "since", Description: "RFC3339 start time — overrides window when paired with until", Type: "string"},
+				{Name: "until", Description: "RFC3339 end time — overrides window when paired with since", Type: "string"},
+			}},
 
 		// Channels
 		"GET /api/channels":                 {Summary: "List channels", Description: "Returns known mesh channels with message counts.", Tag: "channels"},
@@ -114,10 +139,14 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/observers/metrics/summary": {Summary: "Observer metrics summary", Description: "Aggregate metrics across all observers.", Tag: "observers"},
 
 		// Misc
-		"GET /api/resolve-hops":      {Summary: "Resolve hop path", Description: "Resolves hash prefixes in a hop path to node names. Returns affinity scores and best candidates.", Tag: "nodes", QueryParams: []paramMeta{{Name: "hops", Description: "Comma-separated hop hash prefixes", Type: "string", Required: true}}},
-		"GET /api/traces/{hash}":     {Summary: "Get packet traces", Description: "Returns all observer sightings for a packet hash.", Tag: "packets"},
+		"GET /api/resolve-hops":  {Summary: "Resolve hop path", Description: "Resolves hash prefixes in a hop path to node names. Returns affinity scores and best candidates.", Tag: "nodes", QueryParams: []paramMeta{{Name: "hops", Description: "Comma-separated hop hash prefixes", Type: "string", Required: true}}},
+		"GET /api/traces/{hash}": {Summary: "Get packet traces", Description: "Returns all observer sightings for a packet hash.", Tag: "packets"},
+		"GET /api/packets/{hash}/path": {Summary: "Get a packet's full geographic flood spread", Description: "Resolves EVERY distinct station that observed a packet to its own branch: hop count (from that station's deepest observation) plus, where resolvable, each relay's name/role/lat/lon in path order and the station's own position (self-advertised GPS when known, same as /api/observers, else its configured IATA code). A station heard more than once (later flood copies via longer routes) contributes only its deepest observation. Lat/lon are null for any hop or observer that has no known position -- callers should draw a gap, not guess. Also returns `first`: the single earliest-arriving observation across every station (usually 0 hops, close to the sender) -- an approximate origin landmark, distinct from branches[0] which is the deepest/farthest-traveled branch. Backs the Channels tab's ping-bot \"View path\" map link.", Tag: "packets",
+			Response: schemaRef("PacketPathResponse")},
 		"GET /api/iata-coords":       {Summary: "Get IATA airport coordinates", Description: "Returns lat/lon for known airport codes (used for observer positioning).", Tag: "config"},
 		"GET /api/audio-lab/buckets": {Summary: "Audio lab frequency buckets", Description: "Returns frequency bucket data for audio analysis.", Tag: "analytics"},
+		"GET /api/ping-scores": {Summary: "Ping-score highscore board", Description: "Global (not scoped by region/area) records and leaderboards derived from every ping-bot-triggering channel message ever seen: farthest reach, most hops, widest simultaneous spread, fastest full spread, and most airtime-efficient ping, plus which relay nodes and which observers appear most often. Computed from the same GetPacketPath + LoRa-airtime-estimate logic behind /api/packets/{hash}/path and refreshed on a background interval, so it may lag the very latest ping by a few minutes. Fields are omitted (not zero) until at least one qualifying ping has been recorded.", Tag: "packets",
+			Response: schemaRef("PingScoresResponse")},
 	}
 }
 
@@ -248,6 +277,170 @@ func componentSchemas() map[string]interface{} {
 				"node":               str("The queried node's public key."),
 				"neighbors":          map[string]interface{}{"type": "array", "items": schemaRef("NeighborEntry")},
 				"total_observations": map[string]interface{}{"type": "integer"},
+			},
+		},
+		"HopAnalyticsPacket": map[string]interface{}{
+			"type":        "object",
+			"description": "One transmission that passed through the queried node as a relay hop (issue #1812).",
+			"properties": map[string]interface{}{
+				"hash":      str("Packet hash."),
+				"tsMs":      map[string]interface{}{"type": "integer", "description": "First-seen timestamp, Unix milliseconds."},
+				"hops":      map[string]interface{}{"type": "integer", "description": "0-based index of the queried node within the packet's resolved relay path — the value MeshCore firmware compares against flood_max in allowPacketForward. NOT distance to the reporting observer."},
+				"transport": map[string]interface{}{"type": "string", "enum": []string{"flood", "flood_advert", "flood_unscoped", "direct", "unknown"}, "description": "Which firmware flood.max* knob (if any) caps this packet's hop count."},
+				"scoped":    map[string]interface{}{"type": "boolean", "description": "Whether the transmission carried a region scope (TRANSPORT_FLOOD/TRANSPORT_DIRECT)."},
+			},
+		},
+		"NodeHopAnalyticsResponse": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"packets": map[string]interface{}{"type": "array", "items": schemaRef("HopAnalyticsPacket")},
+			},
+		},
+		"HopDepthBucket": map[string]interface{}{
+			"type":        "object",
+			"description": "How many relay-hop instances (network-wide) saw a given hop count.",
+			"properties": map[string]interface{}{
+				"hops":  map[string]interface{}{"type": "integer", "description": "0-based hop index."},
+				"count": map[string]interface{}{"type": "integer"},
+			},
+		},
+		"RepeaterUnscopedHopDepth": map[string]interface{}{
+			"type":        "object",
+			"description": "One repeater/room's hop-count profile across the unscoped (plain FLOOD, non-advert) traffic it has relayed.",
+			"properties": map[string]interface{}{
+				"publicKey":  str("Node's public key."),
+				"name":       str("Node's display name, or its public key if unnamed."),
+				"count":      map[string]interface{}{"type": "integer", "description": "Number of unscoped relay-hop instances at this node."},
+				"minHops":    map[string]interface{}{"type": "integer"},
+				"medianHops": map[string]interface{}{"type": "number"},
+				"maxHops":    map[string]interface{}{"type": "integer"},
+			},
+		},
+		"HopDepthTimePoint": map[string]interface{}{
+			"type":        "object",
+			"description": "One time bucket's scoped/unscoped median hop depth (5min/1h/6h buckets for 1h/24h/7d windows, same bucketing as ScopeStatsResponse.timeSeries).",
+			"properties": map[string]interface{}{
+				"t":                 str("Bucket start, RFC3339 UTC."),
+				"scopedMedianHop":   map[string]interface{}{"type": "integer", "nullable": true, "description": "Median hop depth of scoped traffic in this bucket, or null if there was none (0 is a valid median, so absence isn't the same as zero)."},
+				"unscopedMedianHop": map[string]interface{}{"type": "integer", "nullable": true, "description": "Median hop depth of unscoped traffic in this bucket, or null if there was none."},
+			},
+		},
+		"HopDepthAnalyticsResponse": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"window":             str("Time window this response covers: 1h, 24h, or 7d."),
+				"scopedHopDepth":     map[string]interface{}{"type": "array", "items": schemaRef("HopDepthBucket"), "description": "Hop-depth histogram for scoped (TRANSPORT_FLOOD/TRANSPORT_DIRECT) traffic."},
+				"unscopedHopDepth":   map[string]interface{}{"type": "array", "items": schemaRef("HopDepthBucket"), "description": "Hop-depth histogram for unscoped (plain FLOOD) traffic."},
+				"unscopedByRepeater": map[string]interface{}{"type": "array", "items": schemaRef("RepeaterUnscopedHopDepth"), "description": "Per-repeater/room breakdown of unscoped hop depth, sorted by count descending."},
+				"timeSeries":         map[string]interface{}{"type": "array", "items": schemaRef("HopDepthTimePoint"), "description": "Scoped/unscoped median hop depth over time within the window — is containment trending better or worse."},
+			},
+		},
+		"PacketPathPoint": map[string]interface{}{
+			"type":        "object",
+			"description": "One hop's position along a packet's resolved relay path.",
+			"properties": map[string]interface{}{
+				"publicKey":           str("Node public key (hex)."),
+				"name":                str("Node display name, or its public key if unnamed."),
+				"role":                str("Node role (e.g. repeater, room), when known."),
+				"lat":                 map[string]interface{}{"type": "number", "nullable": true, "description": "Null when this node has never advertised a GPS position and has no positioned neighbor either."},
+				"lon":                 map[string]interface{}{"type": "number", "nullable": true},
+				"approx":              map[string]interface{}{"type": "boolean", "description": "True when lat/lon are not this node's own position but a count-weighted centroid of its positioned neighbor_edges neighbors instead -- a last-resort stand-in, not a real fix."},
+				"approxNeighborCount": map[string]interface{}{"type": "integer", "description": "Present only when approx=true. How many positioned neighbors fed the centroid -- a rough confidence signal, higher is more confident."},
+				"approxSpreadKm":      map[string]interface{}{"type": "number", "nullable": true, "description": "Present only when approx=true and approxNeighborCount>1. Widest distance (km) between any two contributing neighbors -- larger means they disagree more about where 'nearby' is."},
+			},
+		},
+		"PacketPathObserver": map[string]interface{}{
+			"type":        "object",
+			"description": "The station that produced a given branch's observation of a packet path, positioned from its own self-advertised GPS when known (same source as /api/observers), else its configured IATA code, else a weighted centroid of its positioned neighbors (see approx).",
+			"properties": map[string]interface{}{
+				"publicKey":           str("Observer's mesh pubkey, when it has one (some bridge-type observers publish under a device name instead -- see the name-match fallback in GetPacketPath). Empty otherwise."),
+				"name":                str("Observer display name."),
+				"iata":                str("Observer's configured IATA airport code, when set."),
+				"role":                str("Observer's own node role (e.g. repeater, room), when it's known as a mesh node itself -- not just an MQTT/API listener."),
+				"lat":                 map[string]interface{}{"type": "number", "nullable": true},
+				"lon":                 map[string]interface{}{"type": "number", "nullable": true},
+				"approx":              map[string]interface{}{"type": "boolean", "description": "True when lat/lon are not this station's own position but a count-weighted centroid of its positioned neighbors instead -- a last-resort stand-in, not a real fix."},
+				"approxNeighborCount": map[string]interface{}{"type": "integer", "description": "Present only when approx=true. See PacketPathPoint.approxNeighborCount."},
+				"approxSpreadKm":      map[string]interface{}{"type": "number", "nullable": true, "description": "Present only when approx=true and approxNeighborCount>1. See PacketPathPoint.approxSpreadKm."},
+			},
+		},
+		"PacketPathBranch": map[string]interface{}{
+			"type":        "object",
+			"description": "One station's own route to a packet: how far it traveled to reach them (from that observation's raw hop count, independent of how much of it resolved) and, where resolvable, each hop's position in path order.",
+			"properties": map[string]interface{}{
+				"hops":                map[string]interface{}{"type": "integer", "description": "Hop count for this station's deepest observation, taken from the raw path length -- present even when none of it resolved."},
+				"points":              map[string]interface{}{"type": "array", "items": schemaRef("PacketPathPoint"), "description": "The resolvable portion of the relay path in hop order. Can be shorter than hops, or empty, when some/all hops never resolved."},
+				"observer":            schemaRef("PacketPathObserver"),
+				"snr":                 map[string]interface{}{"type": "number", "nullable": true, "description": "SNR of this station's deepest observation."},
+				"secondsAfterFirst":   map[string]interface{}{"type": "number", "description": "Seconds after the earliest-arriving observation (see PacketPathResponse.first) this branch's own observation arrived. Zero for first itself. Omitted when either timestamp is unknown."},
+				"distanceFromFirstKm": map[string]interface{}{"type": "number", "description": "Great-circle distance (km) between this branch's own observer and first's observer. Zero for first itself. Omitted when either position is unknown, or when either observer is positioned via approx (an estimate compounding another estimate isn't worth surfacing)."},
+			},
+		},
+		"TouchedAreaShape": map[string]interface{}{
+			"type":        "object",
+			"description": "One configured area's display label plus its drawn boundary, for shading directly on the map. Exactly one of polygon or the latMin/latMax/lonMin/lonMax quartet is present, matching however the area itself was configured.",
+			"properties": map[string]interface{}{
+				"label":   str("The area's display label (e.g. \"Aarhus by\")."),
+				"polygon": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "minItems": 2, "maxItems": 2}, "description": "Ordered [lat, lon] pairs tracing the area's drawn boundary. Present only when the area was configured with a polygon rather than a bounding box."},
+				"latMin":  map[string]interface{}{"type": "number", "nullable": true, "description": "Present only when the area was configured as a bounding box rather than a polygon."},
+				"latMax":  map[string]interface{}{"type": "number", "nullable": true},
+				"lonMin":  map[string]interface{}{"type": "number", "nullable": true},
+				"lonMax":  map[string]interface{}{"type": "number", "nullable": true},
+			},
+		},
+		"PacketPathResponse": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"hash":               str("The packet hash this path was resolved for."),
+				"branches":           map[string]interface{}{"type": "array", "items": schemaRef("PacketPathBranch"), "description": "One branch per distinct station that observed the packet, each kept at that station's own deepest observation, sorted deepest-first -- shows the full flood spread, not just the single farthest route."},
+				"first":              schemaRef("PacketPathBranch"),
+				"touchedAreas":       map[string]interface{}{"type": "array", "items": schemaRef("TouchedAreaShape"), "description": "Every configured area any point or observer on the path falls in, deduped and alphabetized by label. Omitted when no areas are configured or none resolved."},
+				"estimatedAirtimeMs": map[string]interface{}{"type": "number", "nullable": true, "description": "Estimated LoRa Time-on-Air (milliseconds) x distinct-relay-count for this packet's whole flood -- same formula as the Relay Airtime Share analytics metric (issue #1768), applied to a single packet. Assumes the configured/default LoRa PHY preset; relay count is inferred from the union of every hearing station's resolved relay path, not a literal per-retransmission log. Omitted when the in-memory store doesn't have this transmission (DB-only mode, or evicted)."},
+				"airtimeRelayCount":  map[string]interface{}{"type": "integer", "description": "Distinct relay count behind estimatedAirtimeMs. Present only alongside it."},
+			},
+		},
+		"PingScore": map[string]interface{}{
+			"type":        "object",
+			"description": "One ping's computed highscore-relevant stats, derived from the same GetPacketPath + airtime-annotation logic behind /api/packets/{hash}/path.",
+			"properties": map[string]interface{}{
+				"hash":               str("The winning ping's packet hash -- pass to /api/packets/{hash}/path for the full View Path map."),
+				"sender":             str("Display name of whoever sent the ping, when resolvable from the channel message."),
+				"channelHash":        str("Which channel the ping was sent on."),
+				"timestamp":          str("RFC3339 timestamp the ping was first seen."),
+				"stationCount":       map[string]interface{}{"type": "integer", "description": "Distinct stations that heard this ping."},
+				"deepestHops":        map[string]interface{}{"type": "integer", "description": "Most relay hops any station's observation of this ping took."},
+				"deepestNodePubkey":  str("Pubkey of the station behind deepestHops."),
+				"deepestNodeName":    str("Name of the station behind deepestHops."),
+				"farthestKm":         map[string]interface{}{"type": "number", "nullable": true, "description": "Farthest any hearing station was from whoever heard it first, in km. Omitted when no station on this ping's path has a known position."},
+				"farthestNodePubkey": str("Pubkey of the station behind farthestKm."),
+				"farthestNodeName":   str("Name of the station behind farthestKm."),
+				"spreadSeconds":      map[string]interface{}{"type": "number", "nullable": true, "description": "How long the flood took to finish reaching every station it ever reached. Omitted when fewer than 2 stations heard it, or no station has timing data."},
+				"airtimeMs":          map[string]interface{}{"type": "number", "nullable": true, "description": "Estimated LoRa Time-on-Air x distinct-relay-count for this ping's whole flood -- same estimate as /api/packets/{hash}/path's estimatedAirtimeMs."},
+				"relayCount":         map[string]interface{}{"type": "integer", "description": "Distinct relay count behind airtimeMs. Present only alongside it."},
+				"kmPerSecondAirtime": map[string]interface{}{"type": "number", "nullable": true, "description": "farthestKm / (airtimeMs/1000) -- geographic distance covered per second of estimated RF airtime spent relaying this ping. Only set when both farthestKm and airtimeMs (with relayCount>0) are available."},
+			},
+		},
+		"PingLeaderboardEntry": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"pubkey": str("The node/observer's pubkey."),
+				"name":   str("Display name, falling back to the raw pubkey when unresolved."),
+				"count":  map[string]interface{}{"type": "integer", "description": "How many distinct pings this entry earned credit for."},
+			},
+		},
+		"PingScoresResponse": map[string]interface{}{
+			"type":        "object",
+			"description": "The ping-score highscore board: current records plus leaderboards, global (not scoped by region/area).",
+			"properties": map[string]interface{}{
+				"generatedAt":         str("RFC3339 timestamp this snapshot was computed."),
+				"totalPings":          map[string]interface{}{"type": "integer", "description": "Total ping-bot-triggering messages ever seen, whether or not each one resolved to a usable score."},
+				"farthestPing":        schemaRef("PingScore"),
+				"mostHopsPing":        schemaRef("PingScore"),
+				"widestSpreadPing":    schemaRef("PingScore"),
+				"fastestSpreadPing":   map[string]interface{}{"allOf": []interface{}{schemaRef("PingScore")}, "description": "The fastest full spread among pings heard by at least 2 stations -- a lone station is trivially \"instant\" and is excluded so it can't win this record for nothing."},
+				"mostEfficientPing":   schemaRef("PingScore"),
+				"relayLeaderboard":    map[string]interface{}{"type": "array", "items": schemaRef("PingLeaderboardEntry"), "description": "Top nodes ranked by number of distinct pings they appeared as a relay hop in (deduped per ping first, so one busy ping's many branches can't over-credit a relay)."},
+				"observerLeaderboard": map[string]interface{}{"type": "array", "items": schemaRef("PingLeaderboardEntry"), "description": "Top observers ranked by number of pings they were the first station to hear."},
 			},
 		},
 	}

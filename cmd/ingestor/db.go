@@ -80,6 +80,7 @@ type Store struct {
 	stmtUpdateObserverLastSeen *sql.Stmt
 	stmtUpdateNodeTelemetry    *sql.Stmt
 	stmtUpsertMetrics          *sql.Stmt
+	stmtInsertPingTrigger      *sql.Stmt
 
 	sampleIntervalSec int
 	backfillWg        sync.WaitGroup
@@ -770,6 +771,18 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
+	// Ping-score highscore/leaderboard feature (see ping_triggers.go and
+	// internal/dbschema's ensurePingTriggersTable). INSERT OR IGNORE on
+	// tx_id (PRIMARY KEY) makes this idempotent -- only ever written once
+	// per transmission, at the isNew branch in InsertTransmission.
+	s.stmtInsertPingTrigger, err = s.db.Prepare(`
+		INSERT OR IGNORE INTO ping_triggers (tx_id, hash, channel_hash, sender, first_seen)
+		VALUES (?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+
 	// #1690: bump transmissions.last_seen to MAX(current, ?) on every
 	// observation insert so cold-load can filter on effective recency.
 	// This is NOT a migration — it's the steady-state writer path. The
@@ -938,6 +951,18 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		}
 		txID, _ = result.LastInsertId()
 		s.Stats.TransmissionsInserted.Add(1)
+
+		// Ping-score detection: only for a brand-new CHAN transmission
+		// (payload_type 5), never re-checked on a repeat observation of
+		// the same hash -- one row per unique ping, matching the
+		// transmissions table's own find-or-create semantics.
+		if data.PayloadType == 5 {
+			if sender, displayText, ok := pingTriggerSenderAndText(data.DecodedJSON); ok && isPingTrigger(displayText) {
+				if _, err := s.stmtInsertPingTrigger.Exec(txID, hash, nilIfEmpty(data.ChannelHash), nilIfEmpty(sender), rxTime); err != nil {
+					log.Printf("[db] ping_triggers insert (non-fatal): %v", err)
+				}
+			}
+		}
 	}
 
 	if !isNew {
@@ -1622,6 +1647,42 @@ func (s *Store) UpdateNodeDefaultScope(pubkey, scope string) error {
 	}
 	// Mirror to inactive_nodes (node may be there if recently moved by retention).
 	_, err := s.db.Exec(`UPDATE inactive_nodes SET default_scope = ? WHERE public_key = ?`, scope, pubkey)
+	return err
+}
+
+// UpdateNodeConfiguredScope records the region scopes a node has CONFIGURED,
+// as concrete evidence from an observer /neighbors report (#1865). Unlike
+// UpdateNodeDefaultScope (inferred, overwritten on every observation), this is
+// only called for the observer's own `self` scopes and for neighbors whose OTA
+// scope query returned status="responded" — so the caller, not this method,
+// gates on status. An empty scope IS a valid "responded, no scopes configured"
+// statement and is stored; a timeout must simply not reach this method.
+//
+// reportedAt is the report envelope timestamp (ISO-8601). It is stored in
+// configured_scope_at and used for last-write-wins: an out-of-order older
+// report must not clobber a newer confirmed value. A blank reportedAt skips
+// the ordering guard (always writes).
+func (s *Store) UpdateNodeConfiguredScope(pubkey, scope, reportedAt string) error {
+	if pubkey == "" {
+		return nil
+	}
+	// Last-write-wins: skip if the stored confirmation is newer-or-equal.
+	if reportedAt != "" {
+		var curAt sql.NullString
+		row := s.db.QueryRow(`SELECT configured_scope_at FROM nodes WHERE public_key = ?`, pubkey)
+		if row.Scan(&curAt) == nil && curAt.Valid && curAt.String >= reportedAt {
+			return nil
+		}
+	}
+	if _, err := s.db.Exec(
+		`UPDATE nodes SET configured_scope = ?, configured_scope_at = ? WHERE public_key = ?`,
+		scope, reportedAt, pubkey); err != nil {
+		return err
+	}
+	// Mirror to inactive_nodes (node may be there if recently moved by retention).
+	_, err := s.db.Exec(
+		`UPDATE inactive_nodes SET configured_scope = ?, configured_scope_at = ? WHERE public_key = ?`,
+		scope, reportedAt, pubkey)
 	return err
 }
 

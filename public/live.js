@@ -17,7 +17,7 @@
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function statusGreen() { return cssVar('--status-green') || '#22c55e'; }
 
-  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, clickablePathsLayer;
+  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, selectedAreaLayer, clickablePathsLayer;
   // New animation canvas
   let animCanvas, animCtx;
   let _dprMedia = null;
@@ -1151,7 +1151,8 @@
             <span id="favDesc" class="sr-only">Show only favorited and claimed nodes</span>
             <label><input type="checkbox" id="liveMultibyteToggle" aria-describedby="multibyteDesc"> Multibyte only</label>
             <span id="multibyteDesc" class="sr-only">Show only multibyte (≥2-byte path-hash) packets; hide unreliable single-byte traffic</span>
-            <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
+            <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Geo filter boundary</label>
+            <label id="liveSelectedAreaLabel" style="display:none"><input type="checkbox" id="liveSelectedAreaToggle"> Selected area outline</label>
             </div>
             <div class="live-toggles">
               <div class="live-node-filter-wrap" style="position:relative">
@@ -1856,6 +1857,73 @@
       } catch (e) { /* no geo filter configured */ }
     })();
 
+    // Selected area outline — distinct from the geo filter boundary above:
+    // this draws whichever area is currently picked via the "Area: X ▾"
+    // dropdown (AreaFilter, shared with Nodes/Map/Analytics), not
+    // necessarily the homeArea-linked geo_filter. Falls back to a plain
+    // box when the area has no polygon. Only one area can be selected at
+    // a time (AreaFilter is single-select), so at most one outline shows.
+    (function () {
+      var areaColor = cssVar('--geo-filter-color') || '#3b82f6';
+      var areaPolygonsCache = null;
+      async function fetchAreaPolygons() {
+        if (areaPolygonsCache) return areaPolygonsCache;
+        try {
+          areaPolygonsCache = await api('/config/areas/polygons', { ttl: 3600 });
+        } catch (e) {
+          areaPolygonsCache = [];
+        }
+        return areaPolygonsCache;
+      }
+      function latLngsFor(entry) {
+        if (entry.polygon && entry.polygon.length >= 3) {
+          return entry.polygon.map(function (p) { return [p[0], p[1]]; });
+        }
+        if (entry.latMin != null && entry.latMax != null && entry.lonMin != null && entry.lonMax != null) {
+          return [
+            [entry.latMin, entry.lonMin], [entry.latMin, entry.lonMax],
+            [entry.latMax, entry.lonMax], [entry.latMax, entry.lonMin],
+          ];
+        }
+        return null;
+      }
+      async function refresh() {
+        var label = document.getElementById('liveSelectedAreaLabel');
+        var checkbox = document.getElementById('liveSelectedAreaToggle');
+        if (selectedAreaLayer) { map.removeLayer(selectedAreaLayer); selectedAreaLayer = null; }
+        var key = AreaFilter.getSelected();
+        if (!key) {
+          if (label) label.style.display = 'none';
+          return;
+        }
+        var areas = await fetchAreaPolygons();
+        var entry = areas.find(function (a) { return a.key === key; });
+        var latlngs = entry && latLngsFor(entry);
+        if (!latlngs) {
+          if (label) label.style.display = 'none';
+          return;
+        }
+        selectedAreaLayer = L.polygon(latlngs, {
+          color: areaColor, weight: 2, opacity: 0.8, dashArray: '2 4',
+          fillColor: areaColor, fillOpacity: 0.06
+        });
+        if (label) label.style.display = '';
+        var saved = localStorage.getItem('meshcore-map-selected-area-outline') !== 'false';
+        if (checkbox) checkbox.checked = saved;
+        if (saved) selectedAreaLayer.addTo(map);
+      }
+      var checkbox = document.getElementById('liveSelectedAreaToggle');
+      if (checkbox) {
+        checkbox.addEventListener('change', function (e) {
+          localStorage.setItem('meshcore-map-selected-area-outline', e.target.checked);
+          if (!selectedAreaLayer) return;
+          if (e.target.checked) { selectedAreaLayer.addTo(map); } else { map.removeLayer(selectedAreaLayer); }
+        });
+      }
+      AreaFilter.onChange(refresh);
+      refresh();
+    })();
+
     const matrixToggle = document.getElementById('liveMatrixToggle');
     matrixToggle.checked = matrixMode;
     matrixToggle.addEventListener('change', (e) => {
@@ -2556,6 +2624,7 @@
           <table style="font-size:12px;width:100%;border-collapse:collapse;">
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Last Seen</td><td>${lastSeen}</td></tr>
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Adverts</td><td>${n.advert_count || 0}</td></tr>
+            ${'configured_scope' in n && n.configured_scope !== null ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;" title="Region scopes this node has configured, confirmed via an observer /neighbors report (status=responded) — concrete evidence (#1865).${n.configured_scope_at ? ' Last confirmed ' + escapeHtml(String(n.configured_scope_at)) + '.' : ''}">Configured scope <span style="color:var(--status-green,#2ecc71)" aria-label="confirmed">✓</span></td><td>${n.configured_scope === '' ? '<span style="color:var(--text-muted)">none configured</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.configured_scope)}</code>`}</td></tr>` : ''}
             ${'default_scope' in n ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Scope</td><td>${n.default_scope === null ? '<span style="color:var(--text-muted)">—</span>'
   : n.default_scope === '' ? '<span style="color:var(--text-muted)">unknown scope</span>'
   : `<code style="color:var(--link-color)">${escapeHtml(n.default_scope)}</code>`
@@ -4546,7 +4615,7 @@
       }
       _navCleanup = null;
     }
-    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = clickablePathsLayer = null;
+    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = selectedAreaLayer = clickablePathsLayer = null;
     clickablePaths = [];
     stopMatrixRain();
     // #1572 — clear body.live-fullscreen on route exit. The class hides

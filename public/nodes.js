@@ -82,6 +82,12 @@
   }
   let lastHeard = localStorage.getItem('meshcore-nodes-last-heard') || '';
   let statusFilter = localStorage.getItem('meshcore-nodes-status-filter') || 'all';
+  // 'all' | 'domestic' | 'foreign' — classifies each node's own lat/lon
+  // against the configured geo_filter box/polygon (see
+  // nodePassesGeoFilter in app.js). The unfiltered node list can be
+  // dominated by out-of-region nodes on deployments with heavy
+  // cross-border traffic, making it hard to see which ones are local.
+  let geoScope = localStorage.getItem('meshcore-nodes-geo-scope') || 'all';
   let wsHandler = null;
   let detailMap = null;
 
@@ -673,7 +679,9 @@
             const btooltip = "Normalized betweenness centrality (0..1). How often this node sits on the shortest path between other pairs of nodes in the affinity graph. 1.0 = the most structurally critical node on the mesh. High Bridge + low Traffic share = a quiet but irreplaceable chokepoint.";
             return `<tr id="row-bridge-score" data-bridge-score="${b.toFixed(4)}"><td title="${btooltip}">Bridge score <span style="color:var(--text-muted);cursor:help" aria-label="help">ⓘ</span></td><td><span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary,#333);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${bbarWidth}%;height:100%;background:${bcolor}"></span></span><span style="color:${bcolor};font-weight:600">${bpct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${blabel}</span></td></tr>`;
           })() : ''}
+          ${'default_scope' in n ? `<tr id="row-own-scope"><td title="This node's own configured region scope (hashRegions) — set in its own adverts. Distinct from Transported scopes below, which are regions this node has relayed for OTHER nodes.">Own scope</td><td>${n.default_scope === null ? '<span class="text-muted">—</span>' : n.default_scope === '' ? '<span class="text-muted">unknown scope</span>' : '<span class="badge">' + escapeHtml(n.default_scope) + '</span>'}</td></tr>` : ''}
           ${(n.role === 'repeater' || n.role === 'room') && Array.isArray(n.transported_scopes) && n.transported_scopes.length ? `<tr id="row-transported-scopes"><td title="Distinct region scopes (transmissions.scope_name) of all non-advert packets in which this repeater appears as a path hop. Shows which regions' traffic this repeater has carried (#1751).">Transported scopes</td><td><span style="display:inline-flex;flex-wrap:wrap;gap:3px;vertical-align:middle">${n.transported_scopes.map(sc => '<span class="badge">' + escapeHtml(String(sc)) + '</span>').join('')}</span></td></tr>` : ''}
+          ${'configured_scope' in n && n.configured_scope !== null ? `<tr id="row-configured-scope"><td title="Region scopes this node has CONFIGURED, confirmed via an observer /neighbors report (status=responded) — concrete evidence, distinct from observed default scope and transported scopes (#1865).${n.configured_scope_at ? ' Last confirmed ' + escapeHtml(String(n.configured_scope_at)) + '.' : ''}">Configured scope <span style="color:var(--status-green,#2ecc71)" aria-label="confirmed">✓</span></td><td>${n.configured_scope === '' ? '<span style="color:var(--text-muted)">none configured</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.configured_scope)}</code>`}</td></tr>` : ''}
           <tr><td>First Seen</td><td>${renderNodeTimestampHtml(n.first_seen)}</td></tr>
           <tr><td>Total Packets</td><td>${stats.totalTransmissions || stats.totalPackets || n.advert_count || 0}${stats.totalObservations && stats.totalObservations !== (stats.totalTransmissions || stats.totalPackets) ? ' <span class="text-muted" style="font-size:0.85em">(seen ' + stats.totalObservations + '×)</span>' : ''}</td></tr>
           <tr><td>Packets Today</td><td>${stats.packetsToday || 0}</td></tr>
@@ -1214,6 +1222,16 @@
         await skewPromise;
       }
 
+      // window.MC_GEO_FILTER is set asynchronously by roles.js's
+      // /api/config/client fetch (window.MeshConfigReady), which can still
+      // be in flight on a cold page load — without this await, the geo
+      // scope filter below would run against `undefined` and
+      // nodePassesGeoFilter's "no config = always passes" fallback would
+      // silently classify every node as domestic. MeshConfigReady never
+      // rejects (it has its own .catch), and awaiting an already-resolved
+      // promise is a same-tick no-op, so this is free on every later call.
+      if (window.MeshConfigReady) await window.MeshConfigReady;
+
       // Client-side filtering
       let filtered = _allNodes;
       if (activeTab !== 'all') filtered = filtered.filter(n => (n.role || '').toLowerCase() === activeTab);
@@ -1236,6 +1254,18 @@
           return getNodeStatus(role, lastMs) === statusFilter;
         });
       }
+      // Geo scope filter (domestic vs foreign). Classifies directly from
+      // lat/lon against the configured geo_filter box/polygon rather than
+      // the `foreign` flag alone — that flag only reflects nodes whose
+      // ADVERT was classified at ingest time, so a node whose last-known
+      // GPS predates geo_filter being configured (or just hasn't
+      // re-advertised since) can be geographically outside the filter
+      // without ever being flagged. window.MC_GEO_FILTER is set from
+      // /api/config/client (public/roles.js); nodePassesGeoFilter
+      // (public/app.js) mirrors the server's geofilter.PassesFilter
+      // exactly, including "no GPS / (0,0) always counts as domestic".
+      if (geoScope === 'domestic') filtered = filtered.filter(n => nodePassesGeoFilter(n.lat, n.lon, window.MC_GEO_FILTER));
+      else if (geoScope === 'foreign') filtered = filtered.filter(n => !nodePassesGeoFilter(n.lat, n.lon, window.MC_GEO_FILTER));
       nodes = filtered;
 
       // Defensive filter: hide nodes with obviously corrupted data
@@ -1299,10 +1329,15 @@
           ${TABS.map(t => `<button class="node-tab ${activeTab === t.key ? 'active' : ''}" data-tab="${t.key}">${t.label}</button>`).join('')}
         </div>
         <div class="nodes-filters">
-          <div class="filter-group" id="nodeStatusFilter">
+          <div class="filter-group" id="nodeStatusFilter" role="group" aria-label="Filter by status">
             <button class="btn ${statusFilter==='all'?'active':''}" data-status="all">All</button>
             <button class="btn ${statusFilter==='active'?'active':''}" data-status="active">Active</button>
             <button class="btn ${statusFilter==='stale'?'active':''}" data-status="stale">Stale</button>
+          </div>
+          <div class="filter-group" id="nodeGeoFilter" role="group" aria-label="Filter by domestic/foreign">
+            <button class="btn ${geoScope==='all'?'active':''}" data-geo="all">All</button>
+            <button class="btn ${geoScope==='domestic'?'active':''}" data-geo="domestic">Domestic</button>
+            <button class="btn ${geoScope==='foreign'?'active':''}" data-geo="foreign">Foreign</button>
           </div>
           <select id="nodeLastHeard" aria-label="Filter by last heard time">
             <option value="">Last Heard: Any</option>
@@ -1348,6 +1383,16 @@
         statusFilter = btn.dataset.status;
         localStorage.setItem('meshcore-nodes-status-filter', statusFilter);
         document.querySelectorAll('#nodeStatusFilter .btn').forEach(b => b.classList.toggle('active', b.dataset.status === statusFilter));
+        loadNodes();
+      });
+    });
+
+    // Geo scope filter buttons (domestic vs foreign)
+    document.querySelectorAll('#nodeGeoFilter .btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        geoScope = btn.dataset.geo;
+        localStorage.setItem('meshcore-nodes-geo-scope', geoScope);
+        document.querySelectorAll('#nodeGeoFilter .btn').forEach(b => b.classList.toggle('active', b.dataset.geo === geoScope));
         loadNodes();
       });
     });
@@ -1808,6 +1853,9 @@
   window._nodesIsAdvertMessage = isAdvertMessage;
   window._nodesGetAllNodes = function() { return _allNodes; };
   window._nodesSetAllNodes = function(n) { _allNodes = n; };
+  window._nodesGetFiltered = function() { return nodes; };
+  window._nodesGetGeoScope = function() { return geoScope; };
+  window._nodesSetGeoScope = function(v) { geoScope = v; };
   window._nodesToggleSort = function(col) {
     if (_nodesTableSortCtrl) { _nodesTableSortCtrl.sort(col); return; }
     // Fallback for tests without DOM

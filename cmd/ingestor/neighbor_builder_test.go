@@ -83,5 +83,158 @@ func TestNeighborEdgesBuilderUpsertsFromObservations(t *testing.T) {
 	}
 }
 
+// TestNeighborEdgesBuilderInteriorHopEdges is the #1547 follow-up fix:
+// consecutive hops WITHIN a path (not just the two endpoints) must also
+// produce neighbor_edges rows. resolvePathWithContext's anchor-on-
+// previous-hop lookup (path_resolver.go) needs adjacency data for
+// interior hops to resolve anything past hop 0 in practice -- before
+// this fix, neighbor_edges only ever recorded originator↔hop0 and
+// observer↔lastHop, so a multi-hop path could never resolve its middle.
+func TestNeighborEdgesBuilderInteriorHopEdges(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "build.db")
+
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	// Three repeaters along the path, each with a unique 2-hex prefix.
+	if _, err := store.db.Exec(
+		`INSERT INTO nodes (public_key, name) VALUES (?, ?), (?, ?), (?, ?)`,
+		"bbbbbbbbbb", "hop-b",
+		"cccccccccc", "hop-c",
+		"dddddddddd", "hop-d",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO observers (id, name) VALUES (?, ?)`,
+		"obs-1", "observer-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	var obsRowid int64
+	if err := store.db.QueryRow(`SELECT rowid FROM observers WHERE id = ?`, "obs-1").Scan(&obsRowid); err != nil {
+		t.Fatal(err)
+	}
+
+	// A non-ADVERT (CHAN) transmission, no from_pubkey -- interior edges
+	// must not depend on isAdvert or a resolvable origin, unlike the two
+	// endpoint edges.
+	res, err := store.db.Exec(
+		`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"", "h2", "2026-01-01T00:00:00Z", 0, 5, 0, "{}",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txID, _ := res.LastInsertId()
+
+	// path = b -> c -> d (three hops, 2-byte/4-hex-char prefixes -- the
+	// minimum length minInteriorEdgeHashBytes allows). Expect interior
+	// edges b<->c and c<->d.
+	if _, err := store.db.Exec(
+		`INSERT INTO observations (transmission_id, observer_idx, path_json, timestamp) VALUES (?, ?, ?, ?)`,
+		txID, obsRowid, `["bbbb","cccc","dddd"]`, int64(1735689600),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := store.buildAndPersistNeighborEdges()
+	if err != nil {
+		t.Fatalf("buildAndPersistNeighborEdges: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("expected at least 1 edge upserted, got 0")
+	}
+
+	for _, pair := range [][2]string{{"bbbbbbbbbb", "cccccccccc"}, {"cccccccccc", "dddddddddd"}} {
+		var got int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM neighbor_edges WHERE node_a = ? AND node_b = ?`, pair[0], pair[1]).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 1 {
+			t.Errorf("expected interior edge %s<->%s to be persisted; got %d rows", pair[0], pair[1], got)
+		}
+	}
+}
+
+// TestNeighborEdgesBuilderInteriorHopEdges_ExcludesOneByte covers the
+// PR #1852 review finding: a 1-byte (2-hex-char) prefix that happens to
+// be unique among nodes known TODAY can silently become wrong once an
+// unknown/new node sharing that byte appears later -- and unlike the
+// endpoint edges, an interior edge has no ADVERT/ANON_REQ to
+// double-check it against. minInteriorEdgeHashBytes=2 excludes 1-byte
+// hops from interior-edge creation entirely, even when they'd otherwise
+// resolve unambiguously against the current nodes table.
+func TestNeighborEdgesBuilderInteriorHopEdges_ExcludesOneByte(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "build.db")
+
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	// Same three repeaters as the sibling test, but referenced by their
+	// 1-byte (2-hex-char) prefixes below instead of 2-byte.
+	if _, err := store.db.Exec(
+		`INSERT INTO nodes (public_key, name) VALUES (?, ?), (?, ?), (?, ?)`,
+		"bbbbbbbbbb", "hop-b",
+		"cccccccccc", "hop-c",
+		"dddddddddd", "hop-d",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO observers (id, name) VALUES (?, ?)`,
+		"obs-1", "observer-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	var obsRowid int64
+	if err := store.db.QueryRow(`SELECT rowid FROM observers WHERE id = ?`, "obs-1").Scan(&obsRowid); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := store.db.Exec(
+		`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"", "h3", "2026-01-01T00:00:00Z", 0, 5, 0, "{}",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txID, _ := res.LastInsertId()
+
+	// path = b -> c -> d, but as 1-byte prefixes -- must NOT produce
+	// interior edges, even though each individually resolves unambiguously
+	// against the current (small, test-only) nodes table.
+	if _, err := store.db.Exec(
+		`INSERT INTO observations (transmission_id, observer_idx, path_json, timestamp) VALUES (?, ?, ?, ?)`,
+		txID, obsRowid, `["bb","cc","dd"]`, int64(1735689600),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.buildAndPersistNeighborEdges(); err != nil {
+		t.Fatalf("buildAndPersistNeighborEdges: %v", err)
+	}
+
+	for _, pair := range [][2]string{{"bbbbbbbbbb", "cccccccccc"}, {"cccccccccc", "dddddddddd"}} {
+		var got int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM neighbor_edges WHERE node_a = ? AND node_b = ?`, pair[0], pair[1]).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 0 {
+			t.Errorf("expected NO interior edge %s<->%s from 1-byte hops, got %d rows", pair[0], pair[1], got)
+		}
+	}
+}
+
 // (test ends here)
 

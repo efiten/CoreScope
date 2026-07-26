@@ -35,6 +35,12 @@ const neighborBuilderSlowTickThreshold = 5 * time.Second
 // independent of the server package.
 const payloadADVERT = 0x04
 
+// minInteriorEdgeHashBytes is the minimum hop hash length (in bytes,
+// hex-string length is double this) required before buildAndPersistNeighborEdges
+// will emit an interior hop-to-hop edge. See the doc comment at its use
+// site for why 1-byte prefixes are excluded (PR #1852 review).
+const minInteriorEdgeHashBytes = 2
+
 // edgeRow is one row to upsert into neighbor_edges. (a, b) is already
 // canonical-ordered (a <= b).
 type edgeRow struct {
@@ -227,6 +233,43 @@ func (s *Store) buildAndPersistNeighborEdges() (int, error) {
 			if resolved, ok := resolvePrefix(prefixIdx, last); ok && resolved != observerPK {
 				edges = append(edges, canonEdge(observerPK, resolved, ts))
 			}
+		}
+		// Interior hop-to-hop edges: each consecutive pair of repeaters
+		// in the path must have been in range of each other to relay the
+		// packet along. Unlike the two endpoint edges above, this isn't
+		// gated on isAdvert or which side is the "true" origin/observer
+		// -- it's purely relational between resolved hops in the path
+		// itself. Without it, resolvePathWithContext's anchor-on-
+		// previous-hop lookup (path_resolver.go) has no adjacency data
+		// for any interior hop, so a multi-hop path only ever resolves
+		// its first hop in practice (#1547 follow-up).
+		//
+		// minInteriorEdgeHashBytes guards against a large-mesh false-edge
+		// risk flagged on PR #1852: resolvePrefix only requires a hop to
+		// be unique among nodes known TODAY. At 1 byte (2 hex chars) a
+		// prefix that's currently unique on a large mesh (SaarMesh
+		// reported ~1.2% of 1071 nodes) can silently become wrong once
+		// an unknown/new node sharing that byte appears -- and unlike
+		// the endpoint edges, an interior edge has no ADVERT/ANON_REQ to
+		// double-check it against. 2+ byte prefixes don't have this
+		// problem (SaarMesh: 99.4% of nodes uniquely resolvable there).
+		// Matches the conservative default chosen for the upstream
+		// #1824 pathTrust.minHashBytesForMapping config; inlined here
+		// rather than depending on that config landing first, since it
+		// is not yet wired into any call site.
+		for i := 0; i+1 < len(path); i++ {
+			if len(path[i]) < minInteriorEdgeHashBytes*2 || len(path[i+1]) < minInteriorEdgeHashBytes*2 {
+				continue
+			}
+			resolvedA, okA := resolvePrefix(prefixIdx, path[i])
+			if !okA {
+				continue
+			}
+			resolvedB, okB := resolvePrefix(prefixIdx, path[i+1])
+			if !okB || resolvedA == resolvedB {
+				continue
+			}
+			edges = append(edges, canonEdge(resolvedA, resolvedB, ts))
 		}
 	}
 
