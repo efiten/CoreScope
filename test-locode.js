@@ -228,5 +228,33 @@ test('nothing resolvable: buildLocodeHtml returns null', () => {
   assert.strictEqual(buildLocodeHtml('SomeRandomName', DATA), null);
 });
 
+// Region lookups against the shipped locode.json (not the fixture), so a data
+// regression is caught here rather than as an empty tooltip in the browser.
+const REAL = JSON.parse(fs.readFileSync('public/locode.json', 'utf8'));
+
+test('shipped data: NL 2-letter provinces resolve', () => {
+  for (const [code, name] of [['DR', 'Drenthe'], ['LI', 'Limburg'], ['NB', 'Noord-Brabant'], ['ZH', 'Zuid-Holland']]) {
+    const h = buildLocodeHtml(`NL-${code}-REP01`, REAL);
+    assert.ok(h && h.includes(`Netherlands · ${name}`), `NL-${code} got: ${h}`);
+  }
+});
+
+test('shipped data: BE provinces resolve when no city code collides', () => {
+  for (const [code, name] of [['WLG', 'Liège'], ['VOV', 'Oost-Vlaanderen'], ['VAN', 'Antwerpen'], ['VWV', 'West-Vlaanderen']]) {
+    const h = buildLocodeHtml(`BE-${code}-Fayenbois`, REAL);
+    assert.ok(h && h.includes(`Belgium · ${name}`), `BE-${code} got: ${h}`);
+  }
+});
+
+test('shipped data: BE city codes are not shadowed by a province of the same code', () => {
+  // VLI/WHT/WNA/WBR/BRU are real UN/LOCODE cities as well as ISO 3166-2
+  // provinces. The naming guide makes the city code primary, so these must
+  // stay cities — they are deliberately absent from regions.BE.
+  for (const [code, city] of [['VLI', 'Voroux-lez-Liers'], ['WHT', 'Blaregnies'], ['WNA', 'Warnant'], ['WBR', 'Maransart']]) {
+    const h = buildLocodeHtml(`BE-${code}-RPT01`, REAL);
+    assert.ok(h && h.includes(city), `BE-${code} should stay the city, got: ${h}`);
+  }
+});
+
 console.log(`\nTotal: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
