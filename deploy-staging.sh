@@ -12,6 +12,15 @@ BRANCH="${1:-master}"
 echo "[staging] Checking out $BRANCH..."
 git reset --hard "origin/$BRANCH"
 
+# Staging runs its own config when config.staging.json is present, so retention
+# and memory knobs can be trialled here without touching live (both used to
+# mount the same config.json). Falls back to the live config when absent.
+CONFIG_FILE="$DEPLOY_DIR/config.json"
+if [ -f "$DEPLOY_DIR/config.staging.json" ]; then
+  CONFIG_FILE="$DEPLOY_DIR/config.staging.json"
+fi
+echo "[staging] Config: $CONFIG_FILE"
+
 GIT_COMMIT=$(git rev-parse --short HEAD)
 APP_VERSION=$(git tag --points-at HEAD | grep -E '^v[0-9]' | sort -V | tail -1)
 APP_VERSION=${APP_VERSION:-$(git describe --tags --abbrev=0 2>/dev/null || echo dev)}
@@ -37,7 +46,7 @@ docker run -d --name meshcore-staging \
   --restart unless-stopped \
   --network mesh-internal \
   -p 3001:3000 \
-  -v "$(pwd)/config.json:/app/config.json:ro" \
+  -v "$CONFIG_FILE:/app/config.json:ro" \
   -v meshcore-staging-data:/app/data \
   meshcore-analyzer-staging
 
