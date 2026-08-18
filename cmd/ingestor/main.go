@@ -656,6 +656,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			if cfg.ClientRfSamplesEnabled() {
 				handleClientRfSample(store, tag, parts[2], msg)
 			}
+		case "regions":
+			if cfg.ClientRegionsEnabled() {
+				handleClientRegions(store, cfg, tag, parts[2], msg)
+			}
 		}
 		return
 	}

@@ -1,6 +1,211 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// declaredRegionsCount returns the row count in node_declared_regions.
+func declaredRegionsCount(t *testing.T, s *Store) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM node_declared_regions`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// testTargetPK is a valid lowercase-hex target pubkey (the repeater asked),
+// distinct from testCompanionPK (the reporting companion) so a test that
+// mixes them up is caught.
+const testTargetPK = "bb11223344556677889900aabbccddeeff00112233445566778899aabbccdd"
+
+// TestHandleClientRegionsWritesRow proves a well-formed /regions message
+// writes exactly one node_declared_regions row and touches nothing else.
+func TestHandleClientRegionsWritesRow(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"type": "REGIONS", "timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be", "be-vlg"},
+		"truncated": false,
+		"gps":       map[string]interface{}{"lat": 51.05, "lon": 3.72, "acc_m": 8.0},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	if n := declaredRegionsCount(t, s); n != 1 {
+		t.Fatalf("rows = %d, want 1", n)
+	}
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.RegionsCSV != "be,be-vlg" {
+		t.Errorf("RegionsCSV = %q, want %q", cur.RegionsCSV, "be,be-vlg")
+	}
+	if cur.RxPubkey != testCompanionPK {
+		t.Errorf("RxPubkey = %q, want the topic pubkey %q", cur.RxPubkey, testCompanionPK)
+	}
+	if cur.Lat == nil || cur.Lon == nil || *cur.Lat != 51.05 || *cur.Lon != 3.72 {
+		t.Errorf("lat/lon = %v/%v, want 51.05/3.72", cur.Lat, cur.Lon)
+	}
+	if _, err := time.Parse(rxTimeMillisLayout, cur.ObservedAt); err != nil {
+		t.Errorf("observed_at = %q, want rxTimeMillisLayout format: %v", cur.ObservedAt, err)
+	}
+}
+
+// TestHandleClientRegionsInvalidTopicPubkeyDropped proves an invalid topic
+// pubkey (the reporter's identity) is rejected before any write, the same
+// guard used by every other client sub-topic handler.
+func TestHandleClientRegionsInvalidTopicPubkeyDropped(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be"},
+	}
+	handleClientRegions(s, &Config{}, "test", "NOT-HEX!", msg)
+
+	if n := declaredRegionsCount(t, s); n != 0 {
+		t.Fatalf("rows = %d, want 0 for an invalid topic pubkey", n)
+	}
+}
+
+// TestHandleClientRegionsRejectsInvalidTarget proves `target` is validated as
+// a pubkey with the same hex rule as the topic segment — it is payload data,
+// not ACL-bound identity, so it must not be trusted blindly.
+func TestHandleClientRegionsRejectsInvalidTarget(t *testing.T) {
+	s := newTestStore(t)
+	base := func() map[string]interface{} {
+		return map[string]interface{}{
+			"timestamp": "2026-08-18T10:00:00.000Z",
+			"regions":   []interface{}{"be"},
+		}
+	}
+
+	missing := base()
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, missing)
+
+	invalid := base()
+	invalid["target"] = "not-hex!"
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, invalid)
+
+	empty := base()
+	empty["target"] = ""
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, empty)
+
+	if n := declaredRegionsCount(t, s); n != 0 {
+		t.Fatalf("rows = %d, want 0 — all three target values must be rejected", n)
+	}
+}
+
+// TestHandleClientRegionsEmptyListIsValid proves an empty regions array is a
+// genuine, storable observation ("nothing flood-allowed"), not treated as a
+// malformed/missing field.
+func TestHandleClientRegionsEmptyListIsValid(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	if n := declaredRegionsCount(t, s); n != 1 {
+		t.Fatalf("rows = %d, want 1 — an empty regions list is a valid observation", n)
+	}
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row for the empty-list observation")
+	}
+	if cur.RegionsCSV != "" {
+		t.Errorf("RegionsCSV = %q, want empty string", cur.RegionsCSV)
+	}
+}
+
+// TestHandleClientRegionsMalformedPayloadDropped proves a malformed `regions`
+// field (absent, wrong type, or containing a non-string element) is dropped
+// with a log — never half-stored as an empty list standing in for "no
+// answer", which would blur "declared nothing" with "did not answer".
+func TestHandleClientRegionsMalformedPayloadDropped(t *testing.T) {
+	s := newTestStore(t)
+	base := func() map[string]interface{} {
+		return map[string]interface{}{
+			"timestamp": "2026-08-18T10:00:00.000Z",
+			"target":    testTargetPK,
+		}
+	}
+
+	missing := base()
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, missing)
+
+	wrongType := base()
+	wrongType["regions"] = "be,be-vlg"
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, wrongType)
+
+	badElement := base()
+	badElement["regions"] = []interface{}{"be", 42.0}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, badElement)
+
+	if n := declaredRegionsCount(t, s); n != 0 {
+		t.Fatalf("rows = %d, want 0 — all three malformed payloads must be dropped, not half-stored", n)
+	}
+}
+
+// TestHandleClientRegionsNoGPSStoresNullLatLon proves a declared-regions
+// answer without a position is still meaningful (unlike a coverage point) and
+// is stored with NULL lat/lon rather than dropped.
+func TestHandleClientRegionsNoGPSStoresNullLatLon(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be"},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	if n := declaredRegionsCount(t, s); n != 1 {
+		t.Fatalf("rows = %d, want 1 — no GPS must not drop the observation", n)
+	}
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.Lat != nil || cur.Lon != nil {
+		t.Errorf("lat/lon = %v/%v, want nil/nil when gps is absent", cur.Lat, cur.Lon)
+	}
+}
+
+// TestHandleClientRegionsTruncatedCarriedThrough proves `truncated` is
+// stored as reported (it is a hint from the app, not something the handler
+// re-detects).
+func TestHandleClientRegionsTruncatedCarriedThrough(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be"},
+		"truncated": true,
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil || !cur.Truncated {
+		t.Errorf("Truncated = %v, want true (carried through from payload)", cur)
+	}
+}
 
 func TestDeclaredRegionsCurrentIsLatestObservation(t *testing.T) {
 	s := newTestStore(t)
