@@ -40,6 +40,21 @@
     return s.charAt(0) === '#' ? s.slice(1) : s;
   }
 
+  // '*' is NOT a scope. It is the root of the repeater's region tree, and the
+  // firmware consults it for exactly one thing: whether to forward a plain
+  // ROUTE_TYPE_FLOOD, i.e. a packet with no transport scope at all
+  // (simple_repeater/MyMesh.cpp:562-571 — TRANSPORT_FLOOD matches a named region
+  // by code1, plain FLOOD is governed solely by the wildcard). So it is the
+  // declared counterpart of the `unscoped` counter, not of any scope row, and
+  // listing it among the scopes invites comparing it against scope traffic.
+  function declaredScopes(declared) {
+    return declared ? declared.regions.filter(function (r) { return r !== '*'; }) : [];
+  }
+
+  function declaresUnscoped(declared) {
+    return !!declared && declared.regions.indexOf('*') !== -1;
+  }
+
   // buildRows merges observed[] with declared.regions[] into one row per
   // distinct scope name, so a scope that is declared but never observed
   // still gets a row (the row Step 2b exists to surface) instead of being
@@ -50,7 +65,7 @@
       byName[normScope(o.scope)] = { scope: o.scope, packets: o.packets, lastSeen: o.lastSeen, observed: true };
     });
     if (declared) {
-      declared.regions.forEach(function (r) {
+      declaredScopes(declared).forEach(function (r) {
         var k = normScope(r);
         if (!byName[k]) byName[k] = { scope: r, packets: 0, lastSeen: null, observed: false };
       });
@@ -74,7 +89,7 @@
     if (!declared) {
       return '<span class="ns-decl ns-decl-unknown" title="This repeater has never successfully answered a declared-regions request — out of direct RF range, firmware below v13, or the request was silently ignored (only DIRECT-routed requests get answered). Silence carries no meaning; this is not the same as declaring nothing.">not asked</span>';
     }
-    var declaredHere = declared.regions.some(function (r) { return normScope(r) === normScope(row.scope); });
+    var declaredHere = declaredScopes(declared).some(function (r) { return normScope(r) === normScope(row.scope); });
     if (row.observed && declaredHere) {
       return '<span class="ns-decl ns-decl-yes" title="Declared flood-allowed and observed forwarding it — agreement.">declared</span>';
     }
@@ -105,7 +120,7 @@
     var truncated = declared.truncated
       ? ' <span class="ns-truncated">list truncated — entries may have been silently dropped; a missing region here is not necessarily a real absence.</span>'
       : '';
-    var declaresNothing = declared.regions.length === 0
+    var declaresNothing = declaredScopes(declared).length === 0
       ? ' — it declares no regions flood-allowed.'
       : '';
     return '<div class="ns-declared-meta">Declared regions answer captured ' + escapeHtml(age) + '.' + truncated + declaresNothing + '</div>';
@@ -135,10 +150,16 @@
     var statsHtml = '<div class="analytics-stats">' +
       statCard('Unmatched', d.unmatched, 'Scoped, no key held',
         'Packets that carried a transport scope but matched no configured region key this CoreScope instance holds — a neighbouring region may exist with no key configured here.') +
-      statCard('Unscoped', d.unscoped, 'No scope at all',
-        'Packets that carried no scope at all (Code1 = 0000, or a non-transport route).') +
-      statCard('Declared regions', d.declared ? d.declared.regions.length : '—', d.declared ? 'Flood-allowed, last answer' : 'Never successfully asked',
-        d.declared ? 'Number of regions this repeater declared flood-allowed in its most recent answer.' : 'This repeater has never successfully answered a declared-regions request.') +
+      statCard('Unscoped', d.unscoped,
+        d.declared ? (declaresUnscoped(d.declared) ? 'No scope — declared allowed' : 'No scope — declared denied') : 'No scope at all',
+        'Packets that carried no scope at all (Code1 = 0000, or a non-transport route). ' +
+        (d.declared
+          ? (declaresUnscoped(d.declared)
+            ? "This repeater's declared list includes the '*' wildcard, so it says it does forward unscoped floods — these packets are expected."
+            : "This repeater's declared list omits the '*' wildcard, so it says it does NOT forward unscoped floods. A non-zero count here contradicts that.")
+          : 'Whether the repeater forwards them is unknown — it has never answered a declared-regions request.')) +
+      statCard('Declared regions', d.declared ? declaredScopes(d.declared).length : '—', d.declared ? 'Flood-allowed, last answer' : 'Never successfully asked',
+        d.declared ? "Number of regions this repeater declared flood-allowed in its most recent answer. The '*' wildcard is not counted — it governs unscoped floods, not a region." : 'This repeater has never successfully answered a declared-regions request.') +
       '</div>';
 
     // configIssue must be judged from observed alone, not from rows (the

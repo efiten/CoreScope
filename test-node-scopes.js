@@ -332,16 +332,22 @@ const STALE_TEST_NEW = {
         observedAt: '2026-08-18T18:34:57.190Z', truncated: false,
       },
     });
-    // 6 data rows + 1 <thead> row
+    // 5 data rows + 1 <thead> row: de-nw, be, eu, bx, be-vli. '*' is not a scope.
     const rows = (html.match(/<tr>/g) || []).length;
-    assert(rows === 7,
-      'six distinct scopes: #de-nw and #be merge with their declared twins rather than doubling (got ' + (rows - 1) + ' data rows)');
+    assert(rows === 6,
+      'five distinct scopes: #de-nw and #be merge with their declared twins rather than doubling (got ' + (rows - 1) + ' data rows)');
     assert(!/ns-decl-warn/.test(html),
       'no scope may be badged "observed, not declared" - both observed scopes ARE declared');
     assert((html.match(/ns-decl-yes/g) || []).length === 2,
       'both observed scopes are badged as agreeing with the declared list');
-    assert((html.match(/ns-decl-quiet/g) || []).length === 4,
-      'the four declared-but-unobserved regions each get their own row');
+    assert((html.match(/ns-decl-quiet/g) || []).length === 3,
+      'the three declared-but-unobserved regions each get their own row');
+    assert(!/<td class="ns-scope-name">\*<\/td>/.test(html),
+      "'*' gets no scope row — it is the wildcard governing UNSCOPED floods, not a region");
+    assert(/declared allowed/.test(html),
+      "the '*' wildcard is surfaced on the Unscoped card, where it actually applies");
+    assert(/analytics-stat-value">5</.test(html) || /5<\/div>/.test(html),
+      'the Declared regions count excludes the wildcard (5 scopes, not 6)');
     assert(/<td class="ns-scope-name">de-nw<\/td>/.test(html),
       'an observed scope is displayed without the # prefix, matching how declared rows spell it');
     assert(!/<td class="ns-scope-name">#/.test(html),
