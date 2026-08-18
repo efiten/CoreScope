@@ -784,7 +784,7 @@ forwarding anything is a valid question, not an error.
     "transportDirect":  number         // always 0 — see notes
   },
   "declared": {
-    "regions":    [string],            // e.g. ["*", "be", "be-vlg"]
+    "regions":    [string],            // e.g. ["be", "be-vlg"] — see the '*' note below
     "observedAt": string (ISO),
     "truncated":  boolean
   } | null
@@ -821,6 +821,15 @@ forwarding anything is a valid question, not an error.
 - `declared.regions: []` (a non-null `declared` with an empty array) means the repeater
   **did** answer, and declares nothing flood-allowed. This is a meaningful, different fact
   from `null` and must not be collapsed into it.
+- **`'*'` is not a scope.** When present in `declared.regions`, `'*'` is the root of the
+  repeater's region tree, and it governs exactly one thing: whether the repeater forwards a
+  plain `ROUTE_TYPE_FLOOD` packet — one carrying no transport scope at all (firmware
+  `examples/simple_repeater/MyMesh.cpp:562-571`: `TRANSPORT_FLOOD` matches a named region by
+  Code1, plain `FLOOD` is governed solely by the wildcard). It is therefore the declared
+  counterpart of the `unscoped` count above, not of any region in `observed`. A consumer
+  MUST exclude `'*'` from any scope comparison against `observed` and from any count of how
+  many regions this repeater declares — comparing it against scope traffic, or counting it as
+  a region, produces a permanent phantom "declared, not observed" row that can never resolve.
 - When present, `declared` is always the reading with the greatest `observedAt` — never the
   most recently *received* one, so a drive buffered offline and ingested late cannot
   overwrite a fresher reading.

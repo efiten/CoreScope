@@ -100,20 +100,18 @@ function fakeContainer() {
     // render() delegates a click listener on the container itself; accept and
     // ignore it here. Button behaviour is exercised by fakeContainerWithBar.
     addEventListener: function () {},
-    querySelector: function () { return null; },
   };
 }
 
 // fakeContainerWithBar (FIX 8) — a minimal DOM stub enough to drive
-// wireWindowButtons: querySelector('#nsWindow') returns a fresh stub
-// "element" every time innerHTML is set (mirroring how a real
-// `container.innerHTML = ...` replaces the subtree and produces a brand
-// element (whose own node survives its children being replaced), so the stub
-// gives the CONTAINER the listener list and keeps it across innerHTML writes.
-// That is the behaviour under test: a window button must stay live while a
-// fetch is in flight, which is also the only way load()'s loadGen guard can
-// ever be reached. clickWindowButton() fires every listener registered on the
-// container with an event whose target.closest(sel) returns the button.
+// wireWindowButtons: it gives the CONTAINER itself the listener list, which
+// is what keeps the listener live across innerHTML writes (a real
+// `container.innerHTML = ...` replaces the subtree, but the container's own
+// node survives its children being replaced). That is the behaviour under
+// test: a window button must stay live while a fetch is in flight, which is
+// also the only way load()'s loadGen guard can ever be reached.
+// clickWindowButton() fires every listener registered on the container with
+// an event whose target.closest(sel) returns the button.
 function fakeContainerWithBar() {
   var c = {
     _html: '',
@@ -123,7 +121,6 @@ function fakeContainerWithBar() {
     addEventListener: function (type, fn) {
       if (type === 'click') this._listeners.push(fn);
     },
-    querySelector: function () { return null; },
   };
   c.clickWindowButton = function (windowKey) {
     var target = {
@@ -220,6 +217,18 @@ const DECLARED_ONLY_UNMATCHED = {
   declared: { regions: ['be'], observedAt: '2026-08-18T17:35:36Z', truncated: false },
 };
 
+// Fixture 4b (FIX 2) — a repeater whose declared.regions is EXACTLY ['*']:
+// no named regions, but the wildcard governing unscoped floods IS declared.
+// Before FIX 2 this rendered byte-identical to DECLARES_NOTHING (regions:
+// []) — "it declares no regions flood-allowed" — which is the opposite of
+// what '*' present actually means (unscoped floods ARE forwarded).
+const DECLARES_ONLY_WILDCARD = {
+  publicKey: 'd5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5',
+  window: '24h', observed: [], unmatched: 0, unscoped: 0,
+  routes: { transportFlood: 0, flood: 0, direct: 0, transportDirect: 0 },
+  declared: { regions: ['*'], observedAt: '2026-08-18T17:35:36Z', truncated: false },
+};
+
 // Fixture 6 (FIX 2) — a scope name and a declared region name that collide
 // with Object.prototype keys. buildRows() used to key a plain {} by these
 // names: `byName['__proto__'] = ...` writes the prototype object itself
@@ -311,6 +320,18 @@ const STALE_TEST_NEW = {
     assert(/it declares no regions flood-allowed/.test(html), 'FIX 5: an empty declared.regions list says plainly that it declares no regions flood-allowed');
   }
 
+  console.log('\n=== FIX 2: declared.regions === [\'*\'] must not read as "declares nothing" ===');
+  {
+    const { html: wildcardOnly } = await renderAndGet(DECLARES_ONLY_WILDCARD);
+    const { html: declaresNothing } = await renderAndGet(DECLARES_NOTHING);
+    assert(/it declares no named regions flood-allowed, but does declare/.test(wildcardOnly),
+      "declared.regions === ['*'] renders the wildcard qualifier, not the bare 'declares no regions' sentence");
+    assert(wildcardOnly !== declaresNothing,
+      "['*']-only and []-only declared answers must NOT render byte-identical meta lines — they mean opposite things for unscoped floods");
+    assert(/declared allowed/.test(wildcardOnly),
+      "the Unscoped stat card still shows 'declared allowed' for a ['*']-only declared list");
+  }
+
   console.log('\n=== Hash prefix: observed "#de-nw" and declared "de-nw" are the SAME scope ===');
   {
     // Real shapes from production, not invented: transmissions.scope_name keeps the
@@ -346,7 +367,7 @@ const STALE_TEST_NEW = {
       "'*' gets no scope row — it is the wildcard governing UNSCOPED floods, not a region");
     assert(/declared allowed/.test(html),
       "the '*' wildcard is surfaced on the Unscoped card, where it actually applies");
-    assert(/analytics-stat-value">5</.test(html) || /5<\/div>/.test(html),
+    assert(/analytics-stat-value">5</.test(html),
       'the Declared regions count excludes the wildcard (5 scopes, not 6)');
     assert(/<td class="ns-scope-name">de-nw<\/td>/.test(html),
       'an observed scope is displayed without the # prefix, matching how declared rows spell it');
@@ -435,17 +456,15 @@ const STALE_TEST_NEW = {
   {
     const { sandbox, calls, pending } = makeControllableSandbox();
     const c = fakeContainerWithBar();
-    // NOTE (documented limitation — see FIX 8 report): wireWindowButtons only
-    // (re)binds the click listener AFTER a fetch settles (load()'s success
-    // and catch branches both call it at the end, never before the await).
-    // So the rendered buttons are structurally unwired for the entire
-    // duration a fetch is in flight — a second click cannot physically land
-    // while the first is still pending; there is no click sequence that
-    // produces two in-flight loads. The loadGen guard is instead exercised
-    // here through two overlapping calls to NodeScopes.render() itself,
-    // which drives the exact same load()/loadGen code a button click runs
-    // (a second render() firing before the first settles is the realistic
-    // trigger — e.g. a remount or refresh landing mid-fetch).
+    // wireWindowButtons binds its click listener once, on the container
+    // itself, in render() (guarded by a WeakSet) — so a click CAN land
+    // mid-flight (see the "stays live WHILE a fetch is in flight" test
+    // above). The loadGen guard here is instead exercised through two
+    // overlapping calls to NodeScopes.render() itself, which drives the
+    // exact same load()/loadGen code a button click runs, because a second
+    // render() firing before the first settles (e.g. a remount or refresh
+    // landing mid-fetch) is a second realistic way to produce two in-flight
+    // loads, distinct from the button-click path already covered above.
     sandbox.window.NodeScopes.render(c, 'deadbeef'); // load #1: myGen=1, window=24h
     await new Promise(function (r) { setImmediate(r); });
     assert(calls.length === 1 && calls[0] === '/nodes/deadbeef/scopes?window=24h',

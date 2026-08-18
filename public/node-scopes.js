@@ -3,8 +3,9 @@
    renders observed-vs-declared region-scope conformance into the node
    detail view (an embedded card, not a routed page — this is one section
    on an existing page). Mirrors node-reach.js's fetch/render/empty-state
-   shape and its window-button control. Repeaters only; the caller (nodes.js)
-   only mounts the container for role === 'repeater'. */
+   shape and its window-button control. Repeaters and rooms only (both
+   forward flood traffic); the caller (nodes.js) only mounts the container
+   for role === 'repeater' || role === 'room'. */
 'use strict';
 (function () {
   var loadGen = 0; // bumped per load; guards against in-flight races (mirrors node-reach.js)
@@ -121,7 +122,9 @@
       ? ' <span class="ns-truncated">list truncated — entries may have been silently dropped; a missing region here is not necessarily a real absence.</span>'
       : '';
     var declaresNothing = declaredScopes(declared).length === 0
-      ? ' — it declares no regions flood-allowed.'
+      ? (declaresUnscoped(declared)
+        ? ' — it declares no named regions flood-allowed, but does declare the \'*\' wildcard, so it forwards unscoped floods.'
+        : ' — it declares no regions flood-allowed.')
       : '';
     return '<div class="ns-declared-meta">Declared regions answer captured ' + escapeHtml(age) + '.' + truncated + declaresNothing + '</div>';
   }

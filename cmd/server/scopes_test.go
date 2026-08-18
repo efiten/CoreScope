@@ -143,10 +143,17 @@ func seedDirectTransmission(t *testing.T, s *PacketStore, forwarder string, seed
 
 func TestScopeConformanceKeepsThreeStatesDistinct(t *testing.T) {
 	s := newScopeTestStore(t)
-	// Same forwarder on all three, so only the scope state differs.
+	// Same forwarder on all three, so only the scope state differs. Unmatched
+	// and unscoped are seeded with DIFFERENT counts (2 vs 3) deliberately: a
+	// fixture with the same count for both (as this test used to have, 1/1)
+	// cannot catch the two increments being swapped in scopes.go — the
+	// asserted numbers would still match either way. See FIX 4.
 	seedTransmission(t, s, "1a2b", scopeMatched("be-van")) // scope_name = matched name
 	seedTransmission(t, s, "1a2b", scopeUnmatched())       // code1 != 0000, no key -> scope_name = empty string
-	seedTransmission(t, s, "1a2b", scopeUnscoped())        // code1 == 0000 -> scope_name = NULL
+	seedTransmission(t, s, "1a2b", scopeUnmatched())
+	seedTransmission(t, s, "1a2b", scopeUnscoped()) // code1 == 0000 -> scope_name = NULL
+	seedTransmission(t, s, "1a2b", scopeUnscoped())
+	seedTransmission(t, s, "1a2b", scopeUnscoped())
 
 	got, err := s.ScopeConformance("1a2b", "2026-01-01T00:00:00Z")
 	if err != nil {
@@ -155,11 +162,11 @@ func TestScopeConformanceKeepsThreeStatesDistinct(t *testing.T) {
 	if len(got.Observed) != 1 || got.Observed[0].Scope != "be-van" {
 		t.Errorf("observed = %+v, want exactly the matched scope", got.Observed)
 	}
-	if got.Unmatched != 1 {
-		t.Errorf("unmatched = %d, want 1 — a scoped packet we hold no key for is information, not absence", got.Unmatched)
+	if got.Unmatched != 2 {
+		t.Errorf("unmatched = %d, want 2 — a scoped packet we hold no key for is information, not absence", got.Unmatched)
 	}
-	if got.Unscoped != 1 {
-		t.Errorf("unscoped = %d, want 1", got.Unscoped)
+	if got.Unscoped != 3 {
+		t.Errorf("unscoped = %d, want 3", got.Unscoped)
 	}
 }
 
@@ -252,6 +259,51 @@ func TestScopeConformanceRouteMixIgnoresDirectRoutes(t *testing.T) {
 	}
 	if len(got.Observed) != 0 {
 		t.Errorf("Observed = %+v, want empty — no flood packet was seeded", got.Observed)
+	}
+}
+
+// TestScopeConformanceSurvivesMalformedPathJSON guards against a SQLite
+// quirk: json_each() in the EXISTS subquery is evaluated independently of
+// the `o.path_json IS NOT NULL` predicate in the same WHERE clause, so a
+// single row anywhere in the window whose path_json is an empty string or
+// otherwise non-JSON text fails json_each() with "malformed JSON (1)" and
+// errors the WHOLE query — not just that row — for every pubkey. A good row
+// alongside the malformed one must still be returned, and the request must
+// not error.
+func TestScopeConformanceSurvivesMalformedPathJSON(t *testing.T) {
+	s := newScopeTestStore(t)
+	seedTransmission(t, s, "1a2b", scopeMatched("be-van")) // good row
+
+	// A second transmission with a malformed path_json observation, forced
+	// straight into the DB — seedTransmissionRoute always writes valid JSON,
+	// so this bypasses it to reproduce a row that could exist in a live DB
+	// (e.g. partial ingest, a truncated write) without a helper that could
+	// itself drift from what real corruption looks like.
+	res, err := s.db.conn.Exec(
+		`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, code1, code2, scope_name)
+		 VALUES ('AA', 'malformedhash', '2026-01-15T12:00:00Z', ?, 1, '1234', '00', 'be-van')`,
+		RouteFlood,
+	)
+	if err != nil {
+		t.Fatalf("seed malformed transmission: %v", err)
+	}
+	txID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("seed malformed transmission id: %v", err)
+	}
+	if _, err := s.db.conn.Exec(
+		`INSERT INTO observations (transmission_id, path_json, timestamp) VALUES (?, '', ?)`,
+		txID, time.Now().Unix(),
+	); err != nil {
+		t.Fatalf("seed malformed observation: %v", err)
+	}
+
+	got, err := s.ScopeConformance("1a2b", "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("a malformed path_json row elsewhere must not error the whole query: %v", err)
+	}
+	if len(got.Observed) != 1 || got.Observed[0].Scope != "be-van" {
+		t.Errorf("observed = %+v, want the one good row still returned", got.Observed)
 	}
 }
 

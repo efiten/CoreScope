@@ -96,6 +96,12 @@ const minForwarderHopHexLen = 4
 //     matches when it equals the pubkey's own first len(hop) characters —
 //     and excludes hops shorter than minForwarderHopHexLen as too
 //     collision-prone to trust (see its doc comment).
+//   - json_valid(o.path_json) is required explicitly: SQLite evaluates the
+//     json_each() join independently of the IS NOT NULL predicate in this
+//     same WHERE clause, so a single row anywhere in the window with
+//     malformed path_json (an empty string or non-JSON text) fails
+//     json_each() and errors the ENTIRE query — not just that row — for
+//     every pubkey.
 var scopeConformanceQuery = `
 	SELECT t.scope_name, t.route_type, t.first_seen
 	FROM transmissions t
@@ -107,6 +113,7 @@ var scopeConformanceQuery = `
 	      JOIN json_each(o.path_json) je ON je.key = json_array_length(o.path_json) - 1
 	      WHERE o.transmission_id = t.id
 	        AND o.path_json IS NOT NULL
+	        AND json_valid(o.path_json)
 	        AND json_array_length(o.path_json) > 0
 	        AND LENGTH(je.value) >= ` + fmt.Sprint(minForwarderHopHexLen) + `
 	        AND LOWER(je.value) = SUBSTR(?, 1, LENGTH(je.value))
@@ -482,7 +489,11 @@ func (s *Server) handleNodeScopes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	raw, _ := v.([]byte)
+	raw, ok := v.([]byte)
+	if !ok {
+		writeError(w, 500, "internal error: unexpected scopes result type")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
 }

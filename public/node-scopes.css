@@ -1,7 +1,10 @@
 /* Node detail — Scopes section. Reuses .analytics-stats / .analytics-stat-card /
    .analytics-time-range from the analytics page (same tokens node-reach.css
    reuses); these are the scopes-specific bits only. No hex/rgb literals —
-   --text-muted / --border / --status-* / --section-bg are defined globally. */
+   --text-muted / --border / --status-* are defined globally. --section-bg is
+   NOT: it exists only in the dark-theme blocks (style.css), never in light
+   :root, so every use below MUST keep the var(--section-bg, var(--card-bg))
+   fallback — the fallback is load-bearing, not decorative. */
 
 .ns-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .ns-head h4 { margin: 0; }
