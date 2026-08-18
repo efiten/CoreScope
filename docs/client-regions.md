@@ -26,7 +26,7 @@ Topic: `meshcore/client/{PUBLIC_KEY}/regions` — `{PUBLIC_KEY}` is the reportin
 {
   "type": "REGIONS",
   "timestamp": "2026-08-18T10:00:00.000Z",
-  "target": "bb11223344556677889900aabbccddeeff00112233445566778899aabbccdd",
+  "target": "bb11223344556677889900aabbccddeeff00112233445566778899aabbccddaa",
   "regions": ["be", "be-vlg"],
   "truncated": false,
   "repeater_clock": 1755504000,
@@ -35,8 +35,15 @@ Topic: `meshcore/client/{PUBLIC_KEY}/regions` — `{PUBLIC_KEY}` is the reportin
 ```
 
 - `target` is the repeater that was asked, as a lowercase-hex pubkey. It is payload data, not
-  ACL-bound identity, so it is validated with the same hex rule used for the topic pubkey before being
-  trusted; a missing or invalid `target` drops the whole message.
+  ACL-bound identity, so it is validated before being trusted — but validated strictly: exactly 64 hex
+  characters, a full pubkey, not the looser 2-64-character rule used for the topic pubkey. The app
+  cannot produce anything else — its request builder throws unless the pubkey it sends is exactly 64
+  hex characters, so it can only ever ask about (and report back) a full pubkey. A shorter `target`
+  therefore indicates a malformed or forged payload, not a legitimate shorthand worth keeping: a
+  wrongly-accepted short value would still insert a row, but `CurrentDeclaredRegions` matches on the
+  exact target string, so that row would never surface for the real node's queries — it would just
+  accumulate silently as junk that looks like data. A missing, malformed, or wrong-length `target`
+  drops the whole message.
 - `regions` is the CSV-decoded list the repeater returned. **An empty list is a valid, deliberate
   answer** — the repeater declared nothing flood-allowed — and is stored as a row with an empty
   `regions_csv`, not dropped or treated as absence. A missing or malformed `regions` field (not an

@@ -15,10 +15,12 @@ func declaredRegionsCount(t *testing.T, s *Store) int {
 	return n
 }
 
-// testTargetPK is a valid lowercase-hex target pubkey (the repeater asked),
-// distinct from testCompanionPK (the reporting companion) so a test that
-// mixes them up is caught.
-const testTargetPK = "bb11223344556677889900aabbccddeeff00112233445566778899aabbccdd"
+// testTargetPK is a valid, exactly-64-hex-char target pubkey (the repeater
+// asked), distinct from testCompanionPK (the reporting companion) so a test
+// that mixes them up is caught. Must stay exactly 64 characters — that is
+// what targetPubkeyRe requires, and a shortened value here would make the
+// happy-path tests pass for the wrong reason.
+const testTargetPK = "bb11223344556677889900aabbccddeeff00112233445566778899aabbccddaa"
 
 // TestHandleClientRegionsWritesRow proves a well-formed /regions message
 // writes exactly one node_declared_regions row and touches nothing else.
@@ -74,9 +76,8 @@ func TestHandleClientRegionsInvalidTopicPubkeyDropped(t *testing.T) {
 	}
 }
 
-// TestHandleClientRegionsRejectsInvalidTarget proves `target` is validated as
-// a pubkey with the same hex rule as the topic segment — it is payload data,
-// not ACL-bound identity, so it must not be trusted blindly.
+// TestHandleClientRegionsRejectsInvalidTarget proves `target` is validated
+// before being trusted — it is payload data, not ACL-bound identity.
 func TestHandleClientRegionsRejectsInvalidTarget(t *testing.T) {
 	s := newTestStore(t)
 	base := func() map[string]interface{} {
@@ -99,6 +100,29 @@ func TestHandleClientRegionsRejectsInvalidTarget(t *testing.T) {
 
 	if n := declaredRegionsCount(t, s); n != 0 {
 		t.Fatalf("rows = %d, want 0 — all three target values must be rejected", n)
+	}
+}
+
+// TestHandleClientRegionsRejectsWrongLengthTarget proves a target that is
+// valid hex but the wrong length is rejected, not silently accepted as a
+// prefix. Task 1's buildRegionsRequest throws unless the pubkey it sends is
+// exactly 64 hex characters, so the app can only ever ask (and report back)
+// a full pubkey — anything shorter is a malformed/forged payload. Without
+// this check, a short target would still insert a row (clientPubkeyRe alone
+// accepts 2-64 hex), and CurrentDeclaredRegions matches on the exact target
+// string, so that row would never surface for the real node's queries — it
+// would just accumulate silently as junk that looks like data.
+func TestHandleClientRegionsRejectsWrongLengthTarget(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK[:8], // valid hex, but only 8 of the required 64 chars
+		"regions":   []interface{}{"be"},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	if n := declaredRegionsCount(t, s); n != 0 {
+		t.Fatalf("rows = %d, want 0 — a target shorter than 64 hex chars must be rejected", n)
 	}
 }
 

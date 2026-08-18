@@ -2,9 +2,23 @@ package main
 
 import (
 	"log"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// targetPubkeyRe validates the `target` field of a /regions payload: the
+// repeater the companion asked. Unlike the topic pubkey (clientPubkeyRe,
+// 2-64 hex — a separate contract with its own history), target has one
+// legitimate shape only. Task 1's buildRegionsRequest throws a TypeError
+// unless the pubkey it sends is exactly 64 hex characters, so the app can
+// only ever ask a full pubkey and can only ever report one back. A target
+// shorter than that is a malformed or forged payload, not a legitimate
+// variant — and accepting it anyway would be a silent-accumulation bug, not
+// a loud one: CurrentDeclaredRegions matches on the exact target, so a row
+// stored against a short prefix is invisible to every query for the real
+// node and just accumulates as junk that looks like data.
+var targetPubkeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // handleClientRegions processes one region-discovery answer from
 // meshcore/client/{PUBLIC_KEY}/regions: a mobile companion asked a repeater
@@ -12,7 +26,7 @@ import (
 // The topic pubkey (rxPubkey) is the reporting companion's identity
 // (ACL-bound by the broker) and is never taken from the payload. `target` is
 // the repeater that was asked; it arrives as payload data and is validated
-// with the same hex rule as the topic segment before being trusted. An empty
+// as a full 64-hex pubkey (targetPubkeyRe) before being trusted. An empty
 // `regions` list is a valid, deliberate answer ("nothing flood-allowed") and
 // is stored; a missing or malformed `regions` field is not an answer at all
 // and the whole message is dropped rather than half-stored as an empty list.
@@ -27,7 +41,7 @@ func handleClientRegions(store *Store, cfg *Config, tag, rxPubkey string, msg ma
 	}
 	target, _ := msg["target"].(string)
 	target = strings.ToLower(strings.TrimSpace(target))
-	if !clientPubkeyRe.MatchString(target) {
+	if !targetPubkeyRe.MatchString(target) {
 		log.Printf("MQTT [%s] regions: invalid target %.8q, dropping", tag, target)
 		return
 	}
