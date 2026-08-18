@@ -33,7 +33,7 @@
   // still gets a row (the row Step 2b exists to surface) instead of being
   // silently absent because it has no packets to iterate.
   function buildRows(observed, declared) {
-    var byName = {};
+    var byName = Object.create(null);
     observed.forEach(function (o) {
       byName[o.scope] = { scope: o.scope, packets: o.packets, lastSeen: o.lastSeen, observed: true };
     });
@@ -88,7 +88,10 @@
     var truncated = declared.truncated
       ? ' <span class="ns-truncated">list truncated — entries may have been silently dropped; a missing region here is not necessarily a real absence.</span>'
       : '';
-    return '<div class="ns-declared-meta">Declared regions answer captured ' + escapeHtml(age) + '.' + truncated + '</div>';
+    var declaresNothing = declared.regions.length === 0
+      ? ' — it declares no regions flood-allowed.'
+      : '';
+    return '<div class="ns-declared-meta">Declared regions answer captured ' + escapeHtml(age) + '.' + truncated + declaresNothing + '</div>';
   }
 
   function routesHtml(routes) {
@@ -122,11 +125,19 @@
         d.declared ? 'Number of regions this repeater declared flood-allowed in its most recent answer.' : 'This repeater has never successfully answered a declared-regions request.') +
       '</div>';
 
+    // configIssue must be judged from observed alone, not from rows (the
+    // observed/declared union) — a repeater with declared-only rows and
+    // unmatched>0 still has a config problem (this deployment holds no key
+    // that could ever name its traffic), and that note must render even
+    // though rows is non-empty. See FIX 1.
+    var configIssue = d.observed.length === 0 && d.unmatched > 0;
+    var noteHtml = configIssue
+      ? '<div class="ns-empty ns-empty-config">No scope could be named for this repeater\'s traffic in the last ' + win + ' — ' + d.unmatched + ' scoped packet' + (d.unmatched === 1 ? '' : 's') + ' matched no configured region key. Scope tracking may not be configured on this deployment; check the region-keys configuration.</div>'
+      : '';
     var bodyHtml;
     if (rows.length === 0) {
-      var configIssue = d.unmatched > 0;
       bodyHtml = configIssue
-        ? '<div class="ns-empty ns-empty-config">No scope could be named for this repeater\'s traffic in the last ' + win + ' — ' + d.unmatched + ' scoped packet' + (d.unmatched === 1 ? '' : 's') + ' matched no configured region key. Scope tracking may not be configured on this deployment; check the region-keys configuration.</div>'
+        ? ''
         : '<div class="ns-empty">No scope data — this repeater has forwarded nothing we observed carrying a region scope in the last ' + win + '.</div>';
     } else {
       bodyHtml = '<table class="ns-table"><thead><tr><th>Scope</th><th>Packets</th><th>Last seen</th><th>Declared</th></tr></thead><tbody>' +
@@ -135,7 +146,7 @@
     }
 
     container.innerHTML = headHtml(win) + statsHtml + declaredMetaHtml(d.declared) +
-      routesHtml(d.routes) + bodyHtml +
+      routesHtml(d.routes) + noteHtml + bodyHtml +
       '<div class="ns-links"><a href="#/analytics?tab=hashsizes">Hash-size analytics &rarr;</a></div>';
     wireWindowButtons(container, pubkey);
   }

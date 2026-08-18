@@ -7,12 +7,6 @@
 .ns-head h4 { margin: 0; }
 .ns-window { margin: 0; }
 
-.ns-note {
-  margin: 6px 0 14px; padding: 6px 10px; font-size: 11px; line-height: 1.4;
-  color: var(--text-muted); background: var(--section-bg);
-  border: 1px solid var(--border); border-radius: 6px;
-}
-
 .ns-declared-meta { font-size: 11px; color: var(--text-muted); margin: 0 0 10px; }
 .ns-declared-meta .ns-truncated { color: var(--status-amber-text); font-weight: 600; }
 .ns-declared-meta .ns-never-asked { color: var(--text-muted); font-style: italic; }
@@ -36,8 +30,8 @@
 }
 .ns-decl-yes { background: color-mix(in srgb, var(--status-green) 16%, transparent); color: var(--status-green-text); }
 .ns-decl-quiet { background: color-mix(in srgb, var(--status-yellow) 18%, transparent); color: var(--status-amber-text); }
-.ns-decl-warn { background: color-mix(in srgb, var(--status-red) 16%, transparent); color: var(--status-red); }
-.ns-decl-unknown { background: var(--section-bg); color: var(--text-muted); font-weight: 600; text-transform: none; }
+.ns-decl-warn { background: color-mix(in srgb, var(--status-red) 16%, transparent); color: var(--danger); }
+.ns-decl-unknown { background: var(--section-bg, var(--card-bg)); color: var(--text-muted); font-weight: 600; text-transform: none; }
 
 .ns-routes { font-size: 11px; color: var(--text-muted); margin: 0 0 14px; }
 .ns-routes b { color: var(--text); font-variant-numeric: tabular-nums; }

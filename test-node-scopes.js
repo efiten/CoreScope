@@ -59,6 +59,39 @@ function makeSandbox(apiResponse) {
   return { sandbox, calls };
 }
 
+// makeControllableSandbox (FIX 8) — like makeSandbox, but api() never
+// resolves on its own; the test resolves each call's promise explicitly via
+// the returned `pending` map (keyed by the request path), so response
+// arrival order can be controlled independently of request order. This is
+// what lets the loadGen guard be exercised: start an older request, start a
+// newer one before the older resolves, resolve the newer one first, THEN
+// resolve the stale older one and assert it did not overwrite the render.
+function makeControllableSandbox() {
+  const calls = [];
+  const pending = {};
+  const sandbox = {
+    window: {},
+    escapeHtml: function (s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    },
+    timeAgo: function (iso) {
+      if (!iso) return '—';
+      return 'AGE(' + iso + ')';
+    },
+    api: function (p) {
+      calls.push(p);
+      return new Promise(function (resolve) { pending[p] = resolve; });
+    },
+    console: console,
+  };
+  sandbox.global = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox, { filename: 'node-scopes.js' });
+  return { sandbox, calls, pending };
+}
+
 function fakeContainer() {
   return {
     _html: '',
@@ -66,6 +99,43 @@ function fakeContainer() {
     get innerHTML() { return this._html; },
     querySelector: function () { return null; }, // skip button wiring — not under test here
   };
+}
+
+// fakeContainerWithBar (FIX 8) — a minimal DOM stub enough to drive
+// wireWindowButtons: querySelector('#nsWindow') returns a fresh stub
+// "element" every time innerHTML is set (mirroring how a real
+// `container.innerHTML = ...` replaces the subtree and produces a brand
+// new #nsWindow node each render, so listeners bound to a stale node are
+// naturally gone rather than accumulating). clickWindowButton() simulates
+// a click whose event.target is the button itself (target.closest(sel)
+// returns the button when sel matches, null otherwise) and fires every
+// listener addEventListener('click', ...) registered against the CURRENT
+// bar node.
+function fakeContainerWithBar() {
+  var currentBar = null;
+  var c = {
+    _html: '',
+    set innerHTML(v) {
+      this._html = v;
+      currentBar = { _listeners: [] };
+      currentBar.addEventListener = function (type, fn) {
+        if (type === 'click') currentBar._listeners.push(fn);
+      };
+    },
+    get innerHTML() { return this._html; },
+    querySelector: function (sel) { return sel === '#nsWindow' ? currentBar : null; },
+  };
+  c.clickWindowButton = function (windowKey) {
+    var bar = currentBar;
+    var target = {
+      closest: function (sel) {
+        if (sel !== 'button[data-window]') return null;
+        return { getAttribute: function (n) { return n === 'data-window' ? windowKey : null; } };
+      },
+    };
+    bar._listeners.forEach(function (fn) { fn({ target: target }); });
+  };
+  return c;
 }
 
 async function renderAndGet(apiResponse) {
@@ -135,20 +205,68 @@ const DECLARES_NOTHING = {
   declared: { regions: [], observedAt: '2026-08-18T17:35:36Z', truncated: false },
 };
 
+// Fixture 5 (FIX 1) — declared-only rows (nothing observed at all) combined
+// with unmatched>0: a repeater that DID answer a declared-regions request,
+// but this instance's region-key config could still be the reason none of
+// its traffic could be named. Before FIX 1 the config note was gated on
+// `rows.length === 0`, and rows is the observed+declared UNION — so this
+// exact combination (declared-only row present, unmatched>0) rendered a
+// bare "declared, not observed" row with no explanation that unmatched
+// packets exist, silently pointing the operator at the repeater instead of
+// at local config.
+const DECLARED_ONLY_UNMATCHED = {
+  publicKey: 'e'.repeat(64),
+  window: '24h', observed: [], unmatched: 3, unscoped: 0,
+  routes: { transportFlood: 0, flood: 3, direct: 0, transportDirect: 0 },
+  declared: { regions: ['be'], observedAt: '2026-08-18T17:35:36Z', truncated: false },
+};
+
+// Fixture 6 (FIX 2) — a scope name and a declared region name that collide
+// with Object.prototype keys. buildRows() used to key a plain {} by these
+// names: `byName['__proto__'] = ...` writes the prototype object itself
+// (no own key created, so Object.keys() never sees it — silently dropped);
+// `if (!byName['constructor'])` is false against a plain {} because
+// Object.prototype.constructor is already truthy, so a declared-only
+// 'constructor' row is silently swallowed. Both names are attacker-
+// influenceable (declared.regions comes from a repeater's own RF reply;
+// scope names come from packets).
+const PROTO_COLLISION = {
+  publicKey: 'f'.repeat(64),
+  window: '24h',
+  observed: [{ scope: '__proto__', packets: 2, firstSeen: '2026-08-18T17:40:06Z', lastSeen: '2026-08-18T17:42:06Z' }],
+  unmatched: 0, unscoped: 0,
+  routes: { transportFlood: 0, flood: 2, direct: 0, transportDirect: 0 },
+  declared: { regions: ['constructor'], observedAt: '2026-08-18T17:35:36Z', truncated: false },
+};
+
+// Fixture 7 (FIX 8) — the response to the NEWER (1h) request in the
+// loadGen race test. Deliberately distinct from THE_STATE/NOT_CONFIGURED so
+// a wrongly-rendered stale response is unmistakable in the assertions.
+const STALE_TEST_NEW = {
+  publicKey: 'a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4',
+  window: '1h',
+  observed: [{ scope: 'nl', packets: 99, firstSeen: '2026-08-18T17:40:06Z', lastSeen: '2026-08-18T17:42:06Z' }],
+  unmatched: 0, unscoped: 0,
+  routes: { transportFlood: 0, flood: 99, direct: 0, transportDirect: 0 },
+  declared: null,
+};
+
 (async function main() {
   console.log('\n=== Fixture 1: three-state declared/observed distinction ===');
   {
     const { html, calls } = await renderAndGet(THREE_STATE);
     assert(calls.length === 1 && calls[0] === '/nodes/deadbeef/scopes?window=24h',
       'fetched exactly once, with the default 24h window: ' + calls[0]);
-    assert(/be[\s\S]{0,120}declared</.test(html) || /ns-decl-yes/.test(html),
-      "'be' (declared AND observed) renders the agreement badge");
+    assert(/<td class="ns-scope-name">be<\/td>[\s\S]{0,200}ns-decl-yes/.test(html),
+      "'be' (declared AND observed) renders the agreement badge, bound to the 'be' row specifically");
     assert(/nl[\s\S]{0,400}declared, not observed/.test(html),
       "'nl' (declared but never observed) renders 'declared, not observed' — the row this work exists to surface");
     assert(/be-vlg[\s\S]{0,400}observed, not declared/.test(html),
       "'be-vlg' (observed but absent from declared list) renders 'observed, not declared'");
-    assert(/>7</.test(html), 'unmatched (7) is shown plainly, not behind a toggle');
-    assert(/>4</.test(html), 'unscoped (4) is shown plainly, not behind a toggle');
+    assert(/Unmatched<\/div><div class="analytics-stat-value">7<\/div>/.test(html),
+      'unmatched (7) is bound to the Unmatched stat card specifically');
+    assert(/Unscoped<\/div><div class="analytics-stat-value">4<\/div>/.test(html),
+      'unscoped (4) is bound to the Unscoped stat card specifically (would fail if unmatched/unscoped were swapped)');
     assert(/transportFlood <b>5<\/b>/.test(html) && /flood <b>14<\/b>/.test(html),
       'route mix shows transportFlood=5, flood=14 (packets this node was observed FORWARDING)');
     assert(/direct <b>0<\/b>/.test(html) && /transportDirect <b>0<\/b>/.test(html),
@@ -180,7 +298,10 @@ const DECLARES_NOTHING = {
   {
     const a = (await renderAndGet(NOT_CONFIGURED)).html;
     const b = (await renderAndGet(GENUINE_EMPTY)).html;
-    assert(a !== b, 'the two empty-state renders are NOT textually identical (the failure class this work targets)');
+    assert(/region-keys? config/i.test(a) && !/region-keys? config/i.test(b),
+      'the config-not-set message text appears in fixture 2 (not configured) but not fixture 3 (genuinely empty)');
+    assert(/forwarded nothing we observed/.test(b) && !/forwarded nothing we observed/.test(a),
+      'the genuinely-empty message text appears in fixture 3 but not fixture 2 — the two empty states carry distinct wording, not just distinct stat-card numbers');
   }
 
   console.log('\n=== Fixture 4: answered-but-declares-nothing vs never-asked ===');
@@ -188,6 +309,102 @@ const DECLARES_NOTHING = {
     const { html } = await renderAndGet(DECLARES_NOTHING);
     assert(/Declared regions answer captured/.test(html), 'declared:[] (non-null) renders an answer-captured line with an age, not "never asked"');
     assert(!/never successfully asked/.test(html), 'declared:[] must NOT render the never-asked message (declared.regions:[] != declared:null)');
+    assert(/it declares no regions flood-allowed/.test(html), 'FIX 5: an empty declared.regions list says plainly that it declares no regions flood-allowed');
+  }
+
+  console.log('\n=== FIX 1: config note must be judged from observed, not from the observed+declared union ===');
+  {
+    // Case A: observed empty, unmatched>0, declared present with a region
+    // this instance never observed forwarding. rows.length > 0 (one
+    // declared-only row), so the pre-fix `rows.length === 0` branch would
+    // never show the config note here — exactly the bug: a declared list
+    // masked the "no region key could ever name this traffic" signal.
+    const { html: a } = await renderAndGet(DECLARED_ONLY_UNMATCHED);
+    assert(/ns-empty-config/.test(a), 'the config note renders even though a declared-only row exists (rows.length > 0)');
+    assert(/region-keys? config/i.test(a), 'config note text is present');
+    assert(/<table class="ns-table">/.test(a), 'the table itself STILL renders — note is in addition to the table, not instead of it');
+    assert(/<td class="ns-scope-name">be<\/td>[\s\S]{0,400}declared, not observed/.test(a),
+      "the declared-only 'be' row renders alongside the note");
+
+    // Case B: observed empty, unmatched>0, no declared list at all — current
+    // behaviour (Fixture 2) must be unchanged: note only, no table.
+    const { html: b } = await renderAndGet(NOT_CONFIGURED);
+    assert(/ns-empty-config/.test(b), 'note renders with no declared list either (unchanged behaviour)');
+    assert(!/<table class="ns-table">/.test(b), 'no table renders when there are truly zero rows');
+
+    // Case C: observed empty, unmatched=0 — the plain "forwarded nothing"
+    // message, never the config note (Fixture 3, re-asserted here under the
+    // FIX 1 heading for clarity).
+    const { html: c } = await renderAndGet(GENUINE_EMPTY);
+    assert(!/ns-empty-config/.test(c), 'no config note when unmatched is 0');
+    assert(/forwarded nothing we observed/.test(c), 'plain empty-state message renders instead');
+  }
+
+  console.log('\n=== FIX 2: Object.prototype-colliding scope/region names must not be dropped or swallowed ===');
+  {
+    const { html } = await renderAndGet(PROTO_COLLISION);
+    assert(/<td class="ns-scope-name">__proto__<\/td><td class="ns-n">2<\/td>/.test(html),
+      "a scope literally named '__proto__' gets its own row with the correct packet count (plain-object assignment would write the prototype and create no own key)");
+    assert(/<td class="ns-scope-name">constructor<\/td>[\s\S]{0,400}declared, not observed/.test(html),
+      "a declared region literally named 'constructor' gets its own declared-only row (a plain {} already has a truthy .constructor, which would swallow it via `if (!byName[r])`)");
+  }
+
+  console.log('\n=== FIX 8: wireWindowButtons — clicking a window button reloads with that window ===');
+  {
+    const { sandbox, calls } = makeSandbox(THREE_STATE);
+    const c = fakeContainerWithBar();
+    sandbox.window.NodeScopes.render(c, 'deadbeef');
+    for (let i = 0; i < 10 && /Loading scopes/.test(c.innerHTML); i++) {
+      await new Promise(function (r) { setImmediate(r); });
+    }
+    assert(calls.length === 1 && calls[0] === '/nodes/deadbeef/scopes?window=24h',
+      'initial render fetches the default (24h) window');
+    c.clickWindowButton('1h');
+    for (let i = 0; i < 10 && calls.length < 2; i++) {
+      await new Promise(function (r) { setImmediate(r); });
+    }
+    assert(calls.length === 2 && calls[1] === '/nodes/deadbeef/scopes?window=1h',
+      "clicking the 1h button (e.target.closest('button[data-window]') resolving to it) triggers a reload fetching window=1h");
+  }
+
+  console.log('\n=== FIX 8: wireWindowButtons — loadGen guard rejects a stale in-flight response ===');
+  {
+    const { sandbox, calls, pending } = makeControllableSandbox();
+    const c = fakeContainerWithBar();
+    // NOTE (documented limitation — see FIX 8 report): wireWindowButtons only
+    // (re)binds the click listener AFTER a fetch settles (load()'s success
+    // and catch branches both call it at the end, never before the await).
+    // So the rendered buttons are structurally unwired for the entire
+    // duration a fetch is in flight — a second click cannot physically land
+    // while the first is still pending; there is no click sequence that
+    // produces two in-flight loads. The loadGen guard is instead exercised
+    // here through two overlapping calls to NodeScopes.render() itself,
+    // which drives the exact same load()/loadGen code a button click runs
+    // (a second render() firing before the first settles is the realistic
+    // trigger — e.g. a remount or refresh landing mid-fetch).
+    sandbox.window.NodeScopes.render(c, 'deadbeef'); // load #1: myGen=1, window=24h
+    await new Promise(function (r) { setImmediate(r); });
+    assert(calls.length === 1 && calls[0] === '/nodes/deadbeef/scopes?window=24h',
+      'first load is in flight and unresolved');
+
+    sandbox.window.NodeScopes.render(c, 'deadbeef'); // load #2, started before #1 resolves: myGen=2
+    await new Promise(function (r) { setImmediate(r); });
+    assert(calls.length === 2 && calls[1] === '/nodes/deadbeef/scopes?window=24h',
+      'a second, newer load starts while the first is still in flight (loadGen now 2)');
+
+    // Resolve the NEWER request first — this is the one that should render.
+    pending[calls[1]](STALE_TEST_NEW);
+    await new Promise(function (r) { setImmediate(r); });
+    assert(/<td class="ns-scope-name">nl<\/td><td class="ns-n">99<\/td>/.test(c.innerHTML),
+      'the newer response, resolving first, renders');
+
+    // Now resolve the STALE (older) request, arriving after. myGen for this
+    // load is 1, but loadGen has since advanced to 2 — the guard
+    // `if (myGen !== loadGen) return;` must discard this render entirely.
+    pending[calls[0]](NOT_CONFIGURED);
+    await new Promise(function (r) { setImmediate(r); });
+    assert(/<td class="ns-scope-name">nl<\/td><td class="ns-n">99<\/td>/.test(c.innerHTML) && !/ns-empty-config/.test(c.innerHTML),
+      'the stale response, resolving after the newer one, does NOT overwrite the render (loadGen guard holds)');
   }
 
   console.log('\n=== Summary ===');
