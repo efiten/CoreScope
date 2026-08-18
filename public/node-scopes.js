@@ -28,6 +28,18 @@
       '<div class="analytics-stat-desc">' + escapeHtml(descShort) + '</div></div>';
   }
 
+  // normScope strips a leading '#' so the two sides can be compared at all.
+  // They are stored in different forms and always have been: transmissions.
+  // scope_name keeps the '#' because region keys are configured that way
+  // (hashRegions: ["#belgium", "#eu"]), while regions_csv arrives from the
+  // firmware with the prefix already stripped. Comparing them raw made every
+  // observed scope read "observed, not declared" and every declared region
+  // read "declared, not observed" — the comparison this screen exists for,
+  // inverted on every row, while looking entirely plausible.
+  function normScope(s) {
+    return s.charAt(0) === '#' ? s.slice(1) : s;
+  }
+
   // buildRows merges observed[] with declared.regions[] into one row per
   // distinct scope name, so a scope that is declared but never observed
   // still gets a row (the row Step 2b exists to surface) instead of being
@@ -35,11 +47,12 @@
   function buildRows(observed, declared) {
     var byName = Object.create(null);
     observed.forEach(function (o) {
-      byName[o.scope] = { scope: o.scope, packets: o.packets, lastSeen: o.lastSeen, observed: true };
+      byName[normScope(o.scope)] = { scope: o.scope, packets: o.packets, lastSeen: o.lastSeen, observed: true };
     });
     if (declared) {
       declared.regions.forEach(function (r) {
-        if (!byName[r]) byName[r] = { scope: r, packets: 0, lastSeen: null, observed: false };
+        var k = normScope(r);
+        if (!byName[k]) byName[k] = { scope: r, packets: 0, lastSeen: null, observed: false };
       });
     }
     var rows = Object.keys(byName).map(function (k) { return byName[k]; });
@@ -61,7 +74,7 @@
     if (!declared) {
       return '<span class="ns-decl ns-decl-unknown" title="This repeater has never successfully answered a declared-regions request — out of direct RF range, firmware below v13, or the request was silently ignored (only DIRECT-routed requests get answered). Silence carries no meaning; this is not the same as declaring nothing.">not asked</span>';
     }
-    var declaredHere = declared.regions.indexOf(row.scope) !== -1;
+    var declaredHere = declared.regions.some(function (r) { return normScope(r) === normScope(row.scope); });
     if (row.observed && declaredHere) {
       return '<span class="ns-decl ns-decl-yes" title="Declared flood-allowed and observed forwarding it — agreement.">declared</span>';
     }

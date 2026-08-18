@@ -311,6 +311,40 @@ const STALE_TEST_NEW = {
     assert(/it declares no regions flood-allowed/.test(html), 'FIX 5: an empty declared.regions list says plainly that it declares no regions flood-allowed');
   }
 
+  console.log('\n=== Hash prefix: observed "#de-nw" and declared "de-nw" are the SAME scope ===');
+  {
+    // Real shapes from production, not invented: transmissions.scope_name keeps the
+    // '#' because region keys are configured that way (hashRegions: ["#belgium"]),
+    // while regions_csv arrives from the firmware with the prefix already stripped.
+    // Comparing raw produced a row per side - every observed scope badged
+    // "observed, not declared" and every declared region badged "declared, not
+    // observed" - i.e. the comparison inverted on every single row while looking
+    // completely plausible. Fixtures that used matching spellings could not see it.
+    const { html } = await renderAndGet({
+      observed: [
+        { scope: '#de-nw', packets: 2444, firstSeen: '2026-08-11T00:00:00Z', lastSeen: '2026-08-18T18:33:43Z' },
+        { scope: '#be', packets: 2349, firstSeen: '2026-08-11T00:00:00Z', lastSeen: '2026-08-18T18:20:24Z' },
+      ],
+      unmatched: 0, unscoped: 0,
+      routes: { transportFlood: 4793, flood: 0, direct: 0, transportDirect: 0 },
+      declared: {
+        regions: ['*', 'eu', 'bx', 'be', 'be-vli', 'de-nw'],
+        observedAt: '2026-08-18T18:34:57.190Z', truncated: false,
+      },
+    });
+    // 6 data rows + 1 <thead> row
+    const rows = (html.match(/<tr>/g) || []).length;
+    assert(rows === 7,
+      'six distinct scopes: #de-nw and #be merge with their declared twins rather than doubling (got ' + (rows - 1) + ' data rows)');
+    assert(!/ns-decl-warn/.test(html),
+      'no scope may be badged "observed, not declared" - both observed scopes ARE declared');
+    assert((html.match(/ns-decl-yes/g) || []).length === 2,
+      'both observed scopes are badged as agreeing with the declared list');
+    assert((html.match(/ns-decl-quiet/g) || []).length === 4,
+      'the four declared-but-unobserved regions each get their own row');
+  }
+
+
   console.log('\n=== FIX 1: config note must be judged from observed, not from the observed+declared union ===');
   {
     // Case A: observed empty, unmatched>0, declared present with a region
