@@ -1,0 +1,225 @@
+/* === CoreScope — node-scopes.js ===
+   Per-node "Scopes" section: fetches /api/nodes/{pubkey}/scopes once and
+   renders observed-vs-declared region-scope conformance into the node
+   detail view (an embedded card, not a routed page — this is one section
+   on an existing page). Mirrors node-reach.js's fetch/render/empty-state
+   shape and its window-button control. Repeaters and rooms only (both
+   forward flood traffic); the caller (nodes.js) only mounts the container
+   for role === 'repeater' || role === 'room'. */
+'use strict';
+(function () {
+  var loadGen = 0; // bumped per load; guards against in-flight races (mirrors node-reach.js)
+  var DEFAULT_WINDOW = '24h'; // matches the server default
+  var WINDOWS = [
+    { key: '1h', label: '1h' },
+    { key: '24h', label: '24h' },
+    { key: '7d', label: '7d' }
+  ];
+
+  function windowBtn(key, cur, label) {
+    var on = key === cur;
+    return '<button data-window="' + key + '" aria-pressed="' + (on ? 'true' : 'false') + '"' +
+      (on ? ' class="active"' : '') + '>' + label + '</button>';
+  }
+
+  function statCard(label, value, descShort, descFull) {
+    return '<div class="analytics-stat-card" title="' + escapeHtml(descFull) + '">' +
+      '<div class="analytics-stat-label">' + escapeHtml(label) + '</div>' +
+      '<div class="analytics-stat-value">' + escapeHtml(String(value)) + '</div>' +
+      '<div class="analytics-stat-desc">' + escapeHtml(descShort) + '</div></div>';
+  }
+
+  // normScope strips a leading '#' so the two sides can be compared at all.
+  // They are stored in different forms and always have been: transmissions.
+  // scope_name keeps the '#' because region keys are configured that way
+  // (hashRegions: ["#belgium", "#eu"]), while regions_csv arrives from the
+  // firmware with the prefix already stripped. Comparing them raw made every
+  // observed scope read "observed, not declared" and every declared region
+  // read "declared, not observed" — the comparison this screen exists for,
+  // inverted on every row, while looking entirely plausible.
+  function normScope(s) {
+    return s.charAt(0) === '#' ? s.slice(1) : s;
+  }
+
+  // '*' is NOT a scope. It is the root of the repeater's region tree, and the
+  // firmware consults it for exactly one thing: whether to forward a plain
+  // ROUTE_TYPE_FLOOD, i.e. a packet with no transport scope at all
+  // (simple_repeater/MyMesh.cpp:562-571 — TRANSPORT_FLOOD matches a named region
+  // by code1, plain FLOOD is governed solely by the wildcard). So it is the
+  // declared counterpart of the `unscoped` counter, not of any scope row, and
+  // listing it among the scopes invites comparing it against scope traffic.
+  function declaredScopes(declared) {
+    return declared ? declared.regions.filter(function (r) { return r !== '*'; }) : [];
+  }
+
+  function declaresUnscoped(declared) {
+    return !!declared && declared.regions.indexOf('*') !== -1;
+  }
+
+  // buildRows merges observed[] with declared.regions[] into one row per
+  // distinct scope name, so a scope that is declared but never observed
+  // still gets a row (the row Step 2b exists to surface) instead of being
+  // silently absent because it has no packets to iterate.
+  function buildRows(observed, declared) {
+    var byName = Object.create(null);
+    observed.forEach(function (o) {
+      byName[normScope(o.scope)] = { scope: o.scope, packets: o.packets, lastSeen: o.lastSeen, observed: true };
+    });
+    if (declared) {
+      declaredScopes(declared).forEach(function (r) {
+        var k = normScope(r);
+        if (!byName[k]) byName[k] = { scope: r, packets: 0, lastSeen: null, observed: false };
+      });
+    }
+    var rows = Object.keys(byName).map(function (k) { return byName[k]; });
+    // Observed scopes ordered by packet count (brief requirement); declared-only
+    // rows (0 packets) sort after, alphabetically among themselves.
+    rows.sort(function (a, b) {
+      if (b.packets !== a.packets) return b.packets - a.packets;
+      return a.scope.localeCompare(b.scope);
+    });
+    return rows;
+  }
+
+  // declaredBadge renders exactly one of the four states this screen must
+  // keep visually distinct: never-asked (declared === null, silence carries
+  // no meaning), declared+observed (agreement), declared-but-not-observed
+  // (the row this body of work exists to surface), observed-but-not-declared
+  // (forwarding something it doesn't admit to, or a stale declared list).
+  function declaredBadge(row, declared) {
+    if (!declared) {
+      return '<span class="ns-decl ns-decl-unknown" title="This repeater has never successfully answered a declared-regions request — out of direct RF range, firmware below v13, or the request was silently ignored (only DIRECT-routed requests get answered). Silence carries no meaning; this is not the same as declaring nothing.">not asked</span>';
+    }
+    var declaredHere = declaredScopes(declared).some(function (r) { return normScope(r) === normScope(row.scope); });
+    if (row.observed && declaredHere) {
+      return '<span class="ns-decl ns-decl-yes" title="Declared flood-allowed and observed forwarding it — agreement.">declared</span>';
+    }
+    if (declaredHere && !row.observed) {
+      return '<span class="ns-decl ns-decl-quiet" title="Declared flood-allowed but not observed forwarding it this window — could be a quiet region, or a repeater that silently stopped.">declared, not observed</span>';
+    }
+    return '<span class="ns-decl ns-decl-warn" title="Observed forwarding this scope but it is absent from the declared list — either forwarding something it does not admit to, or the declared list was captured before a config change.">observed, not declared</span>';
+  }
+
+  function scopeRow(row, declared) {
+    return '<tr>' +
+      // Displayed normalised: observed rows carry the '#', declared-only rows do
+      // not, so rendering row.scope raw put two spellings of the same vocabulary
+      // in one column. The prefix is a local config convention, not part of the
+      // name, and dropping it also buys width on a narrow screen.
+      '<td class="ns-scope-name">' + escapeHtml(normScope(row.scope)) + '</td>' +
+      '<td class="ns-n">' + (row.observed ? row.packets : '—') + '</td>' +
+      '<td class="ns-n">' + (row.observed ? timeAgo(row.lastSeen) : '—') + '</td>' +
+      '<td>' + declaredBadge(row, declared) + '</td>' +
+      '</tr>';
+  }
+
+  function declaredMetaHtml(declared) {
+    if (!declared) {
+      return '<div class="ns-declared-meta"><span class="ns-never-asked">Declared regions: never successfully asked (out of direct RF range, old firmware, or the RF request was silently ignored).</span></div>';
+    }
+    var age = timeAgo(declared.observedAt);
+    var truncated = declared.truncated
+      ? ' <span class="ns-truncated">list truncated — entries may have been silently dropped; a missing region here is not necessarily a real absence.</span>'
+      : '';
+    var declaresNothing = declaredScopes(declared).length === 0
+      ? (declaresUnscoped(declared)
+        ? ' — it declares no named regions flood-allowed, but does declare the \'*\' wildcard, so it forwards unscoped floods.'
+        : ' — it declares no regions flood-allowed.')
+      : '';
+    return '<div class="ns-declared-meta">Declared regions answer captured ' + escapeHtml(age) + '.' + truncated + declaresNothing + '</div>';
+  }
+
+  function routesHtml(routes) {
+    return '<div class="ns-routes" title="Route-type breakdown of packets this node was observed FORWARDING (last hop of a FLOOD-family route). direct/transportDirect are always 0 by construction — a DIRECT route\'s last path hop is the route\'s far end, never the transmitter, so this node can never be attributed as the forwarder of one.">' +
+      'Route mix (forwarded): transportFlood <b>' + routes.transportFlood + '</b> &middot; flood <b>' + routes.flood + '</b> &middot; direct <b>' + routes.direct + '</b> &middot; transportDirect <b>' + routes.transportDirect + '</b>' +
+      '</div>';
+  }
+
+  async function load(container, pubkey, win) {
+    var myGen = ++loadGen;
+    container.innerHTML = headHtml(win) + '<div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading scopes…</div>';
+    var d;
+    try {
+      d = await api('/nodes/' + encodeURIComponent(pubkey) + '/scopes?window=' + win, { ttl: 30000 });
+    } catch (e) {
+      if (myGen !== loadGen) return;
+      container.innerHTML = headHtml(win) + '<div class="ns-empty">Failed to load scopes: ' + escapeHtml(e.message) + '</div>';
+      return;
+    }
+    if (myGen !== loadGen) return;
+
+    var rows = buildRows(d.observed, d.declared);
+
+    var statsHtml = '<div class="analytics-stats">' +
+      statCard('Unmatched', d.unmatched, 'Scoped, no key held',
+        'Packets that carried a transport scope but matched no configured region key this CoreScope instance holds — a neighbouring region may exist with no key configured here.') +
+      statCard('Unscoped', d.unscoped,
+        d.declared ? (declaresUnscoped(d.declared) ? 'No scope — declared allowed' : 'No scope — declared denied') : 'No scope at all',
+        'Packets that carried no scope at all (Code1 = 0000, or a non-transport route). ' +
+        (d.declared
+          ? (declaresUnscoped(d.declared)
+            ? "This repeater's declared list includes the '*' wildcard, so it says it does forward unscoped floods — these packets are expected."
+            : "This repeater's declared list omits the '*' wildcard, so it says it does NOT forward unscoped floods. A non-zero count here contradicts that.")
+          : 'Whether the repeater forwards them is unknown — it has never answered a declared-regions request.')) +
+      statCard('Declared regions', d.declared ? declaredScopes(d.declared).length : '—', d.declared ? 'Flood-allowed, last answer' : 'Never successfully asked',
+        d.declared ? "Number of regions this repeater declared flood-allowed in its most recent answer. The '*' wildcard is not counted — it governs unscoped floods, not a region." : 'This repeater has never successfully answered a declared-regions request.') +
+      '</div>';
+
+    // configIssue must be judged from observed alone, not from rows (the
+    // observed/declared union) — a repeater with declared-only rows and
+    // unmatched>0 still has a config problem (this deployment holds no key
+    // that could ever name its traffic), and that note must render even
+    // though rows is non-empty. See FIX 1.
+    var configIssue = d.observed.length === 0 && d.unmatched > 0;
+    var noteHtml = configIssue
+      ? '<div class="ns-empty ns-empty-config">No scope could be named for this repeater\'s traffic in the last ' + win + ' — ' + d.unmatched + ' scoped packet' + (d.unmatched === 1 ? '' : 's') + ' matched no configured region key. Scope tracking may not be configured on this deployment; check the region-keys configuration.</div>'
+      : '';
+    var bodyHtml;
+    if (rows.length === 0) {
+      bodyHtml = configIssue
+        ? ''
+        : '<div class="ns-empty">No scope data — this repeater has forwarded nothing we observed carrying a region scope in the last ' + win + '.</div>';
+    } else {
+      bodyHtml = '<table class="ns-table"><thead><tr><th>Scope</th><th>Packets</th><th>Last seen</th><th>Declared</th></tr></thead><tbody>' +
+        rows.map(function (r) { return scopeRow(r, d.declared); }).join('') +
+        '</tbody></table>';
+    }
+
+    container.innerHTML = headHtml(win) + statsHtml + declaredMetaHtml(d.declared) +
+      routesHtml(d.routes) + noteHtml + bodyHtml +
+      '<div class="ns-links"><a href="#/analytics?tab=hashsizes">Hash-size analytics &rarr;</a></div>';
+  }
+
+  function headHtml(win) {
+    return '<div class="ns-head">' +
+      '<h4>Scopes</h4>' +
+      '<div class="analytics-time-range ns-window" id="nsWindow">' +
+      WINDOWS.map(function (w) { return windowBtn(w.key, win, w.label); }).join('') +
+      '</div></div>';
+  }
+
+  // wireWindowButtons delegates on `container` itself, NOT on the #nsWindow bar:
+  // load() reassigns container.innerHTML, which destroys the bar and any listener
+  // bound to it. Rebinding after each load left the buttons rendered but dead for
+  // the whole duration of the fetch — they looked clickable and silently did
+  // nothing. Delegating on the container (whose own node survives its children
+  // being replaced) keeps them live throughout, which is also what makes load()'s
+  // loadGen guard reachable: only now can a second click land mid-flight.
+  var wired = new WeakSet();
+
+  function wireWindowButtons(container, pubkey) {
+    if (wired.has(container)) return; // render() may run again for the same container
+    wired.add(container);
+    container.addEventListener('click', function (e) {
+      var b = e.target.closest('button[data-window]');
+      if (b) load(container, pubkey, b.getAttribute('data-window'));
+    });
+  }
+
+  function render(container, pubkey) {
+    wireWindowButtons(container, pubkey);
+    load(container, pubkey, DEFAULT_WINDOW);
+  }
+
+  window.NodeScopes = { render: render };
+})();

@@ -749,6 +749,117 @@ Returned when the node is unknown or blacklisted.
 
 ---
 
+## GET /api/nodes/:pubkey/scopes
+
+Per-repeater region-scope conformance: which region scopes this node has been **observed
+forwarding** (matched/unmatched/unscoped, plus the route-type mix), alongside the region
+list it most recently **declared** when a mobile app asked it over RF. Both sides are
+returned together so a client needs only one request per node.
+
+Unlike most `/api/nodes/:pubkey/*` endpoints, an unknown or never-heard repeater returns
+**`200` with an empty answer**, not `404` — a repeater this instance has never observed
+forwarding anything is a valid question, not an error.
+
+### Query Parameters
+
+| Param    | Type   | Default | Description                    |
+|----------|--------|---------|---------------------------------|
+| `window` | string | `24h`   | Time window: `1h`, `24h`, `7d` |
+
+### Response `200`
+
+```jsonc
+{
+  "publicKey": string,
+  "window":    string,                 // echoed window ("1h", "24h", or "7d")
+  "observed": [
+    { "scope": string, "packets": number, "firstSeen": string (ISO), "lastSeen": string (ISO) }
+  ],
+  "unmatched": number,                 // scoped (Code1 ≠ 0000) but no configured region key matched
+  "unscoped":  number,                 // carried no scope at all (Code1 = 0000, or non-transport route)
+  "routes": {
+    "transportFlood":  number,
+    "flood":            number,
+    "direct":           number,        // always 0 — see notes
+    "transportDirect":  number         // always 0 — see notes
+  },
+  "declared": {
+    "regions":    [string],            // e.g. ["be", "be-vlg"] — see the '*' note below
+    "observedAt": string (ISO),
+    "truncated":  boolean
+  } | null
+}
+```
+
+**Notes — the scope answer has three distinct states, kept separate on purpose:**
+- an entry in `observed` means this repeater's own forwarded traffic carried a scope that
+  matched a region key this CoreScope instance holds — a matched scope entry never has an
+  empty `scope` name.
+- `unmatched` counts packets that carried a transport scope (`Code1 ≠ 0000`) but matched no
+  configured region key — this is information (a neighbouring region this instance has no
+  key for), not an error, and must not be folded into `unscoped`.
+- `unscoped` counts packets that carried no scope at all. `unmatched` and `unscoped` are
+  always reported as separate top-level counts.
+- `routes.direct` / `routes.transportDirect` are always `0` by construction: a DIRECT-family
+  route's last path hop is the route's far end, never the transmitter, so this node can never
+  be attributed as the forwarder of one.
+
+**Notes — `declared` distinguishes "never asked" from "asked and declined everything":**
+- `window` bounds `observed` only; `declared` is always the latest reading regardless of
+  age — a `declared` reading can be far older than the requested `window`. Use `observedAt`
+  to judge its age.
+- **The two sides are spelled differently and a consumer MUST normalise before comparing
+  them.** `observed[].scope` keeps the leading `#` (region keys are configured that way —
+  `hashRegions: ["#belgium", "#eu"]`), while `declared.regions[]` arrives from the firmware
+  with the prefix already stripped. So observed `#de-nw` and declared `de-nw` are the same
+  scope. Comparing raw silently inverts the result: every observed scope looks undeclared
+  and every declared region looks unobserved, which is a plausible-looking answer rather
+  than an obvious failure.
+- `declared: null` means this repeater has never successfully answered a declared-regions
+  request — out of RF range, firmware too old, or the request was silently ignored (the
+  repeater only answers DIRECT-routed requests, so silence is not evidence of anything).
+- `declared.regions: []` (a non-null `declared` with an empty array) means the repeater
+  **did** answer, and declares nothing flood-allowed. This is a meaningful, different fact
+  from `null` and must not be collapsed into it.
+- **`'*'` is not a scope.** When present in `declared.regions`, `'*'` is the root of the
+  repeater's region tree, and it governs exactly one thing: whether the repeater forwards a
+  plain `ROUTE_TYPE_FLOOD` packet — one carrying no transport scope at all (firmware
+  `examples/simple_repeater/MyMesh.cpp:562-571`: `TRANSPORT_FLOOD` matches a named region by
+  Code1, plain `FLOOD` is governed solely by the wildcard). It is therefore the declared
+  counterpart of the `unscoped` count above, not of any region in `observed`. A consumer
+  MUST exclude `'*'` from any scope comparison against `observed` and from any count of how
+  many regions this repeater declares — comparing it against scope traffic, or counting it as
+  a region, produces a permanent phantom "declared, not observed" row that can never resolve.
+- When present, `declared` is always the reading with the greatest `observedAt` — never the
+  most recently *received* one, so a drive buffered offline and ingested late cannot
+  overwrite a fresher reading.
+- On a database that predates the `node_declared_regions` table, `declared` degrades to
+  `null` rather than failing the request.
+
+### Response `400`
+
+Returned when `:pubkey` is not a 64-char hex string, or `window` is not one of `1h`, `24h`, `7d`.
+
+```json
+{ "error": "invalid pubkey: expected 64 hex chars" }
+```
+
+```json
+{ "error": "window must be 1h, 24h, or 7d" }
+```
+
+### Response `404`
+
+Returned when the node is blacklisted or hidden. This does not contradict the never-heard-is-200
+note above: a repeater this instance has simply never observed is unknown, not blacklisted or
+hidden, and still returns `200`.
+
+```json
+{ "error": "Not found" }
+```
+
+---
+
 ## GET /api/packets
 
 Paginated packet (transmission) list with filtering.

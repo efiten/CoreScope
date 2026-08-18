@@ -89,6 +89,10 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/nodes/{pubkey}/paths":     {Summary: "Get node routing paths", Tag: "nodes"},
 		"GET /api/nodes/{pubkey}/analytics": {Summary: "Get node analytics", Description: "Per-node packet counts, timing, and RF stats.", Tag: "nodes"},
 		"GET /api/nodes/{pubkey}/neighbors": {Summary: "Get node neighbors", Description: "Returns the queried node's first-hop neighbors with affinity scores and observation metadata (count, SNR, distance, observers). Ambiguous edges carry candidate pubkeys.", Tag: "nodes", Response: schemaRef("NodeNeighborsResponse")},
+		"GET /api/nodes/{pubkey}/scopes": {Summary: "Get node scope conformance and declared regions", Description: "Returns the region scopes this repeater has been observed forwarding (matched/unmatched/unscoped, plus route-type mix) alongside its most recently declared region list, if any. declared is null when the repeater has never successfully answered a declared-regions request.", Tag: "nodes",
+			QueryParams: []paramMeta{
+				{Name: "window", Description: "Time window: 1h, 24h, or 7d (default 24h)", Type: "string"},
+			}},
 
 		// Analytics
 		"GET /api/analytics/rf":              {Summary: "RF analytics", Description: "SNR/RSSI distributions and statistics.", Tag: "analytics"},

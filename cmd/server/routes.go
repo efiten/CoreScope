@@ -94,6 +94,10 @@ type Server struct {
 	// state. Initialised lazily on first use; see node_reach.go.
 	reach reachState
 
+	// Per-server state for GET /api/nodes/{pubkey}/scopes: TTL cache +
+	// singleflight, mirroring reach above. See scopes.go.
+	scopes scopesState
+
 	// Known-channels catalogue cache (issue #1323). Nil until configured;
 	// when nil the /api/known-channels endpoint returns an empty snapshot.
 	knownChannels *knownChannelsCache
@@ -279,6 +283,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	// clientRxCoverage flag is off (a clean 404 rather than the SPA fallback that
 	// an unregistered /api route would hit). See requireClientRxCoverage.
 	r.HandleFunc("/api/nodes/{pubkey}/rx-coverage", s.handleNodeRxCoverage).Methods("GET")
+	r.HandleFunc("/api/nodes/{pubkey}/scopes", s.handleNodeScopes).Methods("GET")
 	r.HandleFunc("/api/nodes/resolve", s.handleResolvePrefix).Methods("GET")
 	r.HandleFunc("/api/rx-coverage", s.handleRxCoverage).Methods("GET")
 	r.HandleFunc("/api/rx-leaderboard", s.handleRxLeaderboard).Methods("GET")
