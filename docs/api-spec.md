@@ -786,8 +786,7 @@ forwarding anything is a valid question, not an error.
   "declared": {
     "regions":    [string],            // e.g. ["*", "be", "be-vlg"]
     "observedAt": string (ISO),
-    "truncated":  boolean,
-    "rxPubkey":   string
+    "truncated":  boolean
   } | null
 }
 ```
@@ -806,6 +805,9 @@ forwarding anything is a valid question, not an error.
   be attributed as the forwarder of one.
 
 **Notes — `declared` distinguishes "never asked" from "asked and declined everything":**
+- `window` bounds `observed` only; `declared` is always the latest reading regardless of
+  age — a `declared` reading can be far older than the requested `window`. Use `observedAt`
+  to judge its age.
 - `declared: null` means this repeater has never successfully answered a declared-regions
   request — out of RF range, firmware too old, or the request was silently ignored (the
   repeater only answers DIRECT-routed requests, so silence is not evidence of anything).
@@ -828,6 +830,16 @@ Returned when `:pubkey` is not a 64-char hex string, or `window` is not one of `
 
 ```json
 { "error": "window must be 1h, 24h, or 7d" }
+```
+
+### Response `404`
+
+Returned when the node is blacklisted or hidden. This does not contradict the never-heard-is-200
+note above: a repeater this instance has simply never observed is unknown, not blacklisted or
+hidden, and still returns `200`.
+
+```json
+{ "error": "Not found" }
 ```
 
 ---

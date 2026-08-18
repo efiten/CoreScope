@@ -2,12 +2,17 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
+	"golang.org/x/sync/singleflight"
 )
 
 // ScopeObservation is one region scope this repeater has been observed
@@ -205,7 +210,6 @@ type DeclaredRegions struct {
 	Regions    []string `json:"regions"`
 	ObservedAt string   `json:"observedAt"`
 	Truncated  bool     `json:"truncated"`
-	RxPubkey   string   `json:"rxPubkey"`
 }
 
 // splitRegionsCSV parses regions_csv (comma-separated, "#" prefixes already
@@ -240,13 +244,13 @@ func (db *DB) CurrentDeclaredRegions(pubkey string) (*DeclaredRegions, error) {
 	pubkey = strings.ToLower(strings.TrimSpace(pubkey))
 
 	row := db.conn.QueryRow(`
-		SELECT rx_pubkey, observed_at, regions_csv, truncated
+		SELECT observed_at, regions_csv, truncated
 		FROM node_declared_regions
 		WHERE target = ?
 		ORDER BY observed_at DESC LIMIT 1`, pubkey)
-	var rxPubkey, observedAt, regionsCSV string
+	var observedAt, regionsCSV string
 	var truncated int
-	if err := row.Scan(&rxPubkey, &observedAt, &regionsCSV, &truncated); err != nil {
+	if err := row.Scan(&observedAt, &regionsCSV, &truncated); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -256,21 +260,124 @@ func (db *DB) CurrentDeclaredRegions(pubkey string) (*DeclaredRegions, error) {
 		Regions:    splitRegionsCSV(regionsCSV),
 		ObservedAt: observedAt,
 		Truncated:  truncated == 1,
-		RxPubkey:   rxPubkey,
 	}, nil
 }
 
 // NodeScopesResponse is the payload for GET /api/nodes/{pubkey}/scopes: the
-// observed-forwarding side (*ScopeConformance, embedded so its three scope
-// states sit at the JSON top level — unmatched and unscoped are separate
-// counts and a matched scope never has an empty name) plus the declared
-// side (DeclaredRegions), returned together so the UI needs only one
-// request per node rather than a second per-item call.
+// observed-forwarding side (ScopeConformance, embedded BY VALUE so its three
+// scope states sit at the JSON top level — unmatched and unscoped are
+// separate counts and a matched scope never has an empty name) plus the
+// declared side (DeclaredRegions), returned together so the UI needs only
+// one request per node rather than a second per-item call.
+//
+// ScopeConformance is embedded by value rather than as *ScopeConformance:
+// encoding/json silently skips fields promoted through a nil embedded
+// pointer instead of erroring, which would drop observed/unmatched/unscoped
+// from the body entirely rather than surfacing the failure.
 type NodeScopesResponse struct {
 	PublicKey string `json:"publicKey"`
 	Window    string `json:"window"`
-	*ScopeConformance
+	ScopeConformance
 	Declared *DeclaredRegions `json:"declared"`
+}
+
+// scopesState is per-server cache + singleflight state for
+// GET /api/nodes/{pubkey}/scopes, mirroring reachState (node_reach.go): a
+// bounded TTL cache keyed on (pubkey, window) plus a singleflight group so
+// concurrent cold-cache requests for the same key compute once, not N
+// times. Lives on *Server (not a package global) for the same reason reach
+// does — multiple *Server instances must not share observable state.
+type scopesState struct {
+	cacheMu sync.RWMutex
+	cache   map[string]scopesCacheEntry
+	sf      singleflight.Group
+
+	// lastSeenBlacklistGen mirrors reachState's field: when the live
+	// blacklist generation advances past this value, the cache is purged
+	// wholesale on the next request. The 404 path itself is never cached
+	// (the handler returns before a cache key is even computed), so this
+	// only guards a pre-existing successful entry from outliving a
+	// blacklist/hide edit made after it was filled.
+	lastSeenBlacklistGen atomic.Uint64
+}
+
+type scopesCacheEntry struct {
+	at  time.Time
+	raw []byte
+}
+
+const (
+	// nodeScopesCacheTTL matches the sibling /api/scope-stats endpoint's
+	// cache lifetime — also per-window region-scope data recomputed from
+	// the same transmissions table.
+	nodeScopesCacheTTL = 30 * time.Second
+	nodeScopesCacheMax = 256
+)
+
+// scopesCacheGet returns the cached marshalled JSON for key. The returned
+// slice is shared (not copied) and MUST NOT be mutated by callers.
+func (s *Server) scopesCacheGet(key string) ([]byte, bool) {
+	s.scopes.cacheMu.RLock()
+	defer s.scopes.cacheMu.RUnlock()
+	e, ok := s.scopes.cache[key]
+	if !ok || time.Since(e.at) > nodeScopesCacheTTL {
+		return nil, false
+	}
+	return e.raw, true
+}
+
+func (s *Server) scopesCachePut(key string, raw []byte) {
+	s.scopes.cacheMu.Lock()
+	defer s.scopes.cacheMu.Unlock()
+	if s.scopes.cache == nil {
+		s.scopes.cache = map[string]scopesCacheEntry{}
+	}
+	if _, exists := s.scopes.cache[key]; !exists && len(s.scopes.cache) >= nodeScopesCacheMax {
+		s.evictScopesLocked()
+	}
+	s.scopes.cache[key] = scopesCacheEntry{at: time.Now(), raw: raw}
+}
+
+// evictScopesLocked drops expired entries first; if still at the cap it
+// evicts the single oldest entry. Caller holds s.scopes.cacheMu (write).
+func (s *Server) evictScopesLocked() {
+	now := time.Now()
+	for k, e := range s.scopes.cache {
+		if now.Sub(e.at) > nodeScopesCacheTTL {
+			delete(s.scopes.cache, k)
+		}
+	}
+	if len(s.scopes.cache) < nodeScopesCacheMax {
+		return
+	}
+	var oldestKey string
+	var oldestAt time.Time
+	first := true
+	for k, e := range s.scopes.cache {
+		if first || e.at.Before(oldestAt) {
+			oldestKey, oldestAt, first = k, e.at, false
+		}
+	}
+	if !first {
+		delete(s.scopes.cache, oldestKey)
+	}
+}
+
+// scopesPurgeIfBlacklistGenChanged drops every cached entry when the live
+// blacklist generation has advanced past the cache's last-seen value,
+// mirroring reachPurgeIfBlacklistGenChanged. CAS gates the purge so
+// concurrent callers only do the work once per gen bump.
+func (s *Server) scopesPurgeIfBlacklistGenChanged(gen uint64) {
+	seen := s.scopes.lastSeenBlacklistGen.Load()
+	if gen == seen {
+		return
+	}
+	if !s.scopes.lastSeenBlacklistGen.CompareAndSwap(seen, gen) {
+		return
+	}
+	s.scopes.cacheMu.Lock()
+	s.scopes.cache = nil
+	s.scopes.cacheMu.Unlock()
 }
 
 // nodeScopesWindowLookback maps the ?window= vocabulary to a lookback
@@ -320,28 +427,62 @@ func (s *Server) handleNodeScopes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "window must be 1h, 24h, or 7d")
 		return
 	}
-	sinceISO := time.Now().Add(-lookback).UTC().Format(time.RFC3339)
 
-	conformance := &ScopeConformance{Observed: []ScopeObservation{}}
-	if s.store != nil {
-		var err error
-		conformance, err = s.store.ScopeConformance(pubkey, sinceISO)
-		if err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
+	// cacheKey includes the blacklist generation so any mutation via
+	// SetNodeBlacklist invalidates all prior scopes cache entries on the
+	// next request, mirroring handleNodeReach's cache key exactly. The
+	// validation above (blacklisted/hidden -> 404) already runs before this
+	// point, so that path is never cached.
+	var gen uint64
+	if s.cfg != nil {
+		gen = s.cfg.BlacklistGeneration()
+	}
+	s.scopesPurgeIfBlacklistGenChanged(gen)
+	cacheKey := pubkey + "|" + window + "|g" + strconv.FormatUint(gen, 10)
+	if raw, ok := s.scopesCacheGet(cacheKey); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(raw)
+		return
 	}
 
-	declared, err := s.db.CurrentDeclaredRegions(pubkey)
+	// singleflight: collapse a thundering herd on a cold key to one scan.
+	v, err, _ := s.scopes.sf.Do(cacheKey, func() (interface{}, error) {
+		if raw, ok := s.scopesCacheGet(cacheKey); ok {
+			return raw, nil
+		}
+		sinceISO := time.Now().Add(-lookback).UTC().Format(time.RFC3339)
+
+		conformance := &ScopeConformance{Observed: []ScopeObservation{}}
+		if s.store != nil {
+			var cErr error
+			conformance, cErr = s.store.ScopeConformance(pubkey, sinceISO)
+			if cErr != nil {
+				return nil, cErr
+			}
+		}
+
+		declared, dErr := s.db.CurrentDeclaredRegions(pubkey)
+		if dErr != nil {
+			return nil, dErr
+		}
+
+		raw, mErr := json.Marshal(NodeScopesResponse{
+			PublicKey:        pubkey,
+			Window:           window,
+			ScopeConformance: *conformance,
+			Declared:         declared,
+		})
+		if mErr != nil {
+			return nil, mErr
+		}
+		s.scopesCachePut(cacheKey, raw)
+		return raw, nil
+	})
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-
-	writeJSON(w, NodeScopesResponse{
-		PublicKey:        pubkey,
-		Window:           window,
-		ScopeConformance: conformance,
-		Declared:         declared,
-	})
+	raw, _ := v.([]byte)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(raw)
 }

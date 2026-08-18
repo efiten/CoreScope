@@ -94,6 +94,10 @@ type Server struct {
 	// state. Initialised lazily on first use; see node_reach.go.
 	reach reachState
 
+	// Per-server state for GET /api/nodes/{pubkey}/scopes: TTL cache +
+	// singleflight, mirroring reach above. See scopes.go.
+	scopes scopesState
+
 	// Known-channels catalogue cache (issue #1323). Nil until configured;
 	// when nil the /api/known-channels endpoint returns an empty snapshot.
 	knownChannels *knownChannelsCache

@@ -488,13 +488,13 @@ func TestHandleNodeScopesDeclaredRegions(t *testing.T) {
 	if _, err := srv.db.conn.Exec(`
 		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
 		VALUES (?, ?, ?, ?, ?, 0)`,
-		strings.ToLower(pk), "aabbccdd", "2026-08-10T00:00:00.000Z", "2026-08-18T23:59:59.000Z", "be"); err != nil {
+		pk, "aabbccdd", "2026-08-10T00:00:00.000Z", "2026-08-18T23:59:59.000Z", "be"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := srv.db.conn.Exec(`
 		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
 		VALUES (?, ?, ?, ?, ?, 0)`,
-		strings.ToLower(pk), "rxpubkeyhex", "2026-08-18T12:34:56.789Z", "2026-08-18T12:35:01.000Z", "*,be,be-vlg"); err != nil {
+		pk, "rxpubkeyhex", "2026-08-18T12:34:56.789Z", "2026-08-18T12:35:01.000Z", "*,be,be-vlg"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -527,9 +527,6 @@ func TestHandleNodeScopesDeclaredRegions(t *testing.T) {
 	if got.Declared.Truncated {
 		t.Error("truncated = true, want false")
 	}
-	if got.Declared.RxPubkey != "rxpubkeyhex" {
-		t.Errorf("rxPubkey = %q, want the rx_pubkey of the winning (greatest observed_at) row", got.Declared.RxPubkey)
-	}
 }
 
 // TestHandleNodeScopesDeclaredEmptyRegionsIsNotNull covers the other half of
@@ -543,7 +540,7 @@ func TestHandleNodeScopesDeclaredEmptyRegionsIsNotNull(t *testing.T) {
 	if _, err := srv.db.conn.Exec(`
 		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
 		VALUES (?, ?, ?, ?, ?, 0)`,
-		strings.ToLower(pk), "rxpubkeyhex", "2026-08-18T12:00:00.000Z", "2026-08-18T12:00:05.000Z", ""); err != nil {
+		pk, "rxpubkeyhex", "2026-08-18T12:00:00.000Z", "2026-08-18T12:00:05.000Z", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -596,5 +593,122 @@ func TestHandleNodeScopesNoDeclaredRegionsTable(t *testing.T) {
 	}
 	if got.Declared != nil {
 		t.Errorf("declared = %+v, want nil when the table doesn't exist", got.Declared)
+	}
+}
+
+// TestHandleNodeScopesUppercasePubkeyMatchesLowercaseDeclaredRow is the real
+// case-normalisation coverage: every other test above seeds with a pubkey
+// that is already a lowercase literal, so it can pass whether or not the
+// handler lowercases the URL pubkey first — it isn't coverage of that call at
+// all. Here the declared row's target is the lowercase string the ingestor
+// actually writes, but the URL pubkey is uppercase. This must still resolve:
+// isHexPubkey accepts only a-f (an unlowercased uppercase pubkey would 400
+// before ever reaching the query), and the declared lookup is an exact-match
+// `WHERE target = ?` against that lowercase column.
+func TestHandleNodeScopesUppercasePubkeyMatchesLowercaseDeclaredRow(t *testing.T) {
+	srv, router := setupNodeScopesServer(t)
+	pk := testFullPubkeyA // already a lowercase literal
+
+	if _, err := srv.db.conn.Exec(`
+		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
+		VALUES (?, ?, ?, ?, ?, 0)`,
+		pk, "rxpubkeyhex", "2026-08-18T12:00:00.000Z", "2026-08-18T12:00:05.000Z", "be"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+strings.ToUpper(pk)+"/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — an uppercase URL pubkey must still resolve: %s", w.Code, w.Body.String())
+	}
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Declared == nil {
+		t.Fatal("declared = nil, want a populated object — case must not silently empty the declared lookup")
+	}
+	if len(got.Declared.Regions) != 1 || got.Declared.Regions[0] != "be" {
+		t.Errorf("regions = %v, want [\"be\"]", got.Declared.Regions)
+	}
+}
+
+// --- FIX 3: response cache tests ---
+
+// TestHandleNodeScopesServesFromCache confirms a second identical request
+// (same pubkey + window) is served from the cache rather than recomputed: a
+// transmission seeded between the two requests must not appear in the
+// second response.
+func TestHandleNodeScopesServesFromCache(t *testing.T) {
+	srv, router := setupNodeScopesServer(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("be-van"), RouteFlood, recent)
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+testFullPubkeyA+"/scopes?window=1h", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var first NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(first.Observed) != 1 || first.Observed[0].Packets != 1 {
+		t.Fatalf("first response = %+v, want exactly 1 packet observed", first.Observed)
+	}
+
+	// Seed a second matching transmission. A recompute would report 2 packets.
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("be-van"), RouteFlood, recent)
+
+	req2 := httptest.NewRequest("GET", "/api/nodes/"+testFullPubkeyA+"/scopes?window=1h", nil)
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w2.Code, w2.Body.String())
+	}
+	var second NodeScopesResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(second.Observed) != 1 || second.Observed[0].Packets != 1 {
+		t.Errorf("second response = %+v, want the cached 1-packet answer, not a recompute", second.Observed)
+	}
+}
+
+// TestHandleNodeScopesDifferentWindowIsSeparateCacheEntry confirms the cache
+// key includes window: a request for a different window must recompute
+// rather than reuse another window's cached entry.
+func TestHandleNodeScopesDifferentWindowIsSeparateCacheEntry(t *testing.T) {
+	srv, router := setupNodeScopesServer(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("be-van"), RouteFlood, recent)
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+testFullPubkeyA+"/scopes?window=1h", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	// Seeded after the window=1h request warmed its own cache entry.
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("be-van"), RouteFlood, recent)
+
+	req2 := httptest.NewRequest("GET", "/api/nodes/"+testFullPubkeyA+"/scopes?window=24h", nil)
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w2.Code, w2.Body.String())
+	}
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Observed) != 1 || got.Observed[0].Packets != 2 {
+		t.Errorf("window=24h response = %+v, want a fresh compute (2 packets), not the window=1h cache entry", got.Observed)
 	}
 }
