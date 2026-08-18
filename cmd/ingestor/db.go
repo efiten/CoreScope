@@ -259,12 +259,20 @@ func applySchema(db *sql.DB) error {
 			decoded_json TEXT,
 			from_pubkey TEXT,
 			last_seen INTEGER NOT NULL DEFAULT 0,
-			created_at TEXT DEFAULT (datetime('now'))
+			created_at TEXT DEFAULT (datetime('now')),
+			code1 TEXT,
+			code2 TEXT
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_transmissions_hash ON transmissions(hash);
 		CREATE INDEX IF NOT EXISTS idx_transmissions_first_seen ON transmissions(first_seen);
 		CREATE INDEX IF NOT EXISTS idx_transmissions_payload_type ON transmissions(payload_type);
+		-- idx_tx_code1 is created by the transport_codes_v1 migration below,
+		-- after the ALTER runs — same reasoning as idx_transmissions_from_pubkey
+		-- and idx_tx_last_seen_zero above: a legacy DB (table-exists,
+		-- column-missing) would trip on this CREATE INDEX referencing code1
+		-- before the column exists, since CREATE TABLE IF NOT EXISTS is a
+		-- no-op against a pre-existing table.
 		-- idx_transmissions_from_pubkey is created by the from_pubkey_v1
 		-- migration after the column is added on legacy DBs (#1143).
 		-- idx_tx_last_seen_zero (partial, WHERE last_seen=0) is created by
@@ -316,6 +324,70 @@ func applySchema(db *sql.DB) error {
 			name      TEXT,
 			last_seen TEXT
 		);
+
+		-- Diagnostic RF observations from mobile clients. Unlike client_receptions
+		-- this holds EVERY decodable packet, attributable or not, so it must never
+		-- be used for coverage. pkt_hash is ComputeContentHash() — identical to
+		-- transmissions.hash — so dark-traffic queries are a plain equality join.
+		CREATE TABLE IF NOT EXISTS client_rx_observations (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			rx_pubkey     TEXT NOT NULL,
+			rx_at         TEXT NOT NULL,
+			ingested_at   TEXT NOT NULL,
+			pkt_hash      TEXT NOT NULL,
+			route_type    INTEGER NOT NULL,
+			payload_type  INTEGER NOT NULL,
+			code1         TEXT,
+			code2         TEXT,
+			scope_name    TEXT,
+			hash_size     INTEGER NOT NULL,
+			hop_count     INTEGER NOT NULL,
+			path_json     TEXT,
+			forwarder     TEXT,
+			snr           REAL,
+			rssi          INTEGER,
+			lat           REAL NOT NULL,
+			lon           REAL NOT NULL,
+			pos_acc_m     REAL,
+			UNIQUE(rx_pubkey, pkt_hash, rx_at)
+		);
+		CREATE INDEX IF NOT EXISTS idx_cro_prune     ON client_rx_observations(rx_at);
+		CREATE INDEX IF NOT EXISTS idx_cro_hash      ON client_rx_observations(pkt_hash, rx_at);
+		CREATE INDEX IF NOT EXISTS idx_cro_forwarder ON client_rx_observations(forwarder, rx_at);
+		CREATE INDEX IF NOT EXISTS idx_cro_scope     ON client_rx_observations(scope_name, rx_at);
+
+		-- RF environment samples from mobile clients: radio counters paired with
+		-- a GPS point. Absolutes only — deltas are computed at query time, and a
+		-- decrease in uptime_secs (reboot) or any counter (wrap) breaks the chain.
+		CREATE TABLE IF NOT EXISTS client_rf_samples (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			rx_pubkey    TEXT NOT NULL,
+			sampled_at   TEXT NOT NULL,
+			ingested_at  TEXT NOT NULL,
+			lat          REAL NOT NULL,
+			lon          REAL NOT NULL,
+			pos_acc_m    REAL,
+			stationary   INTEGER NOT NULL DEFAULT 0,
+			uptime_secs  INTEGER NOT NULL,
+			battery_mv   INTEGER,
+			queue_len    INTEGER,
+			errors       INTEGER,
+			noise_floor  INTEGER,
+			last_rssi    INTEGER,
+			last_snr     REAL,
+			tx_air_secs  INTEGER,
+			rx_air_secs  INTEGER,
+			recv         INTEGER,
+			sent         INTEGER,
+			flood_rx     INTEGER,
+			direct_rx    INTEGER,
+			flood_tx     INTEGER,
+			direct_tx    INTEGER,
+			recv_errors  INTEGER,
+			UNIQUE(rx_pubkey, sampled_at)
+		);
+		CREATE INDEX IF NOT EXISTS idx_crf_prune ON client_rf_samples(sampled_at);
+		CREATE INDEX IF NOT EXISTS idx_crf_track ON client_rf_samples(rx_pubkey, sampled_at);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
@@ -746,6 +818,29 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] channel_hash casing normalization complete")
 	}
 
+	// Migration: transmissions.code1/code2 — the transport codes were decoded
+	// and discarded; storing them makes scope forwarding queryable per repeater.
+	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'transport_codes_v1'")
+	if row.Scan(new(int)) != nil {
+		log.Println("[migration] Adding code1/code2 columns to transmissions...")
+		// Each ALTER is independent — ignore "duplicate column" so reruns (and
+		// the fresh-database path, where the base schema already created the
+		// columns) are safe. Any other failure must stop before the guard row
+		// is inserted, or prepareStatements' code1/code2 INSERT fails forever
+		// on every subsequent restart with no way to retry the migration.
+		for _, stmt := range []string{
+			`ALTER TABLE transmissions ADD COLUMN code1 TEXT DEFAULT NULL`,
+			`ALTER TABLE transmissions ADD COLUMN code2 TEXT DEFAULT NULL`,
+		} {
+			if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("transport_codes_v1 migration: %w", err)
+			}
+		}
+		db.Exec(`CREATE INDEX IF NOT EXISTS idx_tx_code1 ON transmissions(code1) WHERE code1 IS NOT NULL`)
+		db.Exec(`INSERT INTO _migrations (name) VALUES ('transport_codes_v1')`)
+		log.Println("[migration] code1/code2 columns added")
+	}
+
 	return nil
 }
 
@@ -758,8 +853,8 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtInsertTransmission, err = s.db.Prepare(`
-		INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json, channel_hash, scope_name, from_pubkey, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json, channel_hash, scope_name, from_pubkey, last_seen, code1, code2)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -931,6 +1026,8 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 			scopeNameForDB(data),
 			nilIfEmpty(data.FromPubkey),
 			epochSecondsForLastSeen(rxTime),
+			nilIfEmpty(data.Code1),
+			nilIfEmpty(data.Code2),
 		)
 		if err != nil {
 			s.Stats.WriteErrors.Add(1)
@@ -1495,6 +1592,122 @@ func (s *Store) BackfillDefaultScopeAsync(regionKeys map[string][]byte) {
 	}()
 }
 
+// BackfillTransportCodesAsync populates transmissions.code1/code2 for rows
+// inserted before the transport_codes_v1 migration, by re-parsing raw_hex.
+// Runs in a background goroutine so it does not block MQTT startup.
+//
+// Batched: SQLite holds a single write connection (SetMaxOpenConns(1)), so a
+// multi-million-row UPDATE in one transaction would stall live ingest for the
+// whole run. 5k-row batches keep each transaction short.
+func (s *Store) BackfillTransportCodesAsync() {
+	s.backfillWg.Add(1)
+	go func() {
+		defer s.backfillWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[backfill] transport_codes async panic recovered: %v", r)
+			}
+		}()
+
+		var done int
+		if s.db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'backfill_transport_codes_v1'").Scan(&done) == nil {
+			return // already ran
+		}
+
+		total, err := s.backfillTransportCodes(5000)
+		if err != nil {
+			log.Printf("[backfill] transport_codes: %v", err)
+			return // NOT recording the guard row — retry from scratch on next restart
+		}
+		s.Stats.IncBackfill("transport_codes")
+		log.Printf("[backfill] transport_codes populated for %d transmissions", total)
+		s.db.Exec(`INSERT INTO _migrations (name) VALUES ('backfill_transport_codes_v1')`)
+	}()
+}
+
+// backfillTransportCodes does the actual batched decode-and-update work,
+// returning the number of rows updated. Uses keyset pagination on id rather
+// than counting decoded items per page: a page can hit the LIMIT while
+// containing undecodable rows, so "items returned < batchSize" does NOT mean
+// "no rows remain" — that conflation previously caused the backfill to record
+// its completion migration after silently truncating on the first page with
+// an undecodable row. Termination is driven by how many rows the page
+// actually scanned (seen), not by how many decoded successfully; lastID
+// advances past undecodable rows too, so they are stepped over rather than
+// re-selected forever.
+//
+// Invariant: the caller records the backfill_transport_codes_v1 guard row iff
+// this returns a nil error, i.e. iff the loop ran to genuine exhaustion of all
+// matching rows. Every error path below returns non-nil immediately, without
+// finishing the run, so the guard is withheld and the next startup retries.
+func (s *Store) backfillTransportCodes(batchSize int) (int, error) {
+	var total int
+	var lastID int64
+	for {
+		rows, err := s.db.Query(`
+			SELECT id, raw_hex FROM transmissions
+			WHERE id > ? AND code1 IS NULL AND route_type IN (0, 3)
+			ORDER BY id
+			LIMIT ?`, lastID, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("transport_codes select: %w", err)
+		}
+		type item struct {
+			id           int64
+			code1, code2 string
+		}
+		var items []item
+		var seen int
+		for rows.Next() {
+			var id int64
+			var raw string
+			if err := rows.Scan(&id, &raw); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("transport_codes scan: %w", err)
+			}
+			seen++
+			lastID = id // advance past undecodable rows too, or they are re-selected forever
+			decoded, err := DecodePacket(raw, nil, false)
+			if err != nil || decoded.TransportCodes == nil {
+				continue
+			}
+			items = append(items, item{id, decoded.TransportCodes.Code1, decoded.TransportCodes.Code2})
+		}
+		rows.Close()
+		if seen == 0 {
+			break // no rows left matching the filter
+		}
+
+		if len(items) > 0 {
+			tx, err := s.db.Begin()
+			if err != nil {
+				return total, fmt.Errorf("transport_codes begin: %w", err)
+			}
+			stmt, err := tx.Prepare(`UPDATE transmissions SET code1 = ?, code2 = ? WHERE id = ?`)
+			if err != nil {
+				tx.Rollback()
+				return total, fmt.Errorf("transport_codes prepare: %w", err)
+			}
+			for _, it := range items {
+				if _, err := stmt.Exec(it.code1, it.code2, it.id); err != nil {
+					stmt.Close()
+					tx.Rollback()
+					return total, fmt.Errorf("transport_codes update id=%d: %w", it.id, err)
+				}
+			}
+			stmt.Close()
+			if err := tx.Commit(); err != nil {
+				return total, fmt.Errorf("transport_codes commit: %w", err)
+			}
+			total += len(items)
+		}
+		if seen < batchSize {
+			break // last partial page
+		}
+	}
+	return total, nil
+}
+
 // LogStats logs current operational metrics.
 func (s *Store) LogStats() {
 	log.Printf("[stats] tx_inserted=%d tx_dupes=%d obs_inserted=%d node_upserts=%d observer_upserts=%d write_errors=%d sig_drops=%d",
@@ -1657,6 +1870,8 @@ type PacketData struct {
 	ChannelHash       string // grouping key for channel queries (#762)
 	ScopeName         string // matched region name, or "" for unknown-scoped
 	IsTransportScoped bool   // true when route_type IN (0,3) AND Code1 ≠ "0000"
+	Code1             string // transport code 1 (scope), "" when the route carries none
+	Code2             string // transport code 2 (return-region hint), "" when absent
 	Region            string // observer region: payload > topic > source config (#788)
 	Foreign           bool   // true when ADVERT GPS lies outside configured geofilter (#730)
 	FromPubkey        string // pubkey of the originating node, for exact-match attribution (#1143)
@@ -1668,6 +1883,14 @@ func nilIfEmpty(s string) interface{} {
 		return nil
 	}
 	return s
+}
+
+// boolToInt converts a bool to SQLite's 0/1 INTEGER representation.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // scopeNameForDB encodes PacketData scope semantics for DB storage:
@@ -1816,9 +2039,13 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		}
 	}
 
-	if decoded.TransportCodes != nil && decoded.TransportCodes.Code1 != "0000" {
-		pd.IsTransportScoped = true
-		pd.ScopeName = matchScope(regionKeys, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+	if decoded.TransportCodes != nil {
+		pd.Code1 = decoded.TransportCodes.Code1
+		pd.Code2 = decoded.TransportCodes.Code2
+		if decoded.TransportCodes.Code1 != "0000" {
+			pd.IsTransportScoped = true
+			pd.ScopeName = matchScope(regionKeys, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+		}
 	}
 
 	// Populate from_pubkey at write time (#1143). ADVERTs carry the

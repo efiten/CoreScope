@@ -103,6 +103,7 @@ func main() {
 
 	regionKeys := loadRegionKeys(cfg)
 	store.BackfillDefaultScopeAsync(regionKeys)
+	store.BackfillTransportCodesAsync()
 
 	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
 	// before startup maintenance so no packets are missed while the single
@@ -293,6 +294,29 @@ func main() {
 		}
 	}
 
+	// Diagnostic client_rx_observations retention: separate, typically
+	// shorter window than clientRxDays — this table is diagnostic, not
+	// archival. 0 = disabled.
+	clientRxObsDays := cfg.ClientRxObsDaysOrZero()
+	if clientRxObsDays > 0 {
+		if n, err := store.PruneOldClientRxObservations(clientRxObsDays); err != nil {
+			log.Printf("[prune] client_rx_observations: %v", err)
+		} else if n > 0 {
+			log.Printf("[prune] startup pruned %d client_rx_observations older than %d days", n, clientRxObsDays)
+		}
+	}
+
+	// Diagnostic client_rf_samples retention: separate window, independent
+	// of clientRxDays/clientRxObsDays. 0 = disabled.
+	clientRfDays := cfg.ClientRfDaysOrZero()
+	if clientRfDays > 0 {
+		if n, err := store.PruneOldClientRfSamples(clientRfDays); err != nil {
+			log.Printf("[prune] client_rf_samples: %v", err)
+		} else if n > 0 {
+			log.Printf("[prune] startup pruned %d client_rf_samples older than %d days", n, clientRfDays)
+		}
+	}
+
 	vacuumPages := cfg.IncrementalVacuumPages()
 	store.RunIncrementalVacuum(vacuumPages)
 
@@ -357,19 +381,47 @@ func main() {
 		log.Printf("[prune] auto-prune enabled: packets older than %d days will be removed daily", packetDays)
 	}
 
-	// Daily ticker for client-RX coverage retention (#1727).
-	if clientRxDays > 0 {
+	// Daily ticker for client-RX coverage retention (#1727), reused for the
+	// diagnostic client_rx_observations and client_rf_samples retention
+	// (Task 6) rather than starting a second ticker — the three flags are
+	// independent (0 disables each separately), so the ticker itself must
+	// run when any is set.
+	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 {
 		clientRxRetentionTicker := time.NewTicker(24 * time.Hour)
 		go func() {
 			for range clientRxRetentionTicker.C {
-				if n, err := store.PruneOldClientReceptions(clientRxDays); err != nil {
-					log.Printf("[prune] error: %v", err)
-				} else if n > 0 {
-					store.RunIncrementalVacuum(vacuumPages)
+				if clientRxDays > 0 {
+					if n, err := store.PruneOldClientReceptions(clientRxDays); err != nil {
+						log.Printf("[prune] error: %v", err)
+					} else if n > 0 {
+						store.RunIncrementalVacuum(vacuumPages)
+					}
+				}
+				if clientRxObsDays > 0 {
+					if n, err := store.PruneOldClientRxObservations(clientRxObsDays); err != nil {
+						log.Printf("[prune] client_rx_observations: %v", err)
+					} else if n > 0 {
+						store.RunIncrementalVacuum(vacuumPages)
+					}
+				}
+				if clientRfDays > 0 {
+					if n, err := store.PruneOldClientRfSamples(clientRfDays); err != nil {
+						log.Printf("[prune] client_rf_samples: %v", err)
+					} else if n > 0 {
+						store.RunIncrementalVacuum(vacuumPages)
+					}
 				}
 			}
 		}()
-		log.Printf("[prune] auto-prune enabled: client_receptions older than %d days will be removed daily", clientRxDays)
+		if clientRxDays > 0 {
+			log.Printf("[prune] auto-prune enabled: client_receptions older than %d days will be removed daily", clientRxDays)
+		}
+		if clientRxObsDays > 0 {
+			log.Printf("[prune] auto-prune enabled: client_rx_observations older than %d days will be removed daily", clientRxObsDays)
+		}
+		if clientRfDays > 0 {
+			log.Printf("[prune] auto-prune enabled: client_rf_samples older than %d days will be removed daily", clientRfDays)
+		}
 	}
 
 	// Hourly WAL checkpoint to prevent unbounded WAL growth.
@@ -572,18 +624,39 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		return
 	}
 
-	// Mobile client RX coverage: dedicated topic meshcore/client/{PUBLIC_KEY}/packets.
-	// A roaming companion reports where it directly heard a node; handled in isolation
-	// from the observer/observations path. EMQX ACL binds parts[2] to the client's own key.
-	if cfg.ClientRxCoverageEnabled() && len(parts) >= 4 && parts[1] == "client" && parts[3] == "packets" {
-		// The observer blacklist (checked below) only runs on the observer path,
-		// so a blacklisted operator could otherwise skirt it via the client topic
-		// (#1). Enforce it here before any coverage write.
+	// Mobile client topics: meshcore/client/{PUBLIC_KEY}/packets (RX coverage)
+	// and meshcore/client/{PUBLIC_KEY}/rf (RF environment samples). A roaming
+	// companion reports where it directly heard a node, or its own radio's
+	// counters; both are handled in isolation from the observer/observations
+	// path. EMQX ACL binds parts[2] to the client's own key.
+	//
+	// The topic match and the enable-gate MUST be separate: matching on
+	// parts[1]=="client" always returns from this branch, whatever the config
+	// says. The gate only decides drop-vs-handle per sub-topic. Previously the
+	// gate sat inside the topic match, so a disabled gate made the whole
+	// condition false and fell through to the observer path below, where
+	// parts[1] ("client") would be taken as a region and the companion pubkey
+	// as an observer id — silently poisoning the region list, and worse now
+	// that fullRfLog multiplies client-topic volume.
+	if len(parts) >= 4 && parts[1] == "client" {
+		// The observer blacklist (checked below on the observer path) only runs
+		// there, so a blacklisted operator could otherwise skirt it via the
+		// client topic (#1). Enforce it here before any client-topic write, for
+		// every sub-topic.
 		if cfg.IsObserverBlacklisted(parts[2]) {
 			log.Printf("MQTT [%s] client %.8s blacklisted, dropping", tag, parts[2])
 			return
 		}
-		handleClientPacket(store, tag, parts[2], msg, channelKeys)
+		switch parts[3] {
+		case "packets":
+			if cfg.ClientRxCoverageEnabled() {
+				handleClientPacket(store, cfg, tag, parts[2], msg, channelKeys, regionKeys)
+			}
+		case "rf":
+			if cfg.ClientRfSamplesEnabled() {
+				handleClientRfSample(store, tag, parts[2], msg)
+			}
+		}
 		return
 	}
 
@@ -1275,21 +1348,46 @@ func firstNonEmpty(vals ...string) string {
 // ahead). Caller records this via Store.RecordNaiveSkew so the UI can flag
 // the observer (#1478).
 func resolveRxTime(msg map[string]interface{}, tag string) (string, int64) {
+	t, skew := resolveRxTimeCore(msg, tag)
+	return t.Format(time.RFC3339), skew
+}
+
+// rxTimeMillisLayout is the fixed three-decimal millisecond layout for
+// client_rx_observations.rx_at. UNIQUE(rx_pubkey, pkt_hash, rx_at) on that
+// table relies on sub-second resolution to keep distinct forwarder copies of
+// the same flood as separate rows — RFC3339's second resolution would
+// collapse them and ON CONFLICT DO NOTHING would silently drop all but the
+// first. Deliberately not time.RFC3339Nano, which strips trailing zeros, so
+// this stays a stable uniqueness/sort key. The single definition here is
+// shared by its only production caller (handleClientPacket, which formats a
+// resolveRxTimeCore result with it directly) and by tests that need to
+// derive an rx_at they can query back by.
+const rxTimeMillisLayout = "2006-01-02T15:04:05.000Z07:00"
+
+// resolveRxTimeCore holds the validation/clamping logic shared by
+// resolveRxTime and any caller that needs the resolved time in a different
+// format (handleClientPacket formats it with rxTimeMillisLayout for
+// client_rx_observations). Returns UTC time so callers format it themselves —
+// a caller that needs two different formatted strings for the SAME packet
+// calls this once and formats twice, instead of parsing/validating/logging
+// twice and risking two independent time.Now() reads straddling a second
+// boundary.
+func resolveRxTimeCore(msg map[string]interface{}, tag string) (time.Time, int64) {
 	now := time.Now().UTC()
 	raw, _ := msg["timestamp"].(string)
 	if raw == "" {
-		return now.Format(time.RFC3339), 0
+		return now, 0
 	}
 	t, naive, err := parseEnvelopeTime(raw)
 	if err != nil {
 		log.Printf("MQTT [%s] unparseable timestamp %q, using ingest time", tag, raw)
-		return now.Format(time.RFC3339), 0
+		return now, 0
 	}
 	// Hard reject: > 14h ahead is a genuine clock error (UTC+14 is the maximum
 	// standard offset, so nothing valid should be further ahead than that).
 	if t.After(now.Add(14 * time.Hour)) {
 		log.Printf("MQTT [%s] future timestamp %q, using ingest time", tag, raw)
-		return now.Format(time.RFC3339), 0
+		return now, 0
 	}
 	// Hard reject: > 30 days in the past is an RTC-reset node reporting a
 	// factory date (e.g. 2020-01-01). Such a value would permanently drag
@@ -1297,7 +1395,7 @@ func resolveRxTime(msg map[string]interface{}, tag string) (string, int64) {
 	// InsertTransmission. No legitimate buffered upload is that stale.
 	if t.Before(now.Add(-30 * 24 * time.Hour)) {
 		log.Printf("MQTT [%s] stale timestamp %q (>30d old), using ingest time", tag, raw)
-		return now.Format(time.RFC3339), 0
+		return now, 0
 	}
 	// Symmetric naive-timestamp clamp (issue #1463). Naive (zone-less) ISO
 	// values from observers in non-UTC zones are parsed as-if UTC, leaving a
@@ -1321,16 +1419,16 @@ func resolveRxTime(msg map[string]interface{}, tag string) (string, int64) {
 			// Per-message log was silenced in #1479 — chip + banner in the UI
 			// replace it.
 			deltaSec := int64(signed / time.Second)
-			return now.Format(time.RFC3339), deltaSec
+			return now, deltaSec
 		}
 	}
 	// Legacy soft clamp for zone-aware near-future values: any value ahead of
 	// now is from a slightly skewed observer clock — collapse to now so we
 	// don't render ⚠️ in the UI for live packets from those nodes.
 	if t.After(now) {
-		return now.Format(time.RFC3339), 0
+		return now, 0
 	}
-	return t.UTC().Format(time.RFC3339), 0
+	return t.UTC(), 0
 }
 
 // parseEnvelopeTime parses the MQTT envelope timestamp. Two on-wire forms

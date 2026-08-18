@@ -43,22 +43,24 @@ type MQTTLegacy struct {
 
 // Config holds the ingestor configuration, compatible with the Node.js config.json format.
 type Config struct {
-	DBPath             string                  `json:"dbPath"`
-	MQTT               *MQTTLegacy             `json:"mqtt,omitempty"`
-	MQTTSources        []MQTTSource            `json:"mqttSources,omitempty"`
-	LogLevel           string                  `json:"logLevel,omitempty"`
-	ChannelKeysPath    string                  `json:"channelKeysPath,omitempty"`
-	ChannelKeys        map[string]string       `json:"channelKeys,omitempty"`
-	HashChannels       []string                `json:"hashChannels,omitempty"`
-	HashRegions        []string                `json:"hashRegions,omitempty"`
-	Retention          *RetentionConfig        `json:"retention,omitempty"`
-	Metrics            *MetricsConfig          `json:"metrics,omitempty"`
-	Runtime            *RuntimeConfig          `json:"runtime,omitempty"`
-	ClientRxCoverage   *ClientRxCoverageConfig `json:"clientRxCoverage,omitempty"`
-	GeoFilter          *GeoFilterConfig        `json:"geo_filter,omitempty"`
-	ForeignAdverts     *ForeignAdvertConfig    `json:"foreignAdverts,omitempty"`
-	ValidateSignatures *bool                   `json:"validateSignatures,omitempty"`
-	DB                 *DBConfig               `json:"db,omitempty"`
+	DBPath               string                      `json:"dbPath"`
+	MQTT                 *MQTTLegacy                 `json:"mqtt,omitempty"`
+	MQTTSources          []MQTTSource                `json:"mqttSources,omitempty"`
+	LogLevel             string                      `json:"logLevel,omitempty"`
+	ChannelKeysPath      string                      `json:"channelKeysPath,omitempty"`
+	ChannelKeys          map[string]string           `json:"channelKeys,omitempty"`
+	HashChannels         []string                    `json:"hashChannels,omitempty"`
+	HashRegions          []string                    `json:"hashRegions,omitempty"`
+	Retention            *RetentionConfig            `json:"retention,omitempty"`
+	Metrics              *MetricsConfig              `json:"metrics,omitempty"`
+	Runtime              *RuntimeConfig              `json:"runtime,omitempty"`
+	ClientRxCoverage     *ClientRxCoverageConfig     `json:"clientRxCoverage,omitempty"`
+	ClientRxObservations *ClientRxObservationsConfig `json:"clientRxObservations,omitempty"`
+	ClientRfSamples      *ClientRfSamplesConfig      `json:"clientRfSamples,omitempty"`
+	GeoFilter            *GeoFilterConfig            `json:"geo_filter,omitempty"`
+	ForeignAdverts       *ForeignAdvertConfig        `json:"foreignAdverts,omitempty"`
+	ValidateSignatures   *bool                       `json:"validateSignatures,omitempty"`
+	DB                   *DBConfig                   `json:"db,omitempty"`
 
 	// ObserverIATAWhitelist restricts which observer IATA regions are processed.
 	// When non-empty, only observers whose IATA code (from the MQTT topic) matches
@@ -140,6 +142,29 @@ func (c *Config) ClientRxCoverageEnabled() bool {
 	return c.ClientRxCoverage != nil && c.ClientRxCoverage.Enabled
 }
 
+// ClientRxObservationsConfig controls the opt-in diagnostic RF observation
+// table. Separate from clientRxCoverage: a deployment may well want coverage
+// without the far higher-volume diagnostic stream.
+type ClientRxObservationsConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ClientRxObservationsEnabled reports whether diagnostic client RF observations
+// are recorded. Default false.
+func (c *Config) ClientRxObservationsEnabled() bool {
+	return c.ClientRxObservations != nil && c.ClientRxObservations.Enabled
+}
+
+// ClientRfSamplesConfig controls the opt-in RF environment sample stream.
+type ClientRfSamplesConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ClientRfSamplesEnabled reports whether RF samples are recorded. Default false.
+func (c *Config) ClientRfSamplesEnabled() bool {
+	return c.ClientRfSamples != nil && c.ClientRfSamples.Enabled
+}
+
 // RetentionConfig controls how long stale nodes are kept before being moved to inactive_nodes.
 type RetentionConfig struct {
 	NodeDays     int `json:"nodeDays"`
@@ -158,6 +183,14 @@ type RetentionConfig struct {
 	// coverage rows in client_receptions / client_observers; 0 disables. Bounds
 	// the table the opt-in coverage feature would otherwise grow without limit.
 	ClientRxDays int `json:"clientRxDays"`
+	// ClientRxObsDays is the retention window (by rx_at) for the diagnostic
+	// client_rx_observations table; 0 disables. Shorter than clientRxDays —
+	// this table is diagnostic, not archival.
+	ClientRxObsDays int `json:"clientRxObsDays"`
+	// ClientRfDays is the retention window (by sampled_at) for the
+	// client_rf_samples table; 0 disables. Bounds the table the opt-in RF
+	// sample stream would otherwise grow without limit.
+	ClientRfDays int `json:"clientRfDays"`
 }
 
 // PacketDaysOrZero returns the configured retention.packetDays or 0
@@ -183,6 +216,22 @@ func (c *Config) ObserverPurgeDaysOrZero() int {
 func (c *Config) ClientRxDaysOrZero() int {
 	if c.Retention != nil && c.Retention.ClientRxDays > 0 {
 		return c.Retention.ClientRxDays
+	}
+	return 0
+}
+
+// ClientRxObsDaysOrZero returns retention.clientRxObsDays or 0 (disabled).
+func (c *Config) ClientRxObsDaysOrZero() int {
+	if c.Retention != nil && c.Retention.ClientRxObsDays > 0 {
+		return c.Retention.ClientRxObsDays
+	}
+	return 0
+}
+
+// ClientRfDaysOrZero returns retention.clientRfDays or 0 (disabled).
+func (c *Config) ClientRfDaysOrZero() int {
+	if c.Retention != nil && c.Retention.ClientRfDays > 0 {
+		return c.Retention.ClientRfDays
 	}
 	return 0
 }
