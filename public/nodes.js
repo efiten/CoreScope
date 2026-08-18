@@ -724,6 +724,8 @@
         `; })()}
         </div>
 
+        ${n.role === 'repeater' ? `<div class="node-full-card" id="node-scopes"></div>` : ''}
+
         ${observers.length ? `<div class="node-full-card" id="node-observers">
           ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:8px"><strong>Regions:</strong> ${regions.map(r => '<span class="badge" style="margin:0 2px">' + escapeHtml(r) + '</span>').join(' ')}</div>` : ''; })()}
           <h4>Heard By (${observers.length} observer${observers.length > 1 ? 's' : ''})</h4>
@@ -840,6 +842,11 @@
 
       // #690 — Clock Skew detail section (full-screen view)
       loadClockSkewInto(document.getElementById('node-clock-skew'), n.public_key);
+
+      // Scopes section (repeaters only) — observed-vs-declared region conformance
+      if (n.role === 'repeater' && window.NodeScopes) {
+        window.NodeScopes.render(document.getElementById('node-scopes'), n.public_key);
+      }
 
 
       // Affinity debug panel — show if debugAffinity is enabled
