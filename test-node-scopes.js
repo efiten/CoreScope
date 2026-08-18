@@ -97,7 +97,10 @@ function fakeContainer() {
     _html: '',
     set innerHTML(v) { this._html = v; },
     get innerHTML() { return this._html; },
-    querySelector: function () { return null; }, // skip button wiring — not under test here
+    // render() delegates a click listener on the container itself; accept and
+    // ignore it here. Button behaviour is exercised by fakeContainerWithBar.
+    addEventListener: function () {},
+    querySelector: function () { return null; },
   };
 }
 
@@ -105,35 +108,31 @@ function fakeContainer() {
 // wireWindowButtons: querySelector('#nsWindow') returns a fresh stub
 // "element" every time innerHTML is set (mirroring how a real
 // `container.innerHTML = ...` replaces the subtree and produces a brand
-// new #nsWindow node each render, so listeners bound to a stale node are
-// naturally gone rather than accumulating). clickWindowButton() simulates
-// a click whose event.target is the button itself (target.closest(sel)
-// returns the button when sel matches, null otherwise) and fires every
-// listener addEventListener('click', ...) registered against the CURRENT
-// bar node.
+// element (whose own node survives its children being replaced), so the stub
+// gives the CONTAINER the listener list and keeps it across innerHTML writes.
+// That is the behaviour under test: a window button must stay live while a
+// fetch is in flight, which is also the only way load()'s loadGen guard can
+// ever be reached. clickWindowButton() fires every listener registered on the
+// container with an event whose target.closest(sel) returns the button.
 function fakeContainerWithBar() {
-  var currentBar = null;
   var c = {
     _html: '',
-    set innerHTML(v) {
-      this._html = v;
-      currentBar = { _listeners: [] };
-      currentBar.addEventListener = function (type, fn) {
-        if (type === 'click') currentBar._listeners.push(fn);
-      };
-    },
+    _listeners: [],
+    set innerHTML(v) { this._html = v; },
     get innerHTML() { return this._html; },
-    querySelector: function (sel) { return sel === '#nsWindow' ? currentBar : null; },
+    addEventListener: function (type, fn) {
+      if (type === 'click') this._listeners.push(fn);
+    },
+    querySelector: function () { return null; },
   };
   c.clickWindowButton = function (windowKey) {
-    var bar = currentBar;
     var target = {
       closest: function (sel) {
         if (sel !== 'button[data-window]') return null;
         return { getAttribute: function (n) { return n === 'data-window' ? windowKey : null; } };
       },
     };
-    bar._listeners.forEach(function (fn) { fn({ target: target }); });
+    c._listeners.forEach(function (fn) { fn({ target: target }); });
   };
   return c;
 }
@@ -365,6 +364,27 @@ const STALE_TEST_NEW = {
     }
     assert(calls.length === 2 && calls[1] === '/nodes/deadbeef/scopes?window=1h',
       "clicking the 1h button (e.target.closest('button[data-window]') resolving to it) triggers a reload fetching window=1h");
+  }
+
+  console.log('\n=== Delegation: a window button stays live WHILE a fetch is in flight ===');
+  {
+    // Regression guard. The listener used to be bound to the #nsWindow bar, which
+    // load() destroys every time it reassigns container.innerHTML, and it was only
+    // rebound after the fetch settled. For the whole duration of a load the buttons
+    // were rendered but dead - they looked clickable and silently did nothing, and
+    // no click sequence could ever reach load()'s loadGen guard. Delegating on the
+    // container (its own node survives its children being replaced) fixes both.
+    const { sandbox, calls } = makeSandbox(THREE_STATE);
+    const c = fakeContainerWithBar();
+    sandbox.window.NodeScopes.render(c, 'deadbeef');
+    assert(/Loading scopes/.test(c.innerHTML), 'precondition: the first fetch is still in flight');
+    assert(calls.length === 1, 'precondition: exactly the initial fetch so far');
+    c.clickWindowButton('7d'); // clicked BEFORE the first load settles
+    for (let i = 0; i < 10 && calls.length < 2; i++) {
+      await new Promise(function (r) { setImmediate(r); });
+    }
+    assert(calls.length === 2 && calls[1] === '/nodes/deadbeef/scopes?window=7d',
+      'a click landing mid-flight is honoured and fetches window=7d');
   }
 
   console.log('\n=== FIX 8: wireWindowButtons — loadGen guard rejects a stale in-flight response ===');

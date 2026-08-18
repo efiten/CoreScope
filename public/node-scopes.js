@@ -109,7 +109,6 @@
     } catch (e) {
       if (myGen !== loadGen) return;
       container.innerHTML = headHtml(win) + '<div class="ns-empty">Failed to load scopes: ' + escapeHtml(e.message) + '</div>';
-      wireWindowButtons(container, pubkey);
       return;
     }
     if (myGen !== loadGen) return;
@@ -148,7 +147,6 @@
     container.innerHTML = headHtml(win) + statsHtml + declaredMetaHtml(d.declared) +
       routesHtml(d.routes) + noteHtml + bodyHtml +
       '<div class="ns-links"><a href="#/analytics?tab=hashsizes">Hash-size analytics &rarr;</a></div>';
-    wireWindowButtons(container, pubkey);
   }
 
   function headHtml(win) {
@@ -159,16 +157,26 @@
       '</div></div>';
   }
 
+  // wireWindowButtons delegates on `container` itself, NOT on the #nsWindow bar:
+  // load() reassigns container.innerHTML, which destroys the bar and any listener
+  // bound to it. Rebinding after each load left the buttons rendered but dead for
+  // the whole duration of the fetch — they looked clickable and silently did
+  // nothing. Delegating on the container (whose own node survives its children
+  // being replaced) keeps them live throughout, which is also what makes load()'s
+  // loadGen guard reachable: only now can a second click land mid-flight.
+  var wired = new WeakSet();
+
   function wireWindowButtons(container, pubkey) {
-    var bar = container.querySelector('#nsWindow');
-    if (!bar) return;
-    bar.addEventListener('click', function (e) {
+    if (wired.has(container)) return; // render() may run again for the same container
+    wired.add(container);
+    container.addEventListener('click', function (e) {
       var b = e.target.closest('button[data-window]');
       if (b) load(container, pubkey, b.getAttribute('data-window'));
     });
   }
 
   function render(container, pubkey) {
+    wireWindowButtons(container, pubkey);
     load(container, pubkey, DEFAULT_WINDOW);
   }
 
