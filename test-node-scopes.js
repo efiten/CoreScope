@@ -342,6 +342,10 @@ const STALE_TEST_NEW = {
       'both observed scopes are badged as agreeing with the declared list');
     assert((html.match(/ns-decl-quiet/g) || []).length === 4,
       'the four declared-but-unobserved regions each get their own row');
+    assert(/<td class="ns-scope-name">de-nw<\/td>/.test(html),
+      'an observed scope is displayed without the # prefix, matching how declared rows spell it');
+    assert(!/<td class="ns-scope-name">#/.test(html),
+      'no scope-name cell renders a # — one column must not carry two spellings');
   }
 
 

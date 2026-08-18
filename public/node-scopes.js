@@ -86,7 +86,11 @@
 
   function scopeRow(row, declared) {
     return '<tr>' +
-      '<td class="ns-scope-name">' + escapeHtml(row.scope) + '</td>' +
+      // Displayed normalised: observed rows carry the '#', declared-only rows do
+      // not, so rendering row.scope raw put two spellings of the same vocabulary
+      // in one column. The prefix is a local config convention, not part of the
+      // name, and dropping it also buys width on a narrow screen.
+      '<td class="ns-scope-name">' + escapeHtml(normScope(row.scope)) + '</td>' +
       '<td class="ns-n">' + (row.observed ? row.packets : '—') + '</td>' +
       '<td class="ns-n">' + (row.observed ? timeAgo(row.lastSeen) : '—') + '</td>' +
       '<td>' + declaredBadge(row, declared) + '</td>' +
