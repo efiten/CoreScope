@@ -373,21 +373,17 @@ func TestPruneClientDeclaredRegionsUsesIndex(t *testing.T) {
 
 // TestPruneOldClientDeclaredRegions verifies the declared-regions reaper
 // deletes rows older than the window and keeps recent ones, and that days=0
-// disables it — mirroring TestPruneOldClientRfSamples for the sibling table.
-// It also covers the case an RFC3339 (no-millisecond) cutoff gets wrong:
-// observed_at is stored via rxTimeMillisLayout, and a row observed 500ms
-// after the cutoff instant — chronologically newer, so it must survive — has
-// a string form like "...T10:00:00.500Z" that sorts lexicographically BEFORE
-// a bare "...T10:00:00Z" cutoff (since '.' is 0x2E and 'Z' is 0x5A). An
-// RFC3339-formatted cutoff would therefore wrongly delete it; a
-// millisecond-formatted cutoff correctly keeps it.
+// disables it. It only exercises the days-to-cutoff arithmetic (a row well
+// outside vs. well inside the window) — the millisecond-precision boundary
+// that distinguishes a correct cutoff from an RFC3339 one is covered
+// separately by TestPruneOldClientDeclaredRegionsAtMillisecondBoundary, which
+// pins its own cutoff instant instead of deriving one from time.Now(); see
+// that test's comment for why this one deliberately does not attempt it.
 func TestPruneOldClientDeclaredRegions(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().UTC()
 	recent := now.AddDate(0, 0, -1).Format(rxTimeMillisLayout)
 	old := now.AddDate(0, 0, -40).Format(rxTimeMillisLayout)
-	cutoffInstant := now.AddDate(0, 0, -7)
-	boundary := cutoffInstant.Add(500 * time.Millisecond).Format(rxTimeMillisLayout)
 
 	mk := func(observedAt string) *ClientDeclaredRegions {
 		return &ClientDeclaredRegions{
@@ -401,9 +397,6 @@ func TestPruneOldClientDeclaredRegions(t *testing.T) {
 	if _, err := s.InsertClientDeclaredRegions(mk(old)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.InsertClientDeclaredRegions(mk(boundary)); err != nil {
-		t.Fatal(err)
-	}
 
 	if n, _ := s.PruneOldClientDeclaredRegions(0); n != 0 {
 		t.Fatalf("days=0 must be a no-op, got %d", n)
@@ -415,12 +408,64 @@ func TestPruneOldClientDeclaredRegions(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("expected 1 old row pruned, got %d", n)
 	}
-	if got := declaredRegionsCount(t, s); got != 2 {
-		t.Fatalf("expected 2 rows remaining (recent + boundary), got %d", got)
+	if got := declaredRegionsCount(t, s); got != 1 {
+		t.Fatalf("expected 1 row remaining (recent), got %d", got)
+	}
+}
+
+// TestPruneOldClientDeclaredRegionsAtMillisecondBoundary proves the pruner's
+// cutoff comparison distinguishes a millisecond-precision stored value from
+// an RFC3339 (whole-second) cutoff: observed_at is written via
+// rxTimeMillisLayout, and SQLite compares it lexicographically as a string,
+// so a cutoff formatted without the ".mmm" component sorts AFTER a
+// chronologically-newer row that has one (since '.' is 0x2E and 'Z' is
+// 0x5A) and would wrongly delete it.
+//
+// It calls the unexported pruneOldClientDeclaredRegionsAt seam with a cutoff
+// instant the test controls, rather than deriving one from time.Now() the
+// way PruneOldClientDeclaredRegions(days) does. That is deliberate: the
+// obvious construction — take "now", subtract N days via AddDate (which
+// shifts only the calendar date), then add a sub-second offset — inherits
+// whatever sub-second component "now" happened to have. If that leftover
+// fraction is e.g. 700ms, adding another 500ms rolls into the next second
+// and the boundary row stops testing what it claims to (it would survive
+// under the buggy RFC3339 cutoff too, so the assertion passes either way).
+// Truncating "now" first avoids that but reintroduces the opposite failure:
+// the boundary can then land BEFORE the real cutoff and the test fails
+// against correct code. That is the same flake already fixed once on the
+// sibling client_rf_samples table (~50% of runs, in one direction or the
+// other depending on which fix is chosen). Pinning both the cutoff and the
+// offset removes time.Now() from the test entirely, so the result no longer
+// depends on wall-clock phase.
+func TestPruneOldClientDeclaredRegionsAtMillisecondBoundary(t *testing.T) {
+	s := newTestStore(t)
+	cutoffInstant := time.Date(2026, 8, 4, 10, 0, 0, 0, time.UTC).Add(400 * time.Millisecond)
+	before := cutoffInstant.Add(-1 * time.Millisecond).Format(rxTimeMillisLayout)
+	boundary := cutoffInstant.Add(1 * time.Millisecond).Format(rxTimeMillisLayout)
+
+	mk := func(observedAt string) *ClientDeclaredRegions {
+		return &ClientDeclaredRegions{
+			Target: "bb11", RxPubkey: "aa11", ObservedAt: observedAt, IngestedAt: observedAt,
+			RegionsCSV: "be",
+		}
+	}
+	if _, err := s.InsertClientDeclaredRegions(mk(before)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertClientDeclaredRegions(mk(boundary)); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.pruneOldClientDeclaredRegionsAt(cutoffInstant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 row pruned (1ms before the cutoff), got %d", n)
 	}
 	var boundarySurvived int
 	s.db.QueryRow(`SELECT COUNT(*) FROM node_declared_regions WHERE observed_at = ?`, boundary).Scan(&boundarySurvived)
 	if boundarySurvived != 1 {
-		t.Fatalf("boundary row (500ms after cutoff instant) must survive; an RFC3339 (no-ms) cutoff would wrongly delete it because '.' < 'Z' lexicographically — got %d", boundarySurvived)
+		t.Fatalf("boundary row (1ms after a cutoff with a non-zero millisecond component) must survive; an RFC3339 (no-ms) cutoff would wrongly delete it because '.' < 'Z' lexicographically — got %d", boundarySurvived)
 	}
 }

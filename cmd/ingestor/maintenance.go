@@ -138,15 +138,27 @@ func (s *Store) PruneOldClientDeclaredRegions(days int) (int64, error) {
 	if days <= 0 {
 		return 0, nil
 	}
-	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(rxTimeMillisLayout)
+	n, err := s.pruneOldClientDeclaredRegionsAt(time.Now().UTC().AddDate(0, 0, -days))
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		log.Printf("[prune] deleted %d node_declared_regions older than %d days", n, days)
+	}
+	return n, nil
+}
+
+// pruneOldClientDeclaredRegionsAt is the cutoff-instant seam behind
+// PruneOldClientDeclaredRegions: it exists so tests can pin the cutoff
+// deterministically instead of racing time.Now() to place a fixture row on a
+// specific side of it.
+func (s *Store) pruneOldClientDeclaredRegionsAt(cutoffInstant time.Time) (int64, error) {
+	cutoff := cutoffInstant.Format(rxTimeMillisLayout)
 	res, err := s.db.Exec(`DELETE FROM node_declared_regions WHERE observed_at < ?`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("prune node_declared_regions: %w", err)
 	}
 	n, _ := res.RowsAffected()
-	if n > 0 {
-		log.Printf("[prune] deleted %d node_declared_regions older than %d days", n, days)
-	}
 	return n, nil
 }
 
