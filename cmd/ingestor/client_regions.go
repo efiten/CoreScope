@@ -70,9 +70,9 @@ func handleClientRegions(store *Store, cfg *Config, tag, rxPubkey string, msg ma
 		lon, lonOK := toFloat64(gps["lon"])
 		if latOK && lonOK && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 {
 			latPtr, lonPtr = &lat, &lon
-		}
-		if acc, ok := toFloat64(gps["acc_m"]); ok {
-			posAccPtr = &acc
+			if acc, ok := toFloat64(gps["acc_m"]); ok {
+				posAccPtr = &acc
+			}
 		}
 	}
 

@@ -332,6 +332,34 @@ func TestHandleClientRegionsOmittedPosAccMIsNull(t *testing.T) {
 	}
 }
 
+// TestHandleClientRegionsRejectedPositionDropsPosAccM proves an accuracy
+// radius is not stored when the coordinates it qualifies were rejected: a
+// pos_acc_m beside a NULL lat/lon describes the precision of no position.
+func TestHandleClientRegionsRejectedPositionDropsPosAccM(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be"},
+		"gps":       map[string]interface{}{"lat": 151.05, "lon": 3.72, "acc_m": 8.5},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.Lat != nil || cur.Lon != nil {
+		t.Fatalf("Lat/Lon = %v/%v, want nil for an out-of-range latitude", cur.Lat, cur.Lon)
+	}
+	if cur.PosAccM != nil {
+		t.Errorf("PosAccM = %v, want nil when the position was rejected", *cur.PosAccM)
+	}
+}
+
 func TestDeclaredRegionsCurrentIsLatestObservation(t *testing.T) {
 	s := newTestStore(t)
 	ins := func(at, csv string) {
