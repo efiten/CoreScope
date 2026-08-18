@@ -2,10 +2,15 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/mux"
 )
 
 // setupScopeConformanceDB builds an in-memory transmissions/observations pair
@@ -87,9 +92,17 @@ var scopeSeedCounter int
 // live join has to cope with rather than a lowercase convenience fiction.
 func seedTransmissionRoute(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed, routeType int) {
 	t.Helper()
+	seedTransmissionRouteAt(t, s, forwarder, seed, routeType, "2026-01-15T12:00:00Z")
+}
+
+// seedTransmissionRouteAt is seedTransmissionRoute with an explicit
+// first_seen, for tests (e.g. the handler tests below) that need a
+// transmission to fall inside a real-wall-clock ?window= lookback rather
+// than the fixed date the ScopeConformance unit tests above use.
+func seedTransmissionRouteAt(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed, routeType int, firstSeen string) {
+	t.Helper()
 	scopeSeedCounter++
 	hash := fmt.Sprintf("scopehash%d", scopeSeedCounter)
-	firstSeen := "2026-01-15T12:00:00Z"
 
 	res, err := s.db.conn.Exec(
 		`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, code1, code2, scope_name)
@@ -319,5 +332,269 @@ func TestScopeConformanceDoesNotCrossAttributeDifferentPubkey(t *testing.T) {
 	}
 	if len(got.Observed) != 0 {
 		t.Errorf("observed = %+v, want empty — hop matches pubkey B's prefix, not pubkey A's", got.Observed)
+	}
+}
+
+// --- GET /api/nodes/{pubkey}/scopes handler tests (Task 2) ---
+
+// setupNodeScopesServer builds a *Server wired to a DB carrying both the
+// ScopeConformance schema (transmissions/observations, via
+// setupScopeConformanceDB) and node_declared_regions, so the handler can be
+// exercised end-to-end through the router.
+func setupNodeScopesServer(t *testing.T) (*Server, *mux.Router) {
+	t.Helper()
+	db := setupScopeConformanceDB(t)
+	if _, err := db.conn.Exec(`
+		CREATE TABLE node_declared_regions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			target TEXT NOT NULL,
+			rx_pubkey TEXT NOT NULL,
+			observed_at TEXT NOT NULL,
+			ingested_at TEXT NOT NULL,
+			regions_csv TEXT NOT NULL,
+			truncated INTEGER NOT NULL DEFAULT 0,
+			lat REAL, lon REAL, pos_acc_m REAL, repeater_clock INTEGER,
+			UNIQUE(target, rx_pubkey, observed_at)
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	db.detectSchema() // picks up hasDeclaredRegionsTable now that the table exists
+
+	cfg := &Config{Port: 3000}
+	hub := NewHub()
+	srv := NewServer(db, cfg, hub)
+	srv.store = newTestStoreWithDB(t, db, cfg)
+	router := mux.NewRouter()
+	srv.RegisterRoutes(router)
+	return srv, router
+}
+
+func TestHandleNodeScopesKnownRepeater(t *testing.T) {
+	srv, router := setupNodeScopesServer(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("be-van"), RouteFlood, recent)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeUnmatched(), RouteFlood, recent)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeUnscoped(), RouteFlood, recent)
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+testFullPubkeyA+"/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Observed) != 1 || got.Observed[0].Scope != "be-van" {
+		t.Errorf("observed = %+v, want exactly the matched scope with a non-empty name", got.Observed)
+	}
+	if got.Unmatched != 1 {
+		t.Errorf("unmatched = %d, want 1 (separate top-level count)", got.Unmatched)
+	}
+	if got.Unscoped != 1 {
+		t.Errorf("unscoped = %d, want 1 (separate top-level count)", got.Unscoped)
+	}
+	if got.Declared != nil {
+		t.Errorf("declared = %+v, want nil — no declared-region row was seeded for this pubkey", got.Declared)
+	}
+}
+
+func TestHandleNodeScopesUnknownRepeaterReturns200Empty(t *testing.T) {
+	_, router := setupNodeScopesServer(t)
+	unknown := strings.Repeat("ab", 32)
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+unknown+"/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — a repeater we never heard is a valid empty answer, not 404", w.Code)
+	}
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Observed) != 0 || got.Unmatched != 0 || got.Unscoped != 0 {
+		t.Errorf("want an empty conformance answer, got %+v", got)
+	}
+	if got.Declared != nil {
+		t.Errorf("declared = %+v, want nil", got.Declared)
+	}
+	if !strings.Contains(w.Body.String(), `"declared":null`) {
+		t.Errorf("body = %s, want a literal \"declared\":null, not an omitted key or empty object", w.Body.String())
+	}
+}
+
+func TestHandleNodeScopesInvalidPubkeyReturns400(t *testing.T) {
+	_, router := setupNodeScopesServer(t)
+
+	req := httptest.NewRequest("GET", "/api/nodes/not-hex/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+// TestHandleNodeScopesWindowVocabulary confirms this endpoint matches the
+// vocabulary already used by the sibling /api/scope-stats endpoint (1h, 24h,
+// 7d; default 24h) rather than the broader ParseTimeWindow alias set
+// (which also accepts 1d/3d/1w/30d) used elsewhere in the API.
+func TestHandleNodeScopesWindowVocabulary(t *testing.T) {
+	_, router := setupNodeScopesServer(t)
+	pk := strings.Repeat("cd", 32)
+
+	for _, window := range []string{"1h", "24h", "7d"} {
+		req := httptest.NewRequest("GET", "/api/nodes/"+pk+"/scopes?window="+window, nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("window=%s: status = %d, want 200", window, w.Code)
+		}
+	}
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+pk+"/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Window != "24h" {
+		t.Errorf("default window = %q, want 24h", got.Window)
+	}
+
+	req = httptest.NewRequest("GET", "/api/nodes/"+pk+"/scopes?window=30d", nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("window=30d: status = %d, want 400 (not part of this endpoint's vocabulary)", w.Code)
+	}
+}
+
+// TestHandleNodeScopesDeclaredRegions covers Step 3b: a repeater that has
+// answered a declared-regions request returns a populated declared object,
+// ordered by the greatest observed_at (never ingested_at).
+func TestHandleNodeScopesDeclaredRegions(t *testing.T) {
+	srv, router := setupNodeScopesServer(t)
+	pk := testFullPubkeyA
+
+	// Older-but-later-ingested row (simulates a drive buffered offline that
+	// arrives late) must NOT win over the fresher observed_at below.
+	if _, err := srv.db.conn.Exec(`
+		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
+		VALUES (?, ?, ?, ?, ?, 0)`,
+		strings.ToLower(pk), "aabbccdd", "2026-08-10T00:00:00.000Z", "2026-08-18T23:59:59.000Z", "be"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.db.conn.Exec(`
+		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
+		VALUES (?, ?, ?, ?, ?, 0)`,
+		strings.ToLower(pk), "rxpubkeyhex", "2026-08-18T12:34:56.789Z", "2026-08-18T12:35:01.000Z", "*,be,be-vlg"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+pk+"/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Declared == nil {
+		t.Fatal("declared = nil, want a populated object")
+	}
+	wantRegions := []string{"*", "be", "be-vlg"}
+	if len(got.Declared.Regions) != len(wantRegions) {
+		t.Fatalf("regions = %v, want %v", got.Declared.Regions, wantRegions)
+	}
+	for i, want := range wantRegions {
+		if got.Declared.Regions[i] != want {
+			t.Errorf("regions[%d] = %q, want %q", i, got.Declared.Regions[i], want)
+		}
+	}
+	if got.Declared.ObservedAt != "2026-08-18T12:34:56.789Z" {
+		t.Errorf("observedAt = %q, want the greatest observed_at row — ordering must never fall back to ingested_at", got.Declared.ObservedAt)
+	}
+	if got.Declared.Truncated {
+		t.Error("truncated = true, want false")
+	}
+	if got.Declared.RxPubkey != "rxpubkeyhex" {
+		t.Errorf("rxPubkey = %q, want the rx_pubkey of the winning (greatest observed_at) row", got.Declared.RxPubkey)
+	}
+}
+
+// TestHandleNodeScopesDeclaredEmptyRegionsIsNotNull covers the other half of
+// Step 3b: a repeater that answered with zero flood-allowed regions is a
+// meaningful, distinct fact from never having been asked, and must serialise
+// as declared.regions == [] rather than declared == null.
+func TestHandleNodeScopesDeclaredEmptyRegionsIsNotNull(t *testing.T) {
+	srv, router := setupNodeScopesServer(t)
+	pk := testFullPubkeyB
+
+	if _, err := srv.db.conn.Exec(`
+		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
+		VALUES (?, ?, ?, ?, ?, 0)`,
+		strings.ToLower(pk), "rxpubkeyhex", "2026-08-18T12:00:00.000Z", "2026-08-18T12:00:05.000Z", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/nodes/"+pk+"/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	if !strings.Contains(w.Body.String(), `"regions":[]`) {
+		t.Errorf("body = %s, want a literal \"regions\":[], not null or an omitted key", w.Body.String())
+	}
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Declared == nil {
+		t.Fatal("declared = nil, want a populated object — the repeater answered, it just declared nothing flood-allowed")
+	}
+	if len(got.Declared.Regions) != 0 {
+		t.Errorf("regions = %v, want empty", got.Declared.Regions)
+	}
+}
+
+// TestHandleNodeScopesNoDeclaredRegionsTable covers the missing-table
+// degrade path (mirrors TestHandleScopeStatsNoColumn's established pattern
+// for optional schema): an older database predating node_declared_regions
+// must not fail the whole request — it degrades to declared: null.
+func TestHandleNodeScopesNoDeclaredRegionsTable(t *testing.T) {
+	db := setupScopeConformanceDB(t) // no node_declared_regions table at all
+	cfg := &Config{Port: 3000}
+	hub := NewHub()
+	srv := NewServer(db, cfg, hub)
+	srv.store = newTestStoreWithDB(t, db, cfg)
+	router := mux.NewRouter()
+	srv.RegisterRoutes(router)
+
+	pk := strings.Repeat("ef", 32)
+	req := httptest.NewRequest("GET", "/api/nodes/"+pk+"/scopes", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — a missing node_declared_regions table must degrade, not fail the request: %s", w.Code, w.Body.String())
+	}
+	var got NodeScopesResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Declared != nil {
+		t.Errorf("declared = %+v, want nil when the table doesn't exist", got.Declared)
 	}
 }

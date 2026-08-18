@@ -3,7 +3,11 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"net/http"
 	"strings"
+	"time"
+
+	"github.com/gorilla/mux"
 )
 
 // ScopeObservation is one region scope this repeater has been observed
@@ -187,4 +191,157 @@ func (s *PacketStore) ScopeConformance(pubkey string, sinceISO string) (*ScopeCo
 	}
 
 	return result, nil
+}
+
+// DeclaredRegions is the most recently *declared* region list a repeater
+// reported when a mobile app asked it over RF, mirroring the ingestor's
+// CurrentDeclaredRegions (cmd/ingestor/client_reception.go). Regions is
+// never nil — an empty slice is itself a meaningful answer ("this repeater
+// declares nothing flood-allowed"), distinct from *DeclaredRegions being nil
+// ("never successfully asked": out of RF range, firmware too old, or the
+// request was silently ignored — the repeater only answers DIRECT-routed
+// requests, so silence means nothing).
+type DeclaredRegions struct {
+	Regions    []string `json:"regions"`
+	ObservedAt string   `json:"observedAt"`
+	Truncated  bool     `json:"truncated"`
+	RxPubkey   string   `json:"rxPubkey"`
+}
+
+// splitRegionsCSV parses regions_csv (comma-separated, "#" prefixes already
+// stripped by the firmware) into a slice, always non-nil.
+func splitRegionsCSV(csv string) []string {
+	regions := []string{}
+	if csv == "" {
+		return regions
+	}
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			regions = append(regions, part)
+		}
+	}
+	return regions
+}
+
+// CurrentDeclaredRegions returns pubkey's most recently declared region
+// list, or nil (not an error) when the repeater has never successfully
+// answered, or when node_declared_regions is absent (an older database that
+// predates this table).
+//
+// "Most recent" is ordered by the greatest observed_at, NEVER ingested_at —
+// mirrors the ingestor's own CurrentDeclaredRegions exactly: a drive
+// buffered offline can arrive days late, and ordering by arrival would let
+// that stale reading overwrite a fresher one.
+func (db *DB) CurrentDeclaredRegions(pubkey string) (*DeclaredRegions, error) {
+	if !db.hasDeclaredRegionsTable {
+		return nil, nil
+	}
+	pubkey = strings.ToLower(strings.TrimSpace(pubkey))
+
+	row := db.conn.QueryRow(`
+		SELECT rx_pubkey, observed_at, regions_csv, truncated
+		FROM node_declared_regions
+		WHERE target = ?
+		ORDER BY observed_at DESC LIMIT 1`, pubkey)
+	var rxPubkey, observedAt, regionsCSV string
+	var truncated int
+	if err := row.Scan(&rxPubkey, &observedAt, &regionsCSV, &truncated); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("current declared regions: %w", err)
+	}
+	return &DeclaredRegions{
+		Regions:    splitRegionsCSV(regionsCSV),
+		ObservedAt: observedAt,
+		Truncated:  truncated == 1,
+		RxPubkey:   rxPubkey,
+	}, nil
+}
+
+// NodeScopesResponse is the payload for GET /api/nodes/{pubkey}/scopes: the
+// observed-forwarding side (*ScopeConformance, embedded so its three scope
+// states sit at the JSON top level — unmatched and unscoped are separate
+// counts and a matched scope never has an empty name) plus the declared
+// side (DeclaredRegions), returned together so the UI needs only one
+// request per node rather than a second per-item call.
+type NodeScopesResponse struct {
+	PublicKey string `json:"publicKey"`
+	Window    string `json:"window"`
+	*ScopeConformance
+	Declared *DeclaredRegions `json:"declared"`
+}
+
+// nodeScopesWindowLookback maps the ?window= vocabulary to a lookback
+// duration. Matches the sibling /api/scope-stats endpoint's vocabulary
+// exactly (1h, 24h, 7d) rather than the broader ParseTimeWindow alias set
+// (which also accepts 1d/3d/1w/30d) used by unrelated analytics endpoints.
+func nodeScopesWindowLookback(window string) (time.Duration, bool) {
+	switch window {
+	case "1h":
+		return time.Hour, true
+	case "24h":
+		return 24 * time.Hour, true
+	case "7d":
+		return 7 * 24 * time.Hour, true
+	default:
+		return 0, false
+	}
+}
+
+// handleNodeScopes serves GET /api/nodes/{pubkey}/scopes?window=1h|24h|7d.
+//
+// A pubkey never heard forwarding anything is a valid question with an
+// empty answer (200), not a 404 — ScopeConformance already treats it that
+// way, and this handler performs no node-existence lookup that would
+// override it.
+func (s *Server) handleNodeScopes(w http.ResponseWriter, r *http.Request) {
+	pubkey := strings.ToLower(mux.Vars(r)["pubkey"])
+	if !isHexPubkey(pubkey) {
+		writeError(w, 400, "invalid pubkey: expected 64 hex chars")
+		return
+	}
+	if s.cfg != nil && s.cfg.IsBlacklisted(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
+	if s.isPubkeyHidden(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
+
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "24h"
+	}
+	lookback, ok := nodeScopesWindowLookback(window)
+	if !ok {
+		writeError(w, 400, "window must be 1h, 24h, or 7d")
+		return
+	}
+	sinceISO := time.Now().Add(-lookback).UTC().Format(time.RFC3339)
+
+	conformance := &ScopeConformance{Observed: []ScopeObservation{}}
+	if s.store != nil {
+		var err error
+		conformance, err = s.store.ScopeConformance(pubkey, sinceISO)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+
+	declared, err := s.db.CurrentDeclaredRegions(pubkey)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	writeJSON(w, NodeScopesResponse{
+		PublicKey:        pubkey,
+		Window:           window,
+		ScopeConformance: conformance,
+		Declared:         declared,
+	})
 }

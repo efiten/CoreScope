@@ -32,15 +32,16 @@ const routeTypeNonTransportSQL = "route_type IN (1, 2)"
 
 // DB wraps a read-only connection to the MeshCore SQLite database.
 type DB struct {
-	conn             *sql.DB
-	path             string // filesystem path to the database file
-	isV3             bool   // v3 schema: observer_idx in observations (vs observer_id in v2)
-	hasResolvedPath  bool   // observations table has resolved_path column
-	hasObsRawHex     bool   // observations table has raw_hex column (#881)
-	hasScopeName        bool   // transmissions.scope_name column exists (#899)
-	hasDefaultScope     bool   // nodes.default_scope column exists (#899)
-	hasMultibyteSupCols bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
-	hasLastSeen         bool   // transmissions.last_seen column exists (#1690)
+	conn                    *sql.DB
+	path                    string // filesystem path to the database file
+	isV3                    bool   // v3 schema: observer_idx in observations (vs observer_id in v2)
+	hasResolvedPath         bool   // observations table has resolved_path column
+	hasObsRawHex            bool   // observations table has raw_hex column (#881)
+	hasScopeName            bool   // transmissions.scope_name column exists (#899)
+	hasDefaultScope         bool   // nodes.default_scope column exists (#899)
+	hasMultibyteSupCols     bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
+	hasLastSeen             bool   // transmissions.last_seen column exists (#1690)
+	hasDeclaredRegionsTable bool   // node_declared_regions table exists (rf-data-surfacing task 2)
 
 	// Channel list cache (60s TTL) — avoids repeated GROUP BY scans (#762)
 	channelsCacheMu  sync.Mutex
@@ -144,6 +145,17 @@ func (db *DB) detectSchema() {
 			}
 		}
 	}
+
+	// node_declared_regions is an opt-in table that may be absent on older
+	// databases (#899-adjacent). PRAGMA table_info on a missing table just
+	// returns zero rows rather than erroring, so a present-but-empty result
+	// set is the absence signal.
+	ndrRows, err := db.conn.Query("PRAGMA table_info(node_declared_regions)")
+	if err != nil {
+		return
+	}
+	defer ndrRows.Close()
+	db.hasDeclaredRegionsTable = ndrRows.Next()
 }
 
 // nodeSelectCols returns the SELECT column list for nodes queries.
