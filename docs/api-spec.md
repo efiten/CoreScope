@@ -808,6 +808,13 @@ forwarding anything is a valid question, not an error.
 - `window` bounds `observed` only; `declared` is always the latest reading regardless of
   age — a `declared` reading can be far older than the requested `window`. Use `observedAt`
   to judge its age.
+- **The two sides are spelled differently and a consumer MUST normalise before comparing
+  them.** `observed[].scope` keeps the leading `#` (region keys are configured that way —
+  `hashRegions: ["#belgium", "#eu"]`), while `declared.regions[]` arrives from the firmware
+  with the prefix already stripped. So observed `#de-nw` and declared `de-nw` are the same
+  scope. Comparing raw silently inverts the result: every observed scope looks undeclared
+  and every declared region looks unobserved, which is a plausible-looking answer rather
+  than an obvious failure.
 - `declared: null` means this repeater has never successfully answered a declared-regions
   request — out of RF range, firmware too old, or the request was silently ignored (the
   repeater only answers DIRECT-routed requests, so silence is not evidence of anything).
