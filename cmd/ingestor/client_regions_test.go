@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -344,5 +345,82 @@ func TestCurrentDeclaredRegionsNormalizesTargetCase(t *testing.T) {
 	}
 	if cur.RegionsCSV != "be" {
 		t.Errorf("current.RegionsCSV = %q, want %q", cur.RegionsCSV, "be")
+	}
+}
+
+// TestPruneClientDeclaredRegionsUsesIndex pins the retention DELETE to an
+// index seek on idx_ndr_prune rather than a full table scan.
+func TestPruneClientDeclaredRegionsUsesIndex(t *testing.T) {
+	s := newTestStore(t)
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN DELETE FROM node_declared_regions WHERE observed_at < ?`, "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	plan := ""
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if !strings.Contains(plan, "idx_ndr_prune") {
+		t.Fatalf("retention DELETE should use idx_ndr_prune, plan was:\n%s", plan)
+	}
+}
+
+// TestPruneOldClientDeclaredRegions verifies the declared-regions reaper
+// deletes rows older than the window and keeps recent ones, and that days=0
+// disables it — mirroring TestPruneOldClientRfSamples for the sibling table.
+// It also covers the case an RFC3339 (no-millisecond) cutoff gets wrong:
+// observed_at is stored via rxTimeMillisLayout, and a row observed 500ms
+// after the cutoff instant — chronologically newer, so it must survive — has
+// a string form like "...T10:00:00.500Z" that sorts lexicographically BEFORE
+// a bare "...T10:00:00Z" cutoff (since '.' is 0x2E and 'Z' is 0x5A). An
+// RFC3339-formatted cutoff would therefore wrongly delete it; a
+// millisecond-formatted cutoff correctly keeps it.
+func TestPruneOldClientDeclaredRegions(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	recent := now.AddDate(0, 0, -1).Format(rxTimeMillisLayout)
+	old := now.AddDate(0, 0, -40).Format(rxTimeMillisLayout)
+	cutoffInstant := now.AddDate(0, 0, -7)
+	boundary := cutoffInstant.Add(500 * time.Millisecond).Format(rxTimeMillisLayout)
+
+	mk := func(observedAt string) *ClientDeclaredRegions {
+		return &ClientDeclaredRegions{
+			Target: "bb11", RxPubkey: "aa11", ObservedAt: observedAt, IngestedAt: observedAt,
+			RegionsCSV: "be",
+		}
+	}
+	if _, err := s.InsertClientDeclaredRegions(mk(recent)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertClientDeclaredRegions(mk(old)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertClientDeclaredRegions(mk(boundary)); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, _ := s.PruneOldClientDeclaredRegions(0); n != 0 {
+		t.Fatalf("days=0 must be a no-op, got %d", n)
+	}
+	n, err := s.PruneOldClientDeclaredRegions(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 old row pruned, got %d", n)
+	}
+	if got := declaredRegionsCount(t, s); got != 2 {
+		t.Fatalf("expected 2 rows remaining (recent + boundary), got %d", got)
+	}
+	var boundarySurvived int
+	s.db.QueryRow(`SELECT COUNT(*) FROM node_declared_regions WHERE observed_at = ?`, boundary).Scan(&boundarySurvived)
+	if boundarySurvived != 1 {
+		t.Fatalf("boundary row (500ms after cutoff instant) must survive; an RFC3339 (no-ms) cutoff would wrongly delete it because '.' < 'Z' lexicographically — got %d", boundarySurvived)
 	}
 }
