@@ -58,7 +58,13 @@ Topic: `meshcore/client/{PUBLIC_KEY}/regions` — `{PUBLIC_KEY}` is the reportin
   meaningful on its own — it says what a repeater claims to forward, regardless of where the companion
   was standing when it asked. A missing or out-of-range fix stores the row with `lat`/`lon` as SQL
   `NULL` rather than dropping it (contrast with `handleClientPacket`, which drops a position-less
-  message outright because a coverage point without a position is not coverage at all).
+  message outright because a coverage point without a position is not coverage at all). `gps.acc_m` is
+  stored as `pos_acc_m`, the same column name `client_rf_samples` uses for this shape; a missing
+  `acc_m` stores `NULL`, not `0`.
+- `repeater_clock` is the repeater's own RTC reading at the moment it answered — the only signal on this
+  topic that would reveal a repeater with a broken clock. Stored verbatim in the `repeater_clock` column
+  via the same `optInt64` helper `handleClientRfSample` uses for this shape: a missing field stores
+  `NULL`, never `0` — absent is not zero, the same rule enforced for `recv_errors` on the `/rf` topic.
 - Subscription: the ingestor's default subscription (`meshcore/#`) already covers this topic. Sources
   configured with an explicit topic list must add `meshcore/client/+/regions`.
 
@@ -94,6 +100,7 @@ companion's trustworthiness.
 ```
 node_declared_regions(
   id, target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated, lat, lon,
+  pos_acc_m, repeater_clock,
   UNIQUE(target, rx_pubkey, observed_at))   -- idempotent re-ingest; different reporters both persist
 ```
 

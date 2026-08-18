@@ -232,6 +232,106 @@ func TestHandleClientRegionsTruncatedCarriedThrough(t *testing.T) {
 	}
 }
 
+// TestHandleClientRegionsRepeaterClockRoundTrips proves repeater_clock is
+// read from the payload (optInt64, same helper handleClientRfSample uses for
+// this shape) and stored — it is the only signal in this stream that would
+// reveal a repeater with a broken RTC, and was previously discarded even
+// though the app publishes it and the docs show it in the payload example.
+func TestHandleClientRegionsRepeaterClockRoundTrips(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp":      "2026-08-18T10:00:00.000Z",
+		"target":         testTargetPK,
+		"regions":        []interface{}{"be"},
+		"repeater_clock": 1755518096.0,
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.RepeaterClock == nil || *cur.RepeaterClock != 1755518096 {
+		t.Errorf("RepeaterClock = %v, want 1755518096", cur.RepeaterClock)
+	}
+}
+
+// TestHandleClientRegionsOmittedRepeaterClockIsNull proves a payload that
+// omits repeater_clock stores NULL, not 0 — absent is not zero, the same
+// rule this codebase enforces for recv_errors (client_rf_sample.go).
+func TestHandleClientRegionsOmittedRepeaterClockIsNull(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be"},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.RepeaterClock != nil {
+		t.Errorf("RepeaterClock = %v, want nil when the field is absent from the payload", *cur.RepeaterClock)
+	}
+}
+
+// TestHandleClientRegionsPosAccMRoundTrips proves gps.acc_m is read and
+// stored the same way handleClientRfSample stores it as pos_acc_m — it was
+// previously dropped even though the app publishes it.
+func TestHandleClientRegionsPosAccMRoundTrips(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be"},
+		"gps":       map[string]interface{}{"lat": 51.05, "lon": 3.72, "acc_m": 8.5},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.PosAccM == nil || *cur.PosAccM != 8.5 {
+		t.Errorf("PosAccM = %v, want 8.5", cur.PosAccM)
+	}
+}
+
+// TestHandleClientRegionsOmittedPosAccMIsNull proves a payload whose gps
+// object omits acc_m stores NULL, not 0.
+func TestHandleClientRegionsOmittedPosAccMIsNull(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-18T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"be"},
+		"gps":       map[string]interface{}{"lat": 51.05, "lon": 3.72},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.PosAccM != nil {
+		t.Errorf("PosAccM = %v, want nil when gps.acc_m is absent", *cur.PosAccM)
+	}
+}
+
 func TestDeclaredRegionsCurrentIsLatestObservation(t *testing.T) {
 	s := newTestStore(t)
 	ins := func(at, csv string) {

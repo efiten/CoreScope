@@ -64,24 +64,29 @@ func handleClientRegions(store *Store, cfg *Config, tag, rxPubkey string, msg ma
 	rxTime, _ := resolveRxTimeCore(msg, tag)
 	observedAt := rxTime.Format(rxTimeMillisLayout)
 
-	var latPtr, lonPtr *float64
+	var latPtr, lonPtr, posAccPtr *float64
 	if gps, ok := msg["gps"].(map[string]interface{}); ok {
 		lat, latOK := toFloat64(gps["lat"])
 		lon, lonOK := toFloat64(gps["lon"])
 		if latOK && lonOK && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 {
 			latPtr, lonPtr = &lat, &lon
 		}
+		if acc, ok := toFloat64(gps["acc_m"]); ok {
+			posAccPtr = &acc
+		}
 	}
 
 	o := &ClientDeclaredRegions{
-		Target:     target,
-		RxPubkey:   rxPubkey,
-		ObservedAt: observedAt,
-		IngestedAt: time.Now().UTC().Format(time.RFC3339),
-		RegionsCSV: strings.Join(regions, ","),
-		Truncated:  truncated,
-		Lat:        latPtr,
-		Lon:        lonPtr,
+		Target:        target,
+		RxPubkey:      rxPubkey,
+		ObservedAt:    observedAt,
+		IngestedAt:    time.Now().UTC().Format(time.RFC3339),
+		RegionsCSV:    strings.Join(regions, ","),
+		Truncated:     truncated,
+		Lat:           latPtr,
+		Lon:           lonPtr,
+		PosAccM:       posAccPtr,
+		RepeaterClock: optInt64(msg, "repeater_clock"),
 	}
 	if _, err := store.InsertClientDeclaredRegions(o); err != nil {
 		log.Printf("MQTT [%s] node_declared_regions insert: %v", tag, err)

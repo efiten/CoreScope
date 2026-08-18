@@ -423,13 +423,15 @@ func (s *Store) InsertClientRxObservation(o *ClientRxObservation) (bool, error) 
 // an overflowing reply has holes rather than a truncated prefix, with no
 // marker distinguishing the two.
 type ClientDeclaredRegions struct {
-	Target     string
-	RxPubkey   string
-	ObservedAt string
-	IngestedAt string
-	RegionsCSV string
-	Truncated  bool
-	Lat, Lon   *float64
+	Target        string
+	RxPubkey      string
+	ObservedAt    string
+	IngestedAt    string
+	RegionsCSV    string
+	Truncated     bool
+	Lat, Lon      *float64
+	PosAccM       *float64
+	RepeaterClock *int64
 }
 
 // InsertClientDeclaredRegions writes one declared-region observation.
@@ -438,10 +440,10 @@ type ClientDeclaredRegions struct {
 func (s *Store) InsertClientDeclaredRegions(o *ClientDeclaredRegions) (bool, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO node_declared_regions
-			(target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated, lat, lon)
-		VALUES (?,?,?,?,?,?,?,?)
+			(target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated, lat, lon, pos_acc_m, repeater_clock)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(target, rx_pubkey, observed_at) DO NOTHING`,
-		o.Target, o.RxPubkey, o.ObservedAt, o.IngestedAt, o.RegionsCSV, boolToInt(o.Truncated), o.Lat, o.Lon)
+		o.Target, o.RxPubkey, o.ObservedAt, o.IngestedAt, o.RegionsCSV, boolToInt(o.Truncated), o.Lat, o.Lon, o.PosAccM, o.RepeaterClock)
 	if err != nil {
 		return false, err
 	}
@@ -457,13 +459,13 @@ func (s *Store) InsertClientDeclaredRegions(o *ClientDeclaredRegions) (bool, err
 func (s *Store) CurrentDeclaredRegions(target string) (*ClientDeclaredRegions, error) {
 	target = strings.ToLower(strings.TrimSpace(target))
 	row := s.db.QueryRow(`
-		SELECT target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated, lat, lon
+		SELECT target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated, lat, lon, pos_acc_m, repeater_clock
 		FROM node_declared_regions
 		WHERE target = ?
 		ORDER BY observed_at DESC LIMIT 1`, target)
 	var o ClientDeclaredRegions
 	var truncated int
-	if err := row.Scan(&o.Target, &o.RxPubkey, &o.ObservedAt, &o.IngestedAt, &o.RegionsCSV, &truncated, &o.Lat, &o.Lon); err != nil {
+	if err := row.Scan(&o.Target, &o.RxPubkey, &o.ObservedAt, &o.IngestedAt, &o.RegionsCSV, &truncated, &o.Lat, &o.Lon, &o.PosAccM, &o.RepeaterClock); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
