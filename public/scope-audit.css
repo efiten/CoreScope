@@ -1,0 +1,41 @@
+/* Network-wide scope audit page (#/scope-audit). Reuses .ns-decl / .ns-table /
+   .ns-empty / .ns-truncated from node-scopes.css (same badge vocabulary, so
+   the per-node and network-wide views agree visually) plus .analytics-time-range
+   for the window buttons. No hex/rgb literals — --text-muted / --border /
+   --status-* / --link-color are defined globally. */
+
+.sa-page { max-width: 1200px; margin: 0 auto; padding: 12px 16px; }
+
+.sa-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.sa-head h2 { margin: 0; font-size: 18px; }
+
+.sa-intro { color: var(--text-muted); font-size: 12px; margin: 4px 0 10px; }
+.sa-intro a { color: var(--link-color); }
+
+.sa-window-note {
+  font-size: 12px; color: var(--text-muted); margin: 4px 0 10px;
+  border-left: 3px solid var(--border); padding: 4px 10px;
+}
+
+.sa-table-wrap { overflow-x: auto; }
+.sa-table { min-width: 720px; }
+.sa-name a { color: var(--link-color); text-decoration: none; }
+.sa-name a:hover { text-decoration: underline; }
+.sa-name-unknown { color: var(--text-muted); font-style: italic; }
+.sa-role { font-size: 10px; text-transform: uppercase; letter-spacing: .3px; }
+
+.sa-chip {
+  display: inline-block; padding: 1px 6px; margin: 1px 2px 1px 0; border-radius: 4px;
+  font-size: 11px; font-family: var(--mono); white-space: nowrap;
+}
+.sa-chip-declared { background: var(--section-bg, var(--card-bg)); color: var(--text); border: 1px solid var(--border); }
+.sa-chip-missing { background: color-mix(in srgb, var(--status-red) 16%, transparent); color: var(--danger); }
+.sa-chip-undeclared { background: color-mix(in srgb, var(--status-yellow) 18%, transparent); color: var(--status-amber-text); }
+.sa-chip-wildcard { background: var(--section-bg, var(--card-bg)); color: var(--text-muted); font-weight: 700; }
+.sa-chip-ambiguous { background: var(--section-bg, var(--card-bg)); color: var(--text-muted); border: 1px dashed var(--border); font-family: inherit; font-style: italic; }
+
+.sa-count { font-size: 11px; margin-top: 6px; }
+
+@media (max-width: 640px) {
+  .sa-table th:nth-child(5), .sa-table td:nth-child(5) { display: none; }
+}

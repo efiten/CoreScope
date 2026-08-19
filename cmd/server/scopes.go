@@ -270,6 +270,346 @@ func (db *DB) CurrentDeclaredRegions(pubkey string) (*DeclaredRegions, error) {
 	}, nil
 }
 
+// DeclaredRegionsRow is one repeater's most recently declared region list,
+// as returned in bulk by AllCurrentDeclaredRegions for GET /api/scope-audit.
+type DeclaredRegionsRow struct {
+	Target     string
+	ObservedAt string
+	RegionsCSV string
+	Truncated  bool
+}
+
+// AllCurrentDeclaredRegions returns the latest declared-region row for EVERY
+// target that has ever answered, in one indexed query — idx_ndr_target(target,
+// observed_at) covers the PARTITION BY/ORDER BY below — rather than one
+// CurrentDeclaredRegions call per repeater. "Latest" is the same rule as
+// CurrentDeclaredRegions: greatest observed_at, never ingested_at.
+//
+// A repeater that has never answered is simply absent from the result — it
+// is never synthesized as a row declaring nothing, which would be
+// indistinguishable from a repeater that genuinely answered with an empty
+// list.
+func (db *DB) AllCurrentDeclaredRegions() ([]DeclaredRegionsRow, error) {
+	if !db.hasDeclaredRegionsTable {
+		return nil, nil
+	}
+	rows, err := db.conn.Query(`
+		WITH ranked AS (
+			SELECT target, observed_at, regions_csv, truncated,
+				ROW_NUMBER() OVER (PARTITION BY target ORDER BY observed_at DESC) AS rn
+			FROM node_declared_regions
+		)
+		SELECT target, observed_at, regions_csv, truncated
+		FROM ranked
+		WHERE rn = 1
+		ORDER BY target
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("all current declared regions: %w", err)
+	}
+	defer rows.Close()
+
+	var result []DeclaredRegionsRow
+	for rows.Next() {
+		var d DeclaredRegionsRow
+		var truncated int
+		if err := rows.Scan(&d.Target, &d.ObservedAt, &d.RegionsCSV, &truncated); err != nil {
+			return nil, fmt.Errorf("all current declared regions scan: %w", err)
+		}
+		d.Truncated = truncated == 1
+		result = append(result, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("all current declared regions rows: %w", err)
+	}
+	return result, nil
+}
+
+// scopeAuditNodeIdentity is the name/role display identity for one
+// scope-audit row, resolved in bulk (one IN query for every declared
+// target) rather than one GetNodeByPubkey call per repeater.
+type scopeAuditNodeIdentity struct {
+	Name *string
+	Role *string
+}
+
+// scopeAuditNodeIdentities resolves name/role for pubkeys in a single query.
+// A pubkey with no matching nodes row (deleted, pruned) resolves to the zero
+// value rather than being an error — GET /api/scope-audit still has a
+// PublicKey to identify and link the row.
+func (db *DB) scopeAuditNodeIdentities(pubkeys []string) map[string]scopeAuditNodeIdentity {
+	result := make(map[string]scopeAuditNodeIdentity, len(pubkeys))
+	if len(pubkeys) == 0 {
+		return result
+	}
+	placeholders := make([]string, len(pubkeys))
+	args := make([]interface{}, len(pubkeys))
+	for i, k := range pubkeys {
+		placeholders[i] = "?"
+		args[i] = strings.ToLower(k)
+	}
+	rows, err := db.conn.Query(
+		"SELECT public_key, name, role FROM nodes WHERE public_key IN ("+strings.Join(placeholders, ",")+")",
+		args...)
+	if err != nil {
+		return result
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pk string
+		var name, role sql.NullString
+		if rows.Scan(&pk, &name, &role) != nil {
+			continue
+		}
+		id := scopeAuditNodeIdentity{}
+		if name.Valid {
+			v := name.String
+			id.Name = &v
+		}
+		if role.Valid {
+			v := role.String
+			id.Role = &v
+		}
+		result[strings.ToLower(pk)] = id
+	}
+	return result
+}
+
+// normScope strips a leading '#' so the two sides of the declared/observed
+// comparison can be matched at all — mirrors public/node-scopes.js's
+// normScope exactly. transmissions.scope_name keeps the '#' (region keys
+// are configured as hashRegions: ["#belgium", "#eu"]); regions_csv arrives
+// from the firmware with the prefix already stripped. Comparing raw
+// silently inverts the whole comparison while looking entirely plausible.
+func normScope(s string) string {
+	if strings.HasPrefix(s, "#") {
+		return s[1:]
+	}
+	return s
+}
+
+// scopeAuditTargetAgg is one declared target's forwarding aggregate for the
+// GET /api/scope-audit scan window: named scopes it forwarded (key =
+// normScope'd name) plus a count of the plain-FLOOD (unscoped) packets it
+// forwarded — the signal the wildcard-contradiction check needs, since '*'
+// governs exactly those packets, not any named scope.
+type scopeAuditTargetAgg struct {
+	scopes          map[string]*ScopeObservation
+	unscopedPackets int64
+	// ambiguousHops counts forwarder-hop observations in the window whose
+	// truncated hash prefix matched this target AND at least one other
+	// declared target — see ScopeAuditForwarding's doc comment for why
+	// those hops are attributed to neither candidate instead of both.
+	ambiguousHops int64
+}
+
+// scopeAuditPrefixIndex builds, for every even hex length from
+// minForwarderHopHexLen up to a full 64-char pubkey, a lowercase prefix ->
+// []target map. A forwarder hop of any valid truncated-hash length then
+// resolves to its matching declared target(s) via a single map lookup,
+// instead of a per-target SQL join — this is what keeps
+// ScopeAuditForwarding's underlying scan a single query independent of how
+// many repeaters have declared a region list.
+func scopeAuditPrefixIndex(targets []string) map[int]map[string][]string {
+	byLen := make(map[int]map[string][]string)
+	for _, t := range targets {
+		t = strings.ToLower(t)
+		for l := minForwarderHopHexLen; l <= len(t); l += 2 {
+			m, ok := byLen[l]
+			if !ok {
+				m = map[string][]string{}
+				byLen[l] = m
+			}
+			prefix := t[:l]
+			m[prefix] = append(m[prefix], t)
+		}
+	}
+	return byLen
+}
+
+// scopeAuditForwarderScanQuery is the single full-window scan behind
+// GET /api/scope-audit. Unlike scopeConformanceQuery (one EXISTS-correlated
+// call per pubkey — fine for one node, but 37+ repeater-sized loop of them
+// would each re-scan the same first_seen index range), this scans the
+// FLOOD-family window exactly once and returns every forwarder hop found.
+// It applies the SAME three conditions scopeConformanceQuery does —
+// minForwarderHopHexLen, scopeConformanceForwarderRouteTypesSQL, and the
+// explicit json_valid guard against a single malformed path_json row
+// erroring the whole query — but does not join against any target list:
+// attribution to a specific declared target happens in Go
+// (ScopeAuditForwarding), against the small in-memory prefix index built by
+// scopeAuditPrefixIndex, so the SQL cost stays O(rows in window) regardless
+// of len(targets).
+var scopeAuditForwarderScanQuery = `
+	SELECT t.id, je.value, t.scope_name, t.first_seen
+	FROM transmissions t
+	JOIN observations o ON o.transmission_id = t.id
+	JOIN json_each(o.path_json) je ON je.key = json_array_length(o.path_json) - 1
+	WHERE t.first_seen >= ?
+	  AND ` + scopeConformanceForwarderRouteTypesSQL + `
+	  AND o.path_json IS NOT NULL
+	  AND json_valid(o.path_json)
+	  AND json_array_length(o.path_json) > 0
+	  AND LENGTH(je.value) >= ` + fmt.Sprint(minForwarderHopHexLen) + `
+`
+
+// ScopeAuditForwarding runs scopeAuditForwarderScanQuery once for the whole
+// window and attributes every forwarder hop it finds to targets, by the same
+// truncated-hash prefix match ScopeConformance uses for a single pubkey.
+//
+// A hop is attributed only when its prefix matches EXACTLY ONE declared
+// target. This endpoint exists to find a repeater that declares a region and
+// is not actually forwarding it — crediting a hop to every target sharing
+// its prefix would let a colliding neighbour's traffic silently paper over a
+// real gap, and crediting nobody (the alternative of dropping the hop
+// entirely) would invent failures for targets that simply share a collision-
+// prone prefix. Instead, an ambiguous hop is credited to NEITHER candidate,
+// and every candidate's ambiguousHops counter is incremented instead, so the
+// row can say "this notObserved might just be a prefix collision" rather
+// than presenting it as a confirmed finding. See scopeAuditTargetAgg's
+// ambiguousHops field and ScopeAuditRow.AmbiguousHops.
+//
+// Each (target, transmission) pair is counted at most once even if seen via
+// multiple observations, for both the attributed and the ambiguous count —
+// the same de-duplication scopeConformanceQuery gets for free from EXISTS,
+// done explicitly here since this scan is not correlated per target.
+func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (map[string]*scopeAuditTargetAgg, error) {
+	byLen := scopeAuditPrefixIndex(targets)
+	result := make(map[string]*scopeAuditTargetAgg, len(targets))
+
+	rows, err := s.db.conn.Query(scopeAuditForwarderScanQuery, sinceISO)
+	if err != nil {
+		return nil, fmt.Errorf("scope audit forwarder scan: %w", err)
+	}
+	defer rows.Close()
+
+	getAgg := func(target string) *scopeAuditTargetAgg {
+		agg, ok := result[target]
+		if !ok {
+			agg = &scopeAuditTargetAgg{scopes: map[string]*ScopeObservation{}}
+			result[target] = agg
+		}
+		return agg
+	}
+
+	seen := make(map[string]bool) // "<target>|<txID>" already counted (attributed or ambiguous)
+	for rows.Next() {
+		var txID int64
+		var hop string
+		var scopeName sql.NullString
+		var firstSeen string
+		if err := rows.Scan(&txID, &hop, &scopeName, &firstSeen); err != nil {
+			return nil, fmt.Errorf("scope audit forwarder scan scan: %w", err)
+		}
+		hop = strings.ToLower(hop)
+		candidates := byLen[len(hop)][hop]
+
+		if len(candidates) > 1 {
+			for _, target := range candidates {
+				key := target + "|" + strconv.FormatInt(txID, 10)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				getAgg(target).ambiguousHops++
+			}
+			continue
+		}
+		for _, target := range candidates {
+			key := target + "|" + strconv.FormatInt(txID, 10)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			agg := getAgg(target)
+			if !scopeName.Valid {
+				agg.unscopedPackets++
+				continue
+			}
+			if scopeName.String == "" {
+				continue // unmatched — not part of the declared/observed comparison
+			}
+			name := normScope(scopeName.String)
+			so, ok := agg.scopes[name]
+			if !ok {
+				so = &ScopeObservation{Scope: name, FirstSeen: firstSeen, LastSeen: firstSeen}
+				agg.scopes[name] = so
+			}
+			so.Packets++
+			if firstSeen < so.FirstSeen {
+				so.FirstSeen = firstSeen
+			}
+			if firstSeen > so.LastSeen {
+				so.LastSeen = firstSeen
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scope audit forwarder scan rows: %w", err)
+	}
+	return result, nil
+}
+
+// ScopeAuditRow is one repeater's declared-vs-observed comparison for
+// GET /api/scope-audit — the network-wide answer to "which repeaters
+// declare a region they are not actually forwarding". Every field is
+// already normalised (no leading '#') and '*' is never present in
+// DeclaredRegions/NotObserved/UndeclaredObserved — see DeclaredWildcard and
+// WildcardContradiction for its counterpart.
+type ScopeAuditRow struct {
+	PublicKey string `json:"publicKey"`
+	// Name/Role are pointers so "we hold no nodes row for this target" serialises
+	// as null rather than "". A declared-regions row can name a repeater this
+	// instance has never recorded, and an empty string would make that
+	// indistinguishable from a node we DO know that simply has no name — the
+	// same absent-is-not-empty rule the declared side already follows.
+	Name *string `json:"name"`
+	Role *string `json:"role"`
+
+	DeclaredRegions  []string `json:"declaredRegions"`  // '*' excluded — see DeclaredWildcard
+	DeclaredWildcard bool     `json:"declaredWildcard"` // '*' present in the raw declared list
+	DeclaredAt       string   `json:"declaredAt"`       // ISO — age of the declared answer, not the window
+	Truncated        bool     `json:"truncated"`        // declared list may have had entries silently dropped
+
+	// NotObserved is declared regions with zero matched-forwarding observed
+	// in the window — the headline this endpoint exists to surface.
+	NotObserved []string `json:"notObserved"`
+	// UndeclaredObserved is scopes this repeater was observed forwarding
+	// that are absent from its declared list.
+	UndeclaredObserved []ScopeObservation `json:"undeclaredObserved"`
+
+	// ObservedUnscopedPackets is plain-FLOOD (no transport scope) packets
+	// this repeater was observed forwarding in the window — the '*'
+	// counterpart, per DeclaredWildcard's doc comment.
+	ObservedUnscopedPackets int64 `json:"observedUnscopedPackets"`
+	// WildcardContradiction is true when this repeater was observed
+	// forwarding unscoped floods but its declared list omits '*' — it says
+	// it does NOT forward them, and the traffic says otherwise.
+	WildcardContradiction bool `json:"wildcardContradiction"`
+
+	// AmbiguousHops counts forwarder-hop observations in the window whose
+	// truncated hash prefix matched this target's pubkey AND at least one
+	// other declared target's — see ScopeAuditForwarding's doc comment for
+	// why those hops are attributed to neither and instead counted here on
+	// every candidate. A non-zero value is a caveat, not a finding: any
+	// NotObserved entry on this row could be explained by a colliding
+	// neighbour's traffic rather than a real absence, and any
+	// UndeclaredObserved entry is unaffected by it (ambiguous hops are never
+	// attributed to a scope at all).
+	AmbiguousHops int64 `json:"ambiguousHops"`
+}
+
+// ScopeAuditResponse is the payload for GET /api/scope-audit. Only
+// repeaters with at least one declared-regions answer are included — a
+// repeater never successfully asked is absent, not shown declaring nothing
+// (see AllCurrentDeclaredRegions).
+type ScopeAuditResponse struct {
+	Window    string          `json:"window"`
+	Since     string          `json:"since"` // ISO — start of the observed-forwarding window
+	Repeaters []ScopeAuditRow `json:"repeaters"`
+}
+
 // NodeScopesResponse is the payload for GET /api/nodes/{pubkey}/scopes: the
 // observed-forwarding side (ScopeConformance, embedded BY VALUE so its three
 // scope states sit at the JSON top level — unmatched and unscoped are
