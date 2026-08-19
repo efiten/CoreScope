@@ -7,6 +7,9 @@
 'use strict';
 (function () {
   var map = null, covLayer = null, days = 7, selectedRx = '', selectedName = '', boardCache = [], destroyed = false;
+  // layer: 'signal' (default, per-cell best SNR of directly-heard nodes) or
+  // 'noise' (RF noise-floor layer, fork-only opt-in — see MC_CLIENT_RF_SAMPLES).
+  var layer = 'signal';
 
   function cssColor(varName) {
     try { return getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || '#888'; }
@@ -24,13 +27,58 @@
 
   function dayBtn(d) { return '<button data-days="' + d + '"' + (d === days ? ' class="active"' : '') + ' aria-pressed="' + (d === days ? 'true' : 'false') + '">' + (d === 1 ? '24h' : d + 'd') + '</button>'; }
 
+  function layerBtn(k, label) { return '<button data-layer="' + k + '"' + (k === layer ? ' class="active"' : '') + ' aria-pressed="' + (k === layer ? 'true' : 'false') + '">' + label + '</button>'; }
+
+  // NOISE_QUIET_MAX / NOISE_BUSY_MIN (dBm) bucket the noise layer into 3 tiers.
+  // Production noise_floor runs about -103..-116 dBm; these thresholds are set
+  // a bit wider than that so the tiers stay meaningful as more/noisier areas
+  // get sampled, not just the current data range.
+  var NOISE_QUIET_MAX = -110; // <= this: quiet
+  var NOISE_BUSY_MIN = -100;  // >  this: busy
+
+  // noiseColorVar reuses the coverage colour tokens (green=good, red=bad), but
+  // the axis is INVERTED versus colorVar's SNR check: for noise floor, a LOW
+  // (more negative) dBm reading is quieter/better, so it maps to the "strong"
+  // (green) token, and a HIGH reading maps to "weak" (red) -- the opposite
+  // comparison direction from colorVar.
+  function noiseColorVar(p) {
+    if (!p || p.median_noise_floor == null) return '--nq-cov-grey';
+    var m = Number(p.median_noise_floor);
+    if (m <= NOISE_QUIET_MAX) return '--nq-cov-strong';
+    if (m <= NOISE_BUSY_MIN) return '--nq-cov-mid';
+    return '--nq-cov-weak';
+  }
+
+  function legendHtml() {
+    if (layer === 'noise') {
+      return '<div class="nq-cov-legend" id="rxLegend">' +
+        '<span><i style="background:var(--nq-cov-strong)"></i>quiet (≤ ' + NOISE_QUIET_MAX + ' dBm)</span>' +
+        '<span><i style="background:var(--nq-cov-mid)"></i>medium</span>' +
+        '<span><i style="background:var(--nq-cov-weak)"></i>busy (> ' + NOISE_BUSY_MIN + ' dBm)</span>' +
+        '</div>';
+    }
+    return '<div class="nq-cov-legend" id="rxLegend">' +
+      '<span><i style="background:var(--nq-cov-strong)"></i>strong</span>' +
+      '<span><i style="background:var(--nq-cov-mid)"></i>medium</span>' +
+      '<span><i style="background:var(--nq-cov-weak)"></i>weak</span>' +
+      '<span><i style="background:var(--nq-cov-grey)"></i>no signal</span>' +
+      '</div>';
+  }
+
   function pageHtml() {
+    var layerBar = window.MC_CLIENT_RF_SAMPLES
+      ? '<div class="analytics-time-range" id="rxLayerBar" style="margin:8px 0">' + layerBtn('signal', 'Signal') + layerBtn('noise', 'Noise') + '</div>'
+      : '';
     return '<div style="max-width:1100px;margin:0 auto;padding:12px 16px">' +
       '<h2 style="margin:4px 0 2px;font-size:18px">🗺️ Mobile RX coverage</h2>' +
       '<div style="color:var(--text-muted);font-size:11px">Where roaming CoreScope-RX clients heard nodes. Colour = best signal per cell. <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a></div>' +
       '<div class="analytics-time-range" id="rxDays" style="margin:8px 0">' + dayBtn(1) + dayBtn(7) + dayBtn(14) + dayBtn(30) + '</div>' +
-      '<div class="nq-cov-legend"><span><i style="background:var(--nq-cov-strong)"></i>strong</span><span><i style="background:var(--nq-cov-mid)"></i>medium</span><span><i style="background:var(--nq-cov-weak)"></i>weak</span><span><i style="background:var(--nq-cov-grey)"></i>no signal</span></div>' +
+      layerBar +
+      legendHtml() +
+      '<div style="position:relative">' +
       '<div id="rxMap" style="height:60vh;min-height:360px;border:1px solid var(--border,#d0d7de);border-radius:6px;margin:8px 0"></div>' +
+      '<div id="rxNoiseEmpty" class="nq-msg" style="display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:1000;pointer-events:none">No RF samples in this view yet.</div>' +
+      '</div>' +
       '<div class="nq-group-h">Top mobile observers</div>' +
       '<div id="rxBoard" class="rxb"></div>' +
       '</div>';
@@ -74,14 +122,33 @@
     }
   }
 
-  function drawCoverage() {
-    if (!map || destroyed) return;
-    var b = map.getBounds();
-    var bbox = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()].join(',');
+  // noiseFillOpacityFor mirrors fillOpacityFor for the noise tier (#a11y).
+  function noiseFillOpacityFor(p) {
+    switch (noiseColorVar(p)) {
+      case '--nq-cov-strong': return 0.6;
+      case '--nq-cov-mid': return 0.48;
+      case '--nq-cov-weak': return 0.34;
+      default: return 0.22;
+    }
+  }
+
+  // noiseCellHtml renders the noise-layer tooltip: sample count, median, and
+  // the quietest/noisiest single sample in the cell.
+  function noiseCellHtml(p) {
+    if (!p) return '';
+    return '<div style="font-weight:600;margin-bottom:4px">' + p.count + (p.count === 1 ? ' sample' : ' samples') + '</div>' +
+      '<div style="font-size:12px;line-height:1.6;min-width:160px">' +
+      '<div>median: ' + Number(p.median_noise_floor).toFixed(1) + ' dBm</div>' +
+      '<div style="color:var(--text-muted)">quietest: ' + p.quietest_noise_floor + ' dBm · noisiest: ' + p.noisiest_noise_floor + ' dBm</div>' +
+      '</div>';
+  }
+
+  function drawSignalLayer(bbox) {
     var url = '/api/rx-coverage?bbox=' + bbox + '&z=' + map.getZoom() + '&days=' + days + (selectedRx ? '&rx=' + encodeURIComponent(selectedRx) : '');
     fetch(url).then(function (r) { return r.json(); }).then(function (fc) {
-      if (destroyed || !covLayer) return;
+      if (destroyed || !covLayer || layer !== 'signal') return;
       covLayer.clearLayers();
+      setNoiseEmpty(false);
       (fc.features || []).forEach(function (f) {
         var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
         var col = cssColor(colorVar(f.properties));
@@ -89,6 +156,41 @@
           .bindTooltip(coverageNodesHtml(f.properties));
       });
     }).catch(function (e) { console.warn('rx-coverage: coverage fetch failed', e); });
+  }
+
+  function drawNoiseLayer(bbox) {
+    var url = '/api/rf-noise?bbox=' + bbox + '&z=' + map.getZoom() + '&days=' + days;
+    fetch(url).then(function (r) { return r.json(); }).then(function (fc) {
+      if (destroyed || !covLayer || layer !== 'noise') return;
+      covLayer.clearLayers();
+      var features = fc.features || [];
+      setNoiseEmpty(features.length === 0);
+      features.forEach(function (f) {
+        var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
+        var col = cssColor(noiseColorVar(f.properties));
+        L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: noiseFillOpacityFor(f.properties) }).addTo(covLayer)
+          .bindTooltip(noiseCellHtml(f.properties));
+      });
+    }).catch(function (e) { console.warn('rx-coverage: noise fetch failed', e); });
+  }
+
+  // setNoiseEmpty toggles the "no samples in this view" message. Only shown
+  // on the noise layer — MC_CLIENT_RF_SAMPLES already keeps the toggle (and
+  // so this layer) out of reach entirely when the feature is off, so seeing
+  // this message always means "on, but nothing sampled here yet", never
+  // "feature disabled" (the two states this project keeps needing to keep
+  // distinct).
+  function setNoiseEmpty(show) {
+    var el = document.getElementById('rxNoiseEmpty');
+    if (el) el.style.display = (show && layer === 'noise') ? 'block' : 'none';
+  }
+
+  function drawCoverage() {
+    if (!map || destroyed) return;
+    var b = map.getBounds();
+    var bbox = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()].join(',');
+    if (layer === 'noise') drawNoiseLayer(bbox);
+    else drawSignalLayer(bbox);
   }
 
   // Leaderboard sort state. Default = frontier score, descending. The rank (#)
@@ -214,8 +316,21 @@
     loadBoard(); drawCoverage(); syncHash();
   }
 
+  // setLayer switches between the 'signal' (SNR) and 'noise' hex layers. Only
+  // reachable when MC_CLIENT_RF_SAMPLES rendered the toggle in the first place.
+  function setLayer(l) {
+    if (l === layer) return;
+    layer = l;
+    var bar = document.getElementById('rxLayerBar');
+    if (bar) bar.querySelectorAll('button').forEach(function (b) { b.classList.toggle('active', b.dataset.layer === l); });
+    var legend = document.getElementById('rxLegend');
+    if (legend) legend.outerHTML = legendHtml();
+    setNoiseEmpty(false);
+    drawCoverage(); syncHash();
+  }
+
   function syncHash() {
-    var q = 'days=' + days + (selectedRx ? '&rx=' + selectedRx : '');
+    var q = 'days=' + days + (selectedRx ? '&rx=' + selectedRx : '') + (layer !== 'signal' ? '&layer=' + layer : '');
     try { history.replaceState(null, '', '#/rx-coverage?' + q); } catch (e) {}
   }
 
@@ -234,10 +349,14 @@
       container.innerHTML = '<div class="nq-msg">Coverage is not enabled on this deployment.</div>';
       return;
     }
-    selectedRx = ''; selectedName = ''; days = 7; boardCache = [];
+    selectedRx = ''; selectedName = ''; days = 7; boardCache = []; layer = 'signal';
     try {
       var p = (typeof getHashParams === 'function') ? getHashParams() : null;
-      if (p) { var dd = parseInt(p.get('days'), 10); if ([1, 7, 14, 30].indexOf(dd) >= 0) days = dd; selectedRx = (p.get('rx') || '').toLowerCase(); }
+      if (p) {
+        var dd = parseInt(p.get('days'), 10); if ([1, 7, 14, 30].indexOf(dd) >= 0) days = dd;
+        selectedRx = (p.get('rx') || '').toLowerCase();
+        if (window.MC_CLIENT_RF_SAMPLES && p.get('layer') === 'noise') layer = 'noise';
+      }
     } catch (e) {}
     container.innerHTML = pageHtml();
     map = L.map('rxMap', { zoomControl: true, attributionControl: false }).setView([51.0, 4.8], 8);
@@ -249,6 +368,8 @@
     map.on('moveend zoomend', debounce(drawCoverage, 200));
     var bar = document.getElementById('rxDays');
     if (bar) bar.addEventListener('click', function (e) { var b = e.target.closest('button[data-days]'); if (b) setDays(+b.dataset.days); });
+    var layerBar = document.getElementById('rxLayerBar');
+    if (layerBar) layerBar.addEventListener('click', function (e) { var b = e.target.closest('button[data-layer]'); if (b) setLayer(b.dataset.layer); });
     setTimeout(function () { if (!destroyed && map) { map.invalidateSize(); if (selectedRx) fitToObserver(); else drawCoverage(); } }, 150);
     loadBoard();
   }

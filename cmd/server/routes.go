@@ -287,6 +287,9 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/nodes/resolve", s.handleResolvePrefix).Methods("GET")
 	r.HandleFunc("/api/rx-coverage", s.handleRxCoverage).Methods("GET")
 	r.HandleFunc("/api/rx-leaderboard", s.handleRxLeaderboard).Methods("GET")
+	// Same registered-unconditionally / 404-when-off pattern as coverage above,
+	// gated by requireClientRfSamples instead.
+	r.HandleFunc("/api/rf-noise", s.handleRfNoise).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}", s.handleNodeDetail).Methods("GET")
 	r.HandleFunc("/api/nodes", s.handleNodes).Methods("GET")
 
@@ -462,6 +465,7 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		Tiles:               s.cfg.Tiles,
 		Customizer:          CustomizerClientConfig{DisabledTabs: disabledTabs},
 		ClientRxCoverage:    s.cfg.ClientRxCoverageEnabled(),
+		ClientRfSamples:     s.cfg.ClientRfSamplesEnabled(),
 	})
 }
 

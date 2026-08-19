@@ -23,6 +23,7 @@
     "/api/perf/io",
     "/api/perf/sqlite",
     "/api/perf/write-sources",
+    "/api/rf-noise",
     "/api/rx-coverage",
     "/api/rx-leaderboard",
     "/api/scope-stats",
