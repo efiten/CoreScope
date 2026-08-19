@@ -95,9 +95,42 @@ relayers:
   destination-side end, NOT the node we heard. Attributing it credits the SNR to the wrong (often
   far-away) node. Only FLOOD routes (0,1) are recorded from a path.
 - Packet **with no path** (0 hops) **and** an advert → record the advertiser's full pubkey.
-- `direction` must be `rx`. 1-byte (2 hex char) prefixes are excluded (collision-prone, like Reach).
+- `direction` must be `rx`. A 1-byte (2 hex char) FLOOD hop is normally excluded (collision-prone,
+  like Reach) — **except** it can be resolved geographically; see [`src = "geo"`](#src--geo-1-byte-hops-resolved-geographically-not-directly-observed) below.
 - The RSSI/SNR belong to the directly-received transmission, so they attach to the recorded node.
 - The rest of the path is discarded for coverage.
+
+### `src = "geo"` — 1-byte hops resolved geographically, not directly observed
+
+A 1-byte FLOOD hop is 8 bits (256 possible values). On the live database, 2531 known nodes produce
+only 254 distinct 1-byte prefixes and **not one of them is unique** — a 1-byte hop alone can never
+identify a node, which is why it's normally excluded above.
+
+Since a mobile reception is a direct RF reception, the transmitter cannot be far away, so the ingestor
+resolves it geographically instead (`cmd/ingestor/geo_hop.go`, `resolveGeoHop`):
+
+1. Take the 1-byte hop prefix and the reception's GPS position.
+2. Find nodes whose pubkey starts with that prefix **and** that have a known position (`nodes.lat`/
+   `nodes.lon` both non-NULL) within `GeoHopMaxRangeKM` (50km) of the reception.
+3. **Nodes with no known position are excluded from the candidate pool entirely** — they cannot
+   compete for this attribution, having no distance to be ruled out by.
+4. Exactly **one** candidate remains → attribute to it, using its **full pubkey** as `heard_key` and
+   `src = "geo"`. Zero or more than one candidate → no attribution, same as before this feature.
+
+**This rests on an assumption that is not free of risk, and it is deliberately not hidden:** step 3
+means an unpositioned repeater sharing the same prefix can never block a geo attribution, because it
+has no distance to compare. Measured against the live database: of 72 repeaters with no recorded
+position, all 72 were seen within the last 7 days and 24 within the last 24 hours — these are active
+nodes, not dormant or abandoned ones. MeshCore has an explicit `advert_loc_policy = ADVERT_LOC_NONE`
+setting, so broadcasting no position is a legitimate privacy choice, not a sign of a broken or test
+node. If this assumption proves wrong for a given deployment, the affected rows are always findable
+and re-examinable because `src = "geo"` is never conflated with a directly-observed `"rxlog"`/`"advert"`
+row.
+
+The candidate index (prefix → positioned nodes) is an in-memory snapshot, rebuilt every 60s by the
+same neighbor-edges builder tick that already refreshes the hop-resolution prefix index and neighbor
+graph (`cmd/ingestor/neighbor_builder.go`) — not queried per packet. A node added or (re)positioned
+since the last refresh simply isn't a candidate yet.
 
 ## Storage — `client_receptions` (ingestor-owned)
 
@@ -112,8 +145,10 @@ client_receptions(
   UNIQUE(rx_pubkey, heard_key, rx_at))   -- idempotent re-ingest
 ```
 
-`heard_keylen` is 32 for a full pubkey (0-hop advert) or 2/3 for a multibyte prefix. `src` is
-`advert` or `rxlog`. No hex cell is stored — binning is computed server-side from lat/lon.
+`heard_keylen` is 32 for a full pubkey (0-hop advert, or a 1-byte hop resolved geographically) or 2/3
+for a multibyte prefix. `src` is `advert`, `rxlog`, or `geo` — see
+[`src = "geo"`](#src--geo-1-byte-hops-resolved-geographically-not-directly-observed) above for what
+distinguishes the last one. No hex cell is stored — binning is computed server-side from lat/lon.
 
 Indexes: a composite `(heard_key, heard_keylen, lat, lon)` and a `(lat, lon)` index back the coverage
 queries; the per-node query matches a sargable `heard_key IN (pubkey, prefix6, prefix4)` list so the

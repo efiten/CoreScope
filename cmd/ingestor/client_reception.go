@@ -99,10 +99,10 @@ func handleClientPacket(store *Store, cfg *Config, tag, rxPubkey string, msg map
 		}
 	}
 
-	rec, ok := buildClientReception(
+	rec, ok := buildClientReceptionGeo(
 		rxPubkey,
 		direction, decoded.Header.RouteType, decoded.Header.PayloadType, decoded.Path.Hops, decoded.Payload.PubKey, isAdvert,
-		snrPtr, rssiPtr, lat, lon, accPtr, rxAt, ingestedAt,
+		snrPtr, rssiPtr, lat, lon, accPtr, rxAt, ingestedAt, store.geoIdx.load(),
 	)
 	if !ok {
 		return
@@ -224,6 +224,81 @@ func buildClientReception(
 		return nil, false
 	}
 	heardKey, keylen, src, ok := deriveHeardKey(direction, routeType, payloadType, hops, advertPubkey, isAdvert)
+	if !ok {
+		return nil, false
+	}
+	return &ClientReception{
+		RxPubkey: strings.ToLower(rxPubkey), HeardKey: heardKey, HeardKeyLen: keylen,
+		RSSI: rssi, SNR: snr, Lat: lat, Lon: lon, PosAccM: posAccM,
+		RxAt: rxAt, IngestedAt: ingestedAt, Src: src,
+	}, true
+}
+
+// deriveHeardKeyGeo extends deriveHeardKey with geographic resolution for
+// 1-byte FLOOD hops (see resolveGeoHop's doc comment in geo_hop.go for the
+// assumption this rests on). It duplicates deriveHeardKey's direction/
+// payload-type/route-type gates rather than refactoring them out from under
+// deriveHeardKey, which is pinned by TestDeriveHeardKey and must not change
+// shape or behavior.
+//
+// Behavior:
+//   - Any outcome deriveHeardKey already accepts (0-hop advert, ≥2-byte
+//     FLOOD hop) is returned unchanged, with its original src ("advert" /
+//     "rxlog").
+//   - A 1-byte FLOOD hop — which deriveHeardKey rejects outright as
+//     collision-prone — is instead resolved via resolveGeoHop against the
+//     reception's GPS position. A resolved hop returns the candidate's FULL
+//     pubkey with src "geo". An unresolved one still returns ok=false, never
+//     a fabricated key.
+//   - Every other rejection reason (not "rx", DIRECT-family route, TRACE
+//     payload, no hops at all) is unchanged: ok=false. In particular this
+//     never creates an exception to the DIRECT-route rule: path[last] on a
+//     DIRECT route is the route's far end, not the transmitter, and that is
+//     checked before any hop length is considered.
+func deriveHeardKeyGeo(direction string, routeType, payloadType int, hops []string, advertPubkey string, isAdvert bool, lat, lon float64, idx geoIndex) (string, int, string, bool) {
+	if key, keylen, src, ok := deriveHeardKey(direction, routeType, payloadType, hops, advertPubkey, isAdvert); ok {
+		return key, keylen, src, ok
+	}
+	if !strings.EqualFold(direction, "rx") {
+		return "", 0, "", false
+	}
+	if !packetpath.PathBytesAreHops(byte(payloadType)) {
+		return "", 0, "", false
+	}
+	if len(hops) == 0 {
+		return "", 0, "", false
+	}
+	if routeType != packetpath.RouteTransportFlood && routeType != packetpath.RouteFlood {
+		return "", 0, "", false
+	}
+	last := strings.ToLower(strings.TrimSpace(hops[len(hops)-1]))
+	if len(last)/2 != 1 {
+		return "", 0, "", false
+	}
+	full, ok := resolveGeoHop(last, lat, lon, idx)
+	if !ok {
+		return "", 0, "", false
+	}
+	return full, len(full) / 2, "geo", true
+}
+
+// buildClientReceptionGeo extends buildClientReception with the geo-aware
+// heard-key resolution (deriveHeardKeyGeo). It duplicates
+// buildClientReception's two validation guards for the same reason
+// deriveHeardKeyGeo duplicates deriveHeardKey's gates: buildClientReception
+// is pinned by TestBuildClientReception and must not change shape or
+// behavior.
+func buildClientReceptionGeo(
+	rxPubkey, direction string, routeType, payloadType int, hops []string, advertPubkey string, isAdvert bool,
+	snr *float64, rssi *int, lat, lon float64, posAccM *float64, rxAt, ingestedAt string, idx geoIndex,
+) (*ClientReception, bool) {
+	if rxPubkey == "" || rxAt == "" {
+		return nil, false
+	}
+	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return nil, false
+	}
+	heardKey, keylen, src, ok := deriveHeardKeyGeo(direction, routeType, payloadType, hops, advertPubkey, isAdvert, lat, lon, idx)
 	if !ok {
 		return nil, false
 	}

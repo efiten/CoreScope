@@ -93,6 +93,12 @@ type Store struct {
 	// by the context-aware resolver (#1560). Rebuilt on startup and
 	// once per neighbor-edges builder tick (60s).
 	neighborGraph neighborGraphHolder
+
+	// geoIdx holds the in-memory prefix→positioned-candidates index
+	// used to geographically resolve 1-byte client-reception hops (see
+	// geo_hop.go). Rebuilt on startup and once per neighbor-edges
+	// builder tick (60s), same cadence as prefixIdx/neighborGraph.
+	geoIdx geoIndexHolder
 }
 
 // OpenStore opens or creates a SQLite DB at the given path, applying the
