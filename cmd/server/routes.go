@@ -3628,6 +3628,7 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 			Role:                    id.Role,
 			DeclaredRegions:         declaredNamed,
 			DeclaredWildcard:        declaredWildcard,
+			ConfigState:             scopeAuditConfigState(declaredNamed, declaredWildcard),
 			DeclaredAt:              d.ObservedAt,
 			Truncated:               d.Truncated,
 			NotObserved:             notObserved,

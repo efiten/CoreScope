@@ -36,6 +36,13 @@
 
 .sa-count { font-size: 11px; margin-top: 6px; }
 
+/* sa-summary is the per-configState count line at the top of the page —
+   "13 no scopes configured" etc — reusing .ns-decl (node-scopes.css) for the
+   count pill so it shares the exact colour vocabulary the row-level Config
+   badge (also .ns-decl) uses, rather than a separate summary palette. */
+.sa-summary { display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 12px; color: var(--text-muted); margin: 2px 0 10px; }
+.sa-summary-item { display: inline-flex; align-items: center; gap: 5px; }
+
 @media (max-width: 640px) {
-  .sa-table th:nth-child(5), .sa-table td:nth-child(5) { display: none; }
+  .sa-table th:nth-child(6), .sa-table td:nth-child(6) { display: none; }
 }
