@@ -597,3 +597,54 @@ func TestPruneOldClientDeclaredRegionsAtMillisecondBoundary(t *testing.T) {
 		t.Fatalf("boundary row (1ms after a cutoff with a non-zero millisecond component) must survive; an RFC3339 (no-ms) cutoff would wrongly delete it because '.' < 'Z' lexicographically — got %d", boundarySurvived)
 	}
 }
+
+// TestHandleClientRegionsTrimsBlockPadding proves the ingestor strips the AES
+// block padding a repeater's reply carries, whatever the client version sent it.
+// coredrive-rx trims it since v1.10.2, but a PWA runs its cached build until the
+// user reloads and this instance controls none of the independent clients — the
+// padding was observed arriving from a client 40 minutes AFTER that release.
+// Stored verbatim it lands inside the LAST region name, so "be-vli\x00\x00" matches
+// no observed scope and reads as a region declared but never forwarded.
+func TestHandleClientRegionsTrimsBlockPadding(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-19T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"*", "be", "be-vli\x00\x00\x00"},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.RegionsCSV != "*,be,be-vli" {
+		t.Errorf("regions_csv = %q, want %q", cur.RegionsCSV, "*,be,be-vli")
+	}
+}
+
+// TestHandleClientRegionsPaddingOnlyEntryDropped: an entry that is nothing but
+// padding is not a declared region and must not become an empty-named one.
+func TestHandleClientRegionsPaddingOnlyEntryDropped(t *testing.T) {
+	s := newTestStore(t)
+	msg := map[string]interface{}{
+		"timestamp": "2026-08-19T10:00:00.000Z",
+		"target":    testTargetPK,
+		"regions":   []interface{}{"*", "\x00\x00\x00\x00"},
+	}
+	handleClientRegions(s, &Config{}, "test", testCompanionPK, msg)
+
+	cur, err := s.CurrentDeclaredRegions(testTargetPK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("current = nil, want a row")
+	}
+	if cur.RegionsCSV != "*" {
+		t.Errorf("regions_csv = %q, want %q", cur.RegionsCSV, "*")
+	}
+}
