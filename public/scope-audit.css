@@ -25,7 +25,7 @@
 .sa-role { font-size: 10px; text-transform: uppercase; letter-spacing: .3px; }
 
 .sa-chip {
-  display: inline-block; padding: 1px 6px; margin: 1px 2px 1px 0; border-radius: var(--badge-radius, 4px);
+  display: inline-block; padding: 1px 6px; margin: 1px 2px 1px 0; border-radius: 4px;
   font-size: 11px; font-family: var(--mono); white-space: nowrap;
 }
 .sa-chip-declared { background: var(--section-bg, var(--card-bg)); color: var(--text); border: 1px solid var(--border); }
