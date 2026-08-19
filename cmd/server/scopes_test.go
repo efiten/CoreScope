@@ -1131,6 +1131,32 @@ func TestHandleScopeAuditFiltersBlacklistedNode(t *testing.T) {
 	}
 }
 
+// TestHandleScopeAuditFiltersHiddenNamePrefix is the scope-audit twin of
+// TestHandleScopeAuditFiltersBlacklistedNode, covering FIX 5: a repeater
+// whose known name matches an operator-configured hidden-name prefix is
+// excluded. It also pins the subtler half of the `id.Name != nil` guard in
+// handleScopeAudit — a declared target this instance holds NO nodes row for
+// has no name to test a hidden-prefix rule against, so it must NOT be
+// filtered merely for lacking a name; only a KNOWN, matching name is ever
+// grounds for hiding.
+func TestHandleScopeAuditFiltersHiddenNamePrefix(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	hiddenPk := testFullPubkeyA
+	unknownPk := testFullPubkeyB
+	insertDeclared(t, srv, hiddenPk, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	insertDeclared(t, srv, unknownPk, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	if _, err := srv.db.conn.Exec(`INSERT INTO nodes (public_key, name, role) VALUES (?, ?, 'repeater')`, hiddenPk, "🚫 ban me"); err != nil {
+		t.Fatal(err)
+	}
+	// deliberately no nodes row for unknownPk
+	srv.cfg.SetHiddenNamePrefixes([]string{"🚫"})
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 1 || got.Repeaters[0].PublicKey != unknownPk {
+		t.Fatalf("repeaters = %+v, want exactly the unknown-name target — the hidden-name-prefixed repeater must be excluded, and the nameless one must NOT be excluded merely for having no name", got.Repeaters)
+	}
+}
+
 // TestHandleScopeAuditNoDeclaredRegionsTable covers the missing-table
 // degrade path (mirrors TestHandleNodeScopesNoDeclaredRegionsTable): an
 // older database predating node_declared_regions must not fail the request.
