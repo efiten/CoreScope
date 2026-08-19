@@ -83,6 +83,58 @@
     return '<a href="#/nodes/' + encodeURIComponent(row.publicKey) + '">' + name + '</a>';
   }
 
+  // CONFIG_STATES maps ScopeAuditRow.configState (server-computed from
+  // declaredRegions + declaredWildcard — see docs/api-spec.md) to a compact
+  // badge, reusing the same .ns-decl colour vocabulary the Status column
+  // already uses on this page (node-scopes.css) rather than inventing a new
+  // one. "no-scopes" gets the warn (red) treatment because it is the
+  // headline finding this classification exists to surface — roughly a
+  // third of repeaters answering at all fall in it — but its title text
+  // carries the caveat that "*" alone does not strictly prove no region is
+  // configured, only that no region is flood-allowed (see scopeAuditConfigState
+  // in cmd/server/scopes.go): a repeater with regions defined but every one
+  // marked deny-flood looks identical from this data.
+  var CONFIG_STATES = {
+    'full': {
+      label: 'Full', cls: 'ns-decl-yes', summary: 'fully configured',
+      title: 'Declares named regions and \'*\' — forwards both its declared regions and plain unscoped floods.'
+    },
+    'no-scopes': {
+      label: 'No scopes', cls: 'ns-decl-warn', summary: 'no scopes configured',
+      title: 'Declares only \'*\', no named regions — no region is flood-allowed. Almost always means no scopes are configured at all, but a repeater with regions defined that are ALL set to deny flooding would look identical from this data alone.'
+    },
+    'no-unscoped': {
+      label: 'No unscoped', cls: 'ns-decl-quiet', summary: 'not forwarding unscoped floods',
+      title: 'Declares named regions but not \'*\' — does not forward plain unscoped floods. Exact, not an inference.'
+    },
+    'no-flood': {
+      label: 'No flood', cls: 'ns-decl-unknown', summary: 'nothing flood-allowed',
+      title: 'Declares neither named regions nor \'*\' — an answered-but-empty list. Nothing is flood-allowed by this repeater, not even plain unscoped traffic.'
+    }
+  };
+  var CONFIG_STATE_ORDER = ['no-scopes', 'no-unscoped', 'full', 'no-flood'];
+
+  function configStateHtml(row) {
+    var meta = CONFIG_STATES[row.configState];
+    return '<span class="ns-decl ' + meta.cls + '" title="' + escapeHtml(meta.title) + '">' + meta.label + '</span>';
+  }
+
+  // configStateSummaryHtml gives the reader "13 repeaters have no scopes
+  // configured" at a glance without reading every row — the counts are
+  // tallied straight off d.repeaters[].configState, the same array the table
+  // below renders, so they can never drift out of sync with the rows.
+  function configStateSummaryHtml(repeaters) {
+    var counts = { full: 0, 'no-scopes': 0, 'no-unscoped': 0, 'no-flood': 0 };
+    repeaters.forEach(function (r) { counts[r.configState]++; });
+    return '<div class="sa-summary">' +
+      CONFIG_STATE_ORDER.map(function (state) {
+        var meta = CONFIG_STATES[state];
+        return '<span class="sa-summary-item" title="' + escapeHtml(meta.title) + '">' +
+          '<span class="ns-decl ' + meta.cls + '">' + counts[state] + '</span> ' + escapeHtml(meta.summary) + '</span>';
+      }).join('') +
+      '</div>';
+  }
+
   // ambiguousCaveat flags rows with a non-zero FIX 1 ambiguity count: hops
   // whose truncated hash prefix matched more than one declared target were
   // credited to none of them, so a notObserved finding here could be a
@@ -103,6 +155,7 @@
     return '<tr>' +
       '<td class="sa-name">' + nameHtml(row) + (row.role != null && row.role !== '' ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
       '<td>' + issuesHtml + '</td>' +
+      '<td>' + configStateHtml(row) + '</td>' +
       '<td>' + scopeChips(row.declaredRegions, 'sa-chip-declared') + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + '</td>' +
       '<td>' + scopeChips(row.notObserved, 'sa-chip-missing') + ambiguousCaveat(row) + '</td>' +
       '<td>' + undeclaredChips(row.undeclaredObserved) + '</td>' +
@@ -117,9 +170,10 @@
       el.innerHTML = '<div class="ns-empty">No repeater has declared a region list yet — this fills in as devices drive and answer over RF.</div>';
       return;
     }
-    el.innerHTML = windowHonestyNote(d.window) +
+    el.innerHTML = configStateSummaryHtml(d.repeaters) +
+      windowHonestyNote(d.window) +
       '<div class="sa-table-wrap"><table class="ns-table sa-table"><thead><tr>' +
-      '<th>Repeater</th><th>Status</th><th>Declared</th><th>Not observed</th><th>Undeclared observed</th><th>Declared age</th>' +
+      '<th>Repeater</th><th>Status</th><th>Config</th><th>Declared</th><th>Not observed</th><th>Undeclared observed</th><th>Declared age</th>' +
       '</tr></thead><tbody>' +
       d.repeaters.map(rowHtml).join('') +
       '</tbody></table></div>' +

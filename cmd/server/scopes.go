@@ -551,6 +551,47 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 	return result, nil
 }
 
+// Scope audit configuration-state values — see ScopeAuditRow.ConfigState and
+// scopeAuditConfigState.
+const (
+	ScopeConfigFull       = "full"        // named regions AND '*'
+	ScopeConfigNoScopes   = "no-scopes"   // '*' only, no named regions
+	ScopeConfigNoUnscoped = "no-unscoped" // named regions, no '*'
+	ScopeConfigNoFlood    = "no-flood"    // neither named regions nor '*'
+)
+
+// scopeAuditConfigState classifies a repeater's declared-regions answer into
+// one of four configuration states, from ONLY the two fields the caller has
+// already parsed out of the raw declared list (namedRegions and wildcard) —
+// never re-derived from regions_csv, which splitRegionsCSV/normScope have
+// already reduced to exactly these two facts.
+//
+// The firmware exports the FLOOD-allowed set (region_map.exportNamesTo(...,
+// REGION_DENY_FLOOD) in examples/simple_repeater/MyMesh.cpp), so "no named
+// regions in the export" does not strictly prove "no regions defined": a
+// repeater with regions defined but every one of them marked deny-flood
+// exports exactly the same list as one with no region tree at all, and the
+// two are indistinguishable from this data alone. That caveat lands on
+// ScopeConfigNoScopes and ScopeConfigNoFlood, both of which read "zero named
+// regions in the export". It does NOT land on the wildcard half of the
+// classification: '*' absent from the export is exact, not an inference —
+// it means the wildcard denies flooding, i.e. plain unscoped floods are not
+// forwarded, full stop. That exactness is why ScopeConfigNoUnscoped needs no
+// caveat, and why ScopeConfigNoFlood's "no unscoped forwarding" half is
+// exact even though its "no named regions" half is not.
+func scopeAuditConfigState(namedRegions []string, wildcard bool) string {
+	switch {
+	case len(namedRegions) > 0 && wildcard:
+		return ScopeConfigFull
+	case len(namedRegions) == 0 && wildcard:
+		return ScopeConfigNoScopes
+	case len(namedRegions) > 0 && !wildcard:
+		return ScopeConfigNoUnscoped
+	default:
+		return ScopeConfigNoFlood
+	}
+}
+
 // ScopeAuditRow is one repeater's declared-vs-observed comparison for
 // GET /api/scope-audit — the network-wide answer to "which repeaters
 // declare a region they are not actually forwarding". Every field is
@@ -569,8 +610,14 @@ type ScopeAuditRow struct {
 
 	DeclaredRegions  []string `json:"declaredRegions"`  // '*' excluded — see DeclaredWildcard
 	DeclaredWildcard bool     `json:"declaredWildcard"` // '*' present in the raw declared list
-	DeclaredAt       string   `json:"declaredAt"`       // ISO — age of the declared answer, not the window
-	Truncated        bool     `json:"truncated"`        // declared list may have had entries silently dropped
+	// ConfigState is scopeAuditConfigState(DeclaredRegions, DeclaredWildcard)
+	// — one of ScopeConfigFull/NoScopes/NoUnscoped/NoFlood, the config-state
+	// reading of those same two fields so a caller does not have to
+	// re-derive it from them. See scopeAuditConfigState's doc comment for
+	// the caveat on the "no named regions" half of NoScopes/NoFlood.
+	ConfigState string `json:"configState"`
+	DeclaredAt  string `json:"declaredAt"` // ISO — age of the declared answer, not the window
+	Truncated   bool   `json:"truncated"`  // declared list may have had entries silently dropped
 
 	// NotObserved is declared regions with zero matched-forwarding observed
 	// in the window — the headline this endpoint exists to surface.

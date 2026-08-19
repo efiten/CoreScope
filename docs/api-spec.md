@@ -1879,6 +1879,7 @@ not being the same as "declared nothing"), which apply here identically.
       "role":             string,      // "" if unknown
       "declaredRegions":  [string],    // '*' excluded — see declaredWildcard
       "declaredWildcard": boolean,     // '*' present in the raw declared list
+      "configState":      string,      // "full" | "no-scopes" | "no-unscoped" | "no-flood" — see note below
       "declaredAt":       string (ISO),// age of the DECLARED answer, not bounded by window
       "truncated":        boolean,     // declared list may have had entries silently dropped
 
@@ -1933,6 +1934,27 @@ not being the same as "declared nothing"), which apply here identically.
 - `'*'` is never present in `declaredRegions`, `notObserved`, or `undeclaredObserved` — see
   `declaredWildcard` and `wildcardContradiction` for its dedicated (non-scope) treatment,
   same rule as the per-node endpoint.
+- `configState` is a derived reading of `declaredRegions`/`declaredWildcard` together —
+  the repeater's overall configuration shape, rather than a per-region detail:
+  - `"full"` — named regions **and** `'*'` declared: fully configured, forwards both its
+    declared regions and plain unscoped floods.
+  - `"no-scopes"` — `'*'` only, no named regions.
+  - `"no-unscoped"` — named regions declared, `'*'` absent: this repeater does **not**
+    forward plain unscoped floods. This reading is exact — `'*'` absent from the export
+    always means the wildcard denies flooding.
+  - `"no-flood"` — neither named regions nor `'*'`: the repeater answered, but nothing at
+    all is flood-allowed, not even plain unscoped traffic. The "no unscoped forwarding"
+    half of this is exact for the same reason as `"no-unscoped"`; the "no named regions"
+    half carries the same caveat as `"no-scopes"` below.
+
+  **Caveat on `"no-scopes"` and `"no-flood"`:** the firmware exports the FLOOD-*allowed*
+  set (`region_map.exportNamesTo(..., REGION_DENY_FLOOD)` in
+  `examples/simple_repeater/MyMesh.cpp`), not "every region this repeater has configured".
+  A repeater with regions defined but every one of them marked deny-flood exports exactly
+  the same list as a repeater with no region tree at all — the two are indistinguishable
+  from this data alone. In practice `"no-scopes"` is almost always "no scopes configured",
+  but a client MUST NOT present it as proven absence of configuration; word it as "no
+  region is flood-allowed" rather than "no regions exist".
 - `wildcardContradiction` is `true` when the repeater was observed forwarding unscoped
   (plain-`FLOOD`) traffic this window but its declared list omits `'*'` — it declares it
   will NOT forward those packets, and the traffic says otherwise.

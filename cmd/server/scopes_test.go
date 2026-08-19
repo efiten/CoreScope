@@ -1175,6 +1175,87 @@ func TestHandleScopeAuditNoDeclaredRegionsTable(t *testing.T) {
 	}
 }
 
+// --- Scope audit config-state classification ---
+
+// TestScopeAuditConfigStateClassification is a table-driven test of the pure
+// classification function scopeAuditConfigState — the derivation is a plain
+// switch over (namedRegions, wildcard), so each of the four cells is worth
+// pinning directly rather than only indirectly via the handler.
+func TestScopeAuditConfigStateClassification(t *testing.T) {
+	tests := []struct {
+		name         string
+		namedRegions []string
+		wildcard     bool
+		want         string
+	}{
+		{"named and wildcard", []string{"be"}, true, ScopeConfigFull},
+		{"wildcard only", nil, true, ScopeConfigNoScopes},
+		{"named only", []string{"be"}, false, ScopeConfigNoUnscoped},
+		{"neither", nil, false, ScopeConfigNoFlood},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scopeAuditConfigState(tt.namedRegions, tt.wildcard)
+			if got != tt.want {
+				t.Errorf("scopeAuditConfigState(%v, %v) = %q, want %q", tt.namedRegions, tt.wildcard, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHandleScopeAuditConfigStateAllFourShapes seeds one repeater per shape
+// of the (declaredRegions, declaredWildcard) pair — including the fourth,
+// "answered but empty" shape (no named regions AND no '*') that sits outside
+// the three named states — and confirms both that each row's ConfigState
+// lands correctly AND that tallying ConfigState across the response (the
+// same arithmetic the frontend summary line performs over d.repeaters)
+// reproduces the exact per-state counts seeded here. That second check is
+// what pins "the counts in the summary match the rows": if
+// scopeAuditConfigState mis-tags even one row, the tally computed from the
+// response no longer matches what was seeded here, and the test fails.
+func TestHandleScopeAuditConfigStateAllFourShapes(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	fullPk := strings.Repeat("11", 32)
+	noScopesPk := strings.Repeat("22", 32)
+	noUnscopedPk := strings.Repeat("33", 32)
+	noFloodPk := strings.Repeat("44", 32)
+
+	insertDeclared(t, srv, fullPk, now, "*,be", 0)
+	insertDeclared(t, srv, noScopesPk, now, "*", 0)
+	insertDeclared(t, srv, noUnscopedPk, now, "be", 0)
+	insertDeclared(t, srv, noFloodPk, now, "", 0)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 4 {
+		t.Fatalf("repeaters = %+v, want exactly 4", got.Repeaters)
+	}
+
+	want := map[string]string{
+		fullPk:       ScopeConfigFull,
+		noScopesPk:   ScopeConfigNoScopes,
+		noUnscopedPk: ScopeConfigNoUnscoped,
+		noFloodPk:    ScopeConfigNoFlood,
+	}
+	for pk, wantState := range want {
+		row := findScopeAuditRow(t, got.Repeaters, pk)
+		if row.ConfigState != wantState {
+			t.Errorf("pk %s: configState = %q, want %q", pk, row.ConfigState, wantState)
+		}
+	}
+
+	counts := map[string]int{}
+	for _, row := range got.Repeaters {
+		counts[row.ConfigState]++
+	}
+	for _, state := range []string{ScopeConfigFull, ScopeConfigNoScopes, ScopeConfigNoUnscoped, ScopeConfigNoFlood} {
+		if counts[state] != 1 {
+			t.Errorf("count of state %q across repeaters = %d, want 1 (summary tally must match the seeded rows)", state, counts[state])
+		}
+	}
+}
+
 // TestHandleNodeScopesDifferentWindowIsSeparateCacheEntry confirms the cache
 // key includes window: a request for a different window must recompute
 // rather than reuse another window's cached entry.
