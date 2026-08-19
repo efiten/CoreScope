@@ -3579,6 +3579,12 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 				declaredWildcard = true
 				continue
 			}
+			// normScope mirrors the observed side (scopes.go: agg.scopes keys
+			// are already normScope'd) — regions_csv is not guaranteed to
+			// arrive with '#' already stripped in every case, and comparing
+			// raw here would reintroduce the exact trap normScope exists to
+			// prevent, just on the other side of the comparison.
+			rgn = normScope(rgn)
 			declaredNamed = append(declaredNamed, rgn)
 			declaredSet[rgn] = true
 		}

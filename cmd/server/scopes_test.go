@@ -780,21 +780,65 @@ func TestHandleScopeAuditNormalisesHashPrefix(t *testing.T) {
 	srv, router := setupScopeAuditServer(t)
 	pk := testFullPubkeyA
 	hop := pk[:4]
-	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be-van", 0)
 	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be-van", 0)
 	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("#be-van"), RouteFlood, recent)
 
+	// FIX 2: the DECLARED side must be normalised too, not just observed.
+	// regions_csv is not guaranteed to arrive with '#' already stripped (a
+	// firmware variant, an operator-seeded row, or a future collector could
+	// leave it on) — declaring "#be-van" and observing "#be-van" (which the
+	// observed side always normalises to "be-van") must still match. Without
+	// the fix, declaredNamed/declaredSet keep the raw "#be-van", so this
+	// second repeater's row would show BOTH "#be-van" in notObserved (the
+	// declared value never matches the normalised agg.scopes key) AND
+	// "be-van" in undeclaredObserved (the normalised observed name isn't in
+	// declaredSet) — the exact trap normScope exists to prevent, reappearing
+	// on the other side of the comparison. Seeded alongside pk (not as a
+	// separate getScopeAudit call) so both land in one response and neither
+	// is masked by the 30s response cache.
+	pk2 := testFullPubkeyB
+	hop2 := pk2[:4]
+	insertDeclared(t, srv, pk2, time.Now().UTC().Format(time.RFC3339), "#be-van", 0)
+	seedTransmissionRouteAt(t, srv.store, hop2, scopeMatched("#be-van"), RouteFlood, recent)
+
 	got := getScopeAudit(t, router, "")
-	if len(got.Repeaters) != 1 {
-		t.Fatalf("repeaters = %+v, want exactly 1", got.Repeaters)
+	if len(got.Repeaters) != 2 {
+		t.Fatalf("repeaters = %+v, want exactly 2", got.Repeaters)
 	}
-	row := got.Repeaters[0]
+
+	row := findScopeAuditRow(t, got.Repeaters, pk)
 	if len(row.NotObserved) != 0 {
 		t.Errorf("notObserved = %v, want empty — declared \"be-van\" observed as \"#be-van\" must match after normalisation", row.NotObserved)
 	}
 	if len(row.UndeclaredObserved) != 0 {
 		t.Errorf("undeclaredObserved = %+v, want empty", row.UndeclaredObserved)
 	}
+
+	row2 := findScopeAuditRow(t, got.Repeaters, pk2)
+	if len(row2.DeclaredRegions) != 1 || row2.DeclaredRegions[0] != "be-van" {
+		t.Errorf("declaredRegions = %v, want [\"be-van\"] — the leading '#' must be stripped from the declared side too", row2.DeclaredRegions)
+	}
+	if len(row2.NotObserved) != 0 {
+		t.Errorf("notObserved = %v, want empty — declared \"#be-van\" observed as \"#be-van\" must match after normalising BOTH sides", row2.NotObserved)
+	}
+	if len(row2.UndeclaredObserved) != 0 {
+		t.Errorf("undeclaredObserved = %+v, want empty", row2.UndeclaredObserved)
+	}
+}
+
+// findScopeAuditRow locates the row for pk, failing the test if absent —
+// used wherever more than one repeater is seeded in the same response, since
+// sort order is not by pubkey and cannot be relied on to pick the right row.
+func findScopeAuditRow(t *testing.T, rows []ScopeAuditRow, pk string) ScopeAuditRow {
+	t.Helper()
+	for _, r := range rows {
+		if r.PublicKey == pk {
+			return r
+		}
+	}
+	t.Fatalf("no row for pubkey %s in %+v", pk, rows)
+	return ScopeAuditRow{}
 }
 
 // TestHandleScopeAuditExcludesWildcardFromComparison pins trap 2: '*' is the
