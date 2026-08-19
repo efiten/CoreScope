@@ -57,6 +57,18 @@ func handleClientRegions(store *Store, cfg *Config, tag, rxPubkey string, msg ma
 			log.Printf("MQTT [%s] regions: non-string region entry, dropping", tag)
 			return
 		}
+		// The repeater's reply is encrypted with a block cipher, so its plaintext
+		// is NUL-padded to a 16-byte boundary and the padding lands inside the LAST
+		// region name. Clients trim it since coredrive-rx v1.10.2, but a PWA keeps
+		// running its cached build until the user reloads, and this instance has no
+		// control over when eight-odd independent clients do that. Trimming here
+		// closes it once, for every client version: "belml\x00\x00" stored verbatim
+		// matches no observed scope and reads as a region the repeater declares but
+		// never forwards.
+		s = strings.TrimRight(s, "\x00")
+		if s == "" {
+			continue // padding-only entry — not a declared region
+		}
 		regions = append(regions, s)
 	}
 	truncated, _ := msg["truncated"].(bool)
