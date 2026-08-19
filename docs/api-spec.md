@@ -1352,6 +1352,13 @@ entirely: a single parked driver can log hundreds of samples at one GPS
 point, which would otherwise dominate a cell's reported noise floor and
 misrepresent what the band looks like from the road.
 
+**Deployment note:** this endpoint is gated only by `clientRfSamples.enabled`
+and has no dependency on `clientRxCoverage.enabled`. Enabling
+`clientRfSamples` without also enabling `clientRxCoverage` leaves
+`/api/rf-noise` live and returning data with no UI to reach it — the
+Coverage page (which hosts the Noise layer toggle) bails out at "Coverage is
+not enabled" before the toggle is ever rendered.
+
 ### Query Parameters
 
 | Param  | Type   | Default | Description                                             |

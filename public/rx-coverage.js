@@ -30,11 +30,13 @@
   function layerBtn(k, label) { return '<button data-layer="' + k + '"' + (k === layer ? ' class="active"' : '') + ' aria-pressed="' + (k === layer ? 'true' : 'false') + '">' + label + '</button>'; }
 
   // NOISE_QUIET_MAX / NOISE_BUSY_MIN (dBm) bucket the noise layer into 3 tiers.
-  // Production noise_floor runs about -103..-116 dBm; these thresholds are set
-  // a bit wider than that so the tiers stay meaningful as more/noisier areas
-  // get sampled, not just the current data range.
-  var NOISE_QUIET_MAX = -110; // <= this: quiet
-  var NOISE_BUSY_MIN = -100;  // >  this: busy
+  // Fitted to observed data (#4): 1241 production moving samples
+  // (stationary=0) ranged -120..-88, mass concentrated -113..-116. Cumulative
+  // counts: <= -115 → 504 (41%), -114..-108 → 581 (47%), >= -107 → ~156 (12%).
+  // -115/-108 puts all three tiers within reach of that distribution instead
+  // of leaving "busy" almost never rendered.
+  var NOISE_QUIET_MAX = -115; // <= this: quiet
+  var NOISE_BUSY_MIN = -108;  // >  this: busy
 
   // noiseColorVar reuses the coverage colour tokens (green=good, red=bad), but
   // the axis is INVERTED versus colorVar's SNR check: for noise floor, a LOW
@@ -42,7 +44,6 @@
   // (green) token, and a HIGH reading maps to "weak" (red) -- the opposite
   // comparison direction from colorVar.
   function noiseColorVar(p) {
-    if (!p || p.median_noise_floor == null) return '--nq-cov-grey';
     var m = Number(p.median_noise_floor);
     if (m <= NOISE_QUIET_MAX) return '--nq-cov-strong';
     if (m <= NOISE_BUSY_MIN) return '--nq-cov-mid';
@@ -65,13 +66,21 @@
       '</div>';
   }
 
+  // subtitleHtml reflects the active layer (#7): the "Colour = ..." clause
+  // must not keep claiming best-signal colouring while the noise legend (an
+  // inverted, opposite-direction colour axis) sits right below it.
+  function subtitleHtml() {
+    var colourText = layer === 'noise' ? 'Colour = median RF noise floor per cell.' : 'Colour = best signal per cell.';
+    return 'Where roaming CoreScope-RX clients heard nodes. ' + colourText + ' <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a>';
+  }
+
   function pageHtml() {
     var layerBar = window.MC_CLIENT_RF_SAMPLES
       ? '<div class="analytics-time-range" id="rxLayerBar" style="margin:8px 0">' + layerBtn('signal', 'Signal') + layerBtn('noise', 'Noise') + '</div>'
       : '';
     return '<div style="max-width:1100px;margin:0 auto;padding:12px 16px">' +
       '<h2 style="margin:4px 0 2px;font-size:18px">🗺️ Mobile RX coverage</h2>' +
-      '<div style="color:var(--text-muted);font-size:11px">Where roaming CoreScope-RX clients heard nodes. Colour = best signal per cell. <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a></div>' +
+      '<div style="color:var(--text-muted);font-size:11px" id="rxSubtitle">' + subtitleHtml() + '</div>' +
       '<div class="analytics-time-range" id="rxDays" style="margin:8px 0">' + dayBtn(1) + dayBtn(7) + dayBtn(14) + dayBtn(30) + '</div>' +
       layerBar +
       legendHtml() +
@@ -155,7 +164,11 @@
         L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: fillOpacityFor(f.properties) }).addTo(covLayer)
           .bindTooltip(coverageNodesHtml(f.properties));
       });
-    }).catch(function (e) { console.warn('rx-coverage: coverage fetch failed', e); });
+    }).catch(function (e) {
+      console.warn('rx-coverage: coverage fetch failed', e);
+      // #1: never leave stale hexes from a previous layer/view on screen.
+      if (!destroyed && covLayer && layer === 'signal') covLayer.clearLayers();
+    });
   }
 
   function drawNoiseLayer(bbox) {
@@ -171,18 +184,33 @@
         L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: noiseFillOpacityFor(f.properties) }).addTo(covLayer)
           .bindTooltip(noiseCellHtml(f.properties));
       });
-    }).catch(function (e) { console.warn('rx-coverage: noise fetch failed', e); });
+    }).catch(function (e) {
+      console.warn('rx-coverage: noise fetch failed', e);
+      // #1/#2: a slow/failing request must not leave the map showing the
+      // other layer's hexes under the noise legend, nor sit there blank and
+      // unlabelled indistinguishable from "no samples in this view".
+      if (destroyed || !covLayer || layer !== 'noise') return;
+      covLayer.clearLayers();
+      setNoiseEmpty(true, 'Could not load noise samples. Pan or zoom to retry.');
+    });
   }
 
   // setNoiseEmpty toggles the "no samples in this view" message. Only shown
   // on the noise layer — MC_CLIENT_RF_SAMPLES already keeps the toggle (and
   // so this layer) out of reach entirely when the feature is off, so seeing
-  // this message always means "on, but nothing sampled here yet", never
-  // "feature disabled" (the two states this project keeps needing to keep
-  // distinct).
-  function setNoiseEmpty(show) {
+  // this message always means "on", never "feature disabled" (the two states
+  // this project keeps needing to keep distinct). `text` overrides the
+  // default no-samples copy for the fetch-failed case (#2), which must read
+  // as distinctly different — and retryable — from "no samples here yet".
+  function setNoiseEmpty(show, text) {
     var el = document.getElementById('rxNoiseEmpty');
-    if (el) el.style.display = (show && layer === 'noise') ? 'block' : 'none';
+    if (!el) return;
+    if (show && layer === 'noise') {
+      el.textContent = text || 'No RF samples in this view yet.';
+      el.style.display = 'block';
+    } else {
+      el.style.display = 'none';
+    }
   }
 
   function drawCoverage() {
@@ -321,10 +349,16 @@
   function setLayer(l) {
     if (l === layer) return;
     layer = l;
+    // Clear the old layer's polygons synchronously (#1): the legend swap
+    // below is synchronous too, so a slow/failed fetch must never leave the
+    // previous layer's hexes on screen under the new layer's legend/tooltips.
+    if (covLayer) covLayer.clearLayers();
     var bar = document.getElementById('rxLayerBar');
     if (bar) bar.querySelectorAll('button').forEach(function (b) { b.classList.toggle('active', b.dataset.layer === l); });
     var legend = document.getElementById('rxLegend');
     if (legend) legend.outerHTML = legendHtml();
+    var subtitle = document.getElementById('rxSubtitle');
+    if (subtitle) subtitle.innerHTML = subtitleHtml();
     setNoiseEmpty(false);
     drawCoverage(); syncHash();
   }

@@ -79,6 +79,15 @@ func TestAggregateRfNoiseCapsFeatures(t *testing.T) {
 		lon := 10.0 + float64(i%side)*0.1
 		rows = append(rows, rfNoiseRow{Lat: lat, Lon: lon, NoiseFloor: -110})
 	}
+	// Seed one cell with a much higher sample count than the rest (#5): every
+	// other cell above has count == 1, so a cap comparator that only exercises
+	// the cell-id tie-break (or is inverted to keep the sparsest cells) would
+	// still pass without this. This cell — the busiest by far — must be the
+	// one the cap keeps, not the one it cuts.
+	hotLat, hotLon := 10.0, 10.0
+	for i := 0; i < 50; i++ {
+		rows = append(rows, rfNoiseRow{Lat: hotLat, Lon: hotLon, NoiseFloor: -110})
+	}
 	fc := aggregateRfNoise(rows, 9)
 	if len(fc.Features) != rfNoiseFeatureCap || !fc.Truncated {
 		t.Fatalf("want %d features + truncated, got %d truncated=%v", rfNoiseFeatureCap, len(fc.Features), fc.Truncated)
@@ -87,6 +96,19 @@ func TestAggregateRfNoiseCapsFeatures(t *testing.T) {
 		if fc.Features[i-1].Properties.Cell > fc.Features[i].Properties.Cell {
 			t.Fatalf("truncated features not sorted by cell at %d", i)
 		}
+	}
+	hotCell := hexCellAt(hotLat, hotLon, 9)
+	found := false
+	for _, f := range fc.Features {
+		if f.Properties.Cell == hotCell {
+			found = true
+			if f.Properties.Count < 51 {
+				t.Fatalf("hot cell count = %d, want >= 51", f.Properties.Count)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("the densest cell was dropped by the cap; want the densest cells kept")
 	}
 	small := aggregateRfNoise(rows[:10], 9)
 	if small.Truncated {
@@ -187,6 +209,7 @@ func serveRfNoise(srv *Server, path string) *httptest.ResponseRecorder {
 func TestRfNoiseEndpointGeoJSON(t *testing.T) {
 	db := seedRfNoiseDB(t)
 	now := time.Now().UTC().Format(time.RFC3339)
+	outsideWindow := time.Now().UTC().AddDate(0, 0, -40).Format(time.RFC3339)
 	mustExecDB(t, db, `INSERT INTO client_rf_samples (rx_pubkey,sampled_at,ingested_at,lat,lon,stationary,uptime_secs,noise_floor)
 		VALUES ('comp','`+now+`','t',51.05,3.72,0,100,-112)`)
 	// A parked sample in the same cell/window must not affect the response.
@@ -195,6 +218,12 @@ func TestRfNoiseEndpointGeoJSON(t *testing.T) {
 	// A row with no noise_floor reading must be skipped, not counted/crash.
 	mustExecDB(t, db, `INSERT INTO client_rf_samples (rx_pubkey,sampled_at,ingested_at,lat,lon,stationary,uptime_secs,noise_floor)
 		VALUES ('comp','`+now+`','t',51.05,3.72,0,100,NULL)`)
+	// A row outside the days=30 window (#3) must not be counted.
+	mustExecDB(t, db, `INSERT INTO client_rf_samples (rx_pubkey,sampled_at,ingested_at,lat,lon,stationary,uptime_secs,noise_floor)
+		VALUES ('comp','`+outsideWindow+`','t',51.05,3.72,0,100,-105)`)
+	// A row outside the bbox=50,3,52,4 window (#3) must not be counted.
+	mustExecDB(t, db, `INSERT INTO client_rf_samples (rx_pubkey,sampled_at,ingested_at,lat,lon,stationary,uptime_secs,noise_floor)
+		VALUES ('comp','`+now+`','t',10.0,10.0,0,100,-105)`)
 	srv := &Server{db: db, cfg: &Config{ClientRfSamples: &ClientRfSamplesConfig{Enabled: true}}}
 
 	rr := serveRfNoise(srv, "/api/rf-noise?bbox=50,3,52,4&z=12&days=30")
@@ -218,9 +247,11 @@ func TestRfNoiseEndpointGeoJSON(t *testing.T) {
 	}
 }
 
-// TestRfNoiseEndpointGatedOff404sEvenWithData verifies requireClientRfSamples
-// runs before any DB access — the endpoint 404s regardless of what data
-// exists once the feature flag is off.
+// TestRfNoiseEndpointGatedOff404sEvenWithData verifies the endpoint 404s
+// when the feature flag is off even though matching rows exist in the DB.
+// It does not verify requireClientRfSamples runs before the DB query (a gate
+// checked after the query would also 404 here) — that ordering is correct
+// by inspection of handleRfNoise, not exercised by this test.
 func TestRfNoiseEndpointGatedOff404sEvenWithData(t *testing.T) {
 	db := seedRfNoiseDB(t)
 	mustExecDB(t, db, `INSERT INTO client_rf_samples (rx_pubkey,sampled_at,ingested_at,lat,lon,stationary,uptime_secs,noise_floor)
