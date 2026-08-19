@@ -73,6 +73,12 @@ func (s *Store) StartNeighborEdgesBuilder(interval time.Duration) func() {
 	if err := s.RefreshNeighborGraph(); err != nil {
 		log.Printf("[neighbor-build] initial neighbor-graph refresh error: %v", err)
 	}
+	// Prime the geo index (geo_hop.go) so the very first client
+	// reception with a 1-byte hop after startup can be resolved
+	// geographically.
+	if err := s.RefreshGeoIndex(); err != nil {
+		log.Printf("[neighbor-build] initial geo-index refresh error: %v", err)
+	}
 	for {
 		n, err := s.buildAndPersistNeighborEdges()
 		if err != nil {
@@ -106,6 +112,12 @@ func (s *Store) StartNeighborEdgesBuilder(interval time.Duration) func() {
 				// newly persisted adjacencies on the next ingest.
 				if grErr := s.RefreshNeighborGraph(); grErr != nil {
 					log.Printf("[neighbor-build] neighbor-graph refresh error: %v", grErr)
+				}
+				// Refresh the geo index alongside the other node-derived
+				// caches so a node's position update is reflected within
+				// a tick.
+				if geoErr := s.RefreshGeoIndex(); geoErr != nil {
+					log.Printf("[neighbor-build] geo-index refresh error: %v", geoErr)
 				}
 				dur := time.Since(start)
 				if err != nil {
