@@ -57,12 +57,13 @@
   // !! Keep in sync with public/bottom-nav.js MORE_ROUTES.
   // `ph` is the Phosphor icon id (no "ph-" prefix); see public/icons/phosphor-sprite.svg.
   var ROUTES = [
-    { route: 'nodes',     hash: '#/nodes',     label: 'Nodes',     ph: 'monitor' },
-    { route: 'tools',     hash: '#/tools',     label: 'Tools',     ph: 'wrench' },
-    { route: 'observers', hash: '#/observers', label: 'Observers', ph: 'eye' },
-    { route: 'analytics', hash: '#/analytics', label: 'Analytics', ph: 'chart-bar' },
-    { route: 'perf',      hash: '#/perf',      label: 'Perf',      ph: 'lightning' },
-    { route: 'audio-lab', hash: '#/audio-lab', label: 'Audio Lab', ph: 'music-note' },
+    { route: 'nodes',       hash: '#/nodes',       label: 'Nodes',       ph: 'monitor' },
+    { route: 'tools',       hash: '#/tools',       label: 'Tools',       ph: 'wrench' },
+    { route: 'observers',   hash: '#/observers',   label: 'Observers',   ph: 'eye' },
+    { route: 'analytics',   hash: '#/analytics',   label: 'Analytics',   ph: 'chart-bar' },
+    { route: 'scope-audit', hash: '#/scope-audit', label: 'Scope Audit', ph: 'scales' },
+    { route: 'perf',        hash: '#/perf',        label: 'Perf',        ph: 'lightning' },
+    { route: 'audio-lab',   hash: '#/audio-lab',   label: 'Audio Lab',   ph: 'music-note' },
   ];
 
   // Coverage is opt-in (config `clientRxCoverage`). roles.js injects its link

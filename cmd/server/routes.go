@@ -65,6 +65,12 @@ type Server struct {
 	scopeStatsCache    map[string]*ScopeStatsResponse
 	scopeStatsCachedAt map[string]time.Time
 
+	// Cached /api/scope-audit response — per-window, recomputed at most once
+	// every 30s, mirroring scopeStats above. See scopes.go.
+	scopeAuditMu       sync.Mutex
+	scopeAuditCache    map[string]*ScopeAuditResponse
+	scopeAuditCachedAt map[string]time.Time
+
 	// Router reference for OpenAPI spec generation
 	router *mux.Router
 
@@ -234,6 +240,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/health", s.handleHealth).Methods("GET")
 	r.HandleFunc("/api/stats", s.handleStats).Methods("GET")
 	r.HandleFunc("/api/scope-stats", s.handleScopeStats).Methods("GET")
+	r.HandleFunc("/api/scope-audit", s.handleScopeAudit).Methods("GET")
 	r.HandleFunc("/api/perf", s.handlePerf).Methods("GET")
 	r.HandleFunc("/api/perf/io", s.handlePerfIO).Methods("GET")
 	r.HandleFunc("/api/perf/sqlite", s.handlePerfSqlite).Methods("GET")
@@ -3494,6 +3501,165 @@ func (s *Server) handleScopeStats(w http.ResponseWriter, r *http.Request) {
 	s.scopeStatsCache[window] = resp
 	s.scopeStatsCachedAt[window] = time.Now()
 	s.scopeStatsMu.Unlock()
+
+	writeJSON(w, resp)
+}
+
+// handleScopeAudit serves GET /api/scope-audit?window=1h|24h|7d: the
+// network-wide answer to "which repeaters declare a region they are not
+// actually forwarding". Unlike the per-repeater /api/nodes/{pubkey}/scopes,
+// this compares every repeater that has ever declared a region list in one
+// pass — see scopes.go's AllCurrentDeclaredRegions and ScopeAuditForwarding
+// for why that stays a single scan rather than one query per repeater.
+func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
+	const scopeAuditTTL = 30 * time.Second
+
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "24h"
+	}
+	lookback, ok := nodeScopesWindowLookback(window)
+	if !ok {
+		writeError(w, 400, "window must be 1h, 24h, or 7d")
+		return
+	}
+
+	s.scopeAuditMu.Lock()
+	if s.scopeAuditCache != nil {
+		if cached, ok := s.scopeAuditCache[window]; ok && time.Since(s.scopeAuditCachedAt[window]) < scopeAuditTTL {
+			s.scopeAuditMu.Unlock()
+			writeJSON(w, cached)
+			return
+		}
+	}
+	s.scopeAuditMu.Unlock()
+
+	declared, err := s.db.AllCurrentDeclaredRegions()
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	targets := make([]string, 0, len(declared))
+	for _, d := range declared {
+		targets = append(targets, strings.ToLower(d.Target))
+	}
+
+	sinceISO := time.Now().Add(-lookback).UTC().Format(time.RFC3339)
+	forwarding := map[string]*scopeAuditTargetAgg{}
+	if s.store != nil {
+		forwarding, err = s.store.ScopeAuditForwarding(sinceISO, targets)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+
+	identities := s.db.scopeAuditNodeIdentities(targets)
+
+	resp := &ScopeAuditResponse{Window: window, Since: sinceISO, Repeaters: []ScopeAuditRow{}}
+	for _, d := range declared {
+		pk := strings.ToLower(d.Target)
+		if s.cfg != nil && s.cfg.IsBlacklisted(pk) {
+			continue
+		}
+		id := identities[pk]
+		if s.cfg != nil && s.cfg.IsNameHidden(id.Name) {
+			continue
+		}
+
+		allRegions := splitRegionsCSV(d.RegionsCSV)
+		declaredWildcard := false
+		declaredNamed := make([]string, 0, len(allRegions))
+		declaredSet := make(map[string]bool, len(allRegions))
+		for _, rgn := range allRegions {
+			if rgn == "*" {
+				declaredWildcard = true
+				continue
+			}
+			declaredNamed = append(declaredNamed, rgn)
+			declaredSet[rgn] = true
+		}
+
+		agg := forwarding[pk]
+
+		notObserved := []string{}
+		for _, rgn := range declaredNamed {
+			if agg == nil || agg.scopes[rgn] == nil {
+				notObserved = append(notObserved, rgn)
+			}
+		}
+
+		undeclared := []ScopeObservation{}
+		if agg != nil {
+			names := make([]string, 0, len(agg.scopes))
+			for name := range agg.scopes {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				if !declaredSet[name] {
+					undeclared = append(undeclared, *agg.scopes[name])
+				}
+			}
+		}
+
+		var unscopedPackets int64
+		if agg != nil {
+			unscopedPackets = agg.unscopedPackets
+		}
+
+		resp.Repeaters = append(resp.Repeaters, ScopeAuditRow{
+			PublicKey:               pk,
+			Name:                    id.Name,
+			Role:                    id.Role,
+			DeclaredRegions:         declaredNamed,
+			DeclaredWildcard:        declaredWildcard,
+			DeclaredAt:              d.ObservedAt,
+			Truncated:               d.Truncated,
+			NotObserved:             notObserved,
+			UndeclaredObserved:      undeclared,
+			ObservedUnscopedPackets: unscopedPackets,
+			WildcardContradiction:   unscopedPackets > 0 && !declaredWildcard,
+		})
+	}
+
+	// Interesting rows first: a repeater silently not forwarding a declared
+	// region is the headline this endpoint exists to surface, ranked by how
+	// many declared regions it's missing. The wildcard contradiction and
+	// undeclared-observed counts are secondary tie-breaks — flags on the
+	// row, not a separate ranking. Full agreement (no issues at all) sorts
+	// to the bottom, alphabetically, so it doesn't crowd out the rows that
+	// matter.
+	sort.Slice(resp.Repeaters, func(i, j int) bool {
+		a, b := resp.Repeaters[i], resp.Repeaters[j]
+		if len(a.NotObserved) != len(b.NotObserved) {
+			return len(a.NotObserved) > len(b.NotObserved)
+		}
+		if a.WildcardContradiction != b.WildcardContradiction {
+			return a.WildcardContradiction
+		}
+		if len(a.UndeclaredObserved) != len(b.UndeclaredObserved) {
+			return len(a.UndeclaredObserved) > len(b.UndeclaredObserved)
+		}
+		an, bn := a.Name, b.Name
+		if an == "" {
+			an = a.PublicKey
+		}
+		if bn == "" {
+			bn = b.PublicKey
+		}
+		return an < bn
+	})
+
+	s.scopeAuditMu.Lock()
+	if s.scopeAuditCache == nil {
+		s.scopeAuditCache = make(map[string]*ScopeAuditResponse)
+		s.scopeAuditCachedAt = make(map[string]time.Time)
+	}
+	s.scopeAuditCache[window] = resp
+	s.scopeAuditCachedAt[window] = time.Now()
+	s.scopeAuditMu.Unlock()
 
 	writeJSON(w, resp)
 }

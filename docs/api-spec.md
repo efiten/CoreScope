@@ -42,6 +42,7 @@
 - [GET /api/analytics/subpaths](#get-apianalyticssubpaths)
 - [GET /api/analytics/subpath-detail](#get-apianalyticssubpath-detail)
 - [GET /api/scope-stats](#get-apiscope-stats)
+- [GET /api/scope-audit](#get-apiscope-audit)
 - [GET /api/resolve-hops](#get-apiresolve-hops)
 - [GET /api/traces/:hash](#get-apitraceshash)
 - [GET /api/config/theme](#get-apiconfigtheme)
@@ -1780,6 +1781,87 @@ Scope-based packet statistics over a time window. Requires ingestor `scope_name_
 ```json
 { "error": "scope_name column not present — run ingestor to apply migrations" }
 ```
+
+---
+
+## GET /api/scope-audit
+
+Network-wide declared-vs-observed region-scope comparison: for every repeater that has
+ever successfully answered a declared-regions request, which of its declared regions have
+no observed forwarding in the window, which scopes it forwards without declaring, and
+whether it contradicts its own `'*'` wildcard. This is the whole-network answer to the
+question `GET /api/nodes/:pubkey/scopes` answers one repeater at a time — see that
+endpoint's notes for the full explanation of the three traps this comparison has to get
+right (the `#`-prefix spelling difference, `'*'` not being a scope, and "never asked"
+not being the same as "declared nothing"), which apply here identically.
+
+### Query Parameters
+
+| Param    | Type   | Default | Description                    |
+|----------|--------|---------|---------------------------------|
+| `window` | string | `24h`   | Time window: `1h`, `24h`, `7d` |
+
+### Response `200`
+
+```jsonc
+{
+  "window": string,                    // echoed window ("1h", "24h", or "7d")
+  "since":  string (ISO),              // start of the observed-forwarding window
+  "repeaters": [
+    {
+      "publicKey":        string,
+      "name":             string,      // "" if the node row is gone (pruned/deleted)
+      "role":             string,      // "" if unknown
+      "declaredRegions":  [string],    // '*' excluded — see declaredWildcard
+      "declaredWildcard": boolean,     // '*' present in the raw declared list
+      "declaredAt":       string (ISO),// age of the DECLARED answer, not bounded by window
+      "truncated":        boolean,     // declared list may have had entries silently dropped
+
+      "notObserved":            [string],            // declared regions with zero matched-forwarding observed this window
+      "undeclaredObserved":     [
+        { "scope": string, "packets": number, "firstSeen": string (ISO), "lastSeen": string (ISO) }
+      ],
+      "observedUnscopedPackets": number,               // plain-FLOOD packets forwarded this window
+      "wildcardContradiction":   boolean               // observed unscoped forwarding but '*' not declared
+    }
+  ]
+}
+```
+
+### Response `400`
+
+```json
+{ "error": "window must be 1h, 24h, or 7d" }
+```
+
+**Notes:**
+- Only repeaters with **at least one** declared-regions answer appear in `repeaters`. A
+  repeater that was never successfully asked is absent, not shown as a row that declares
+  nothing — those are different facts (see `GET /api/nodes/:pubkey/scopes`'s "never asked"
+  note).
+- `window` bounds `notObserved` / `undeclaredObserved` / `observedUnscopedPackets` only —
+  `declaredAt` is always the latest declared reading regardless of age, exactly like
+  `declared.observedAt` on the per-node endpoint. **A "declared but not observed" result
+  is weak evidence at `window=1h` (a quiet region can simply have had no traffic) and much
+  stronger at `window=7d`; a client MUST show which window a result belongs to and must
+  not present a `1h` result as if it were `7d`.**
+- All scope names in `declaredRegions` / `notObserved` / `undeclaredObserved[].scope` are
+  already normalised (no leading `#`) — the server does the `#`/no-`#` reconciliation
+  described on the per-node endpoint so this response is directly comparable without a
+  client-side normalisation step.
+- `'*'` is never present in `declaredRegions`, `notObserved`, or `undeclaredObserved` — see
+  `declaredWildcard` and `wildcardContradiction` for its dedicated (non-scope) treatment,
+  same rule as the per-node endpoint.
+- `wildcardContradiction` is `true` when the repeater was observed forwarding unscoped
+  (plain-`FLOOD`) traffic this window but its declared list omits `'*'` — it declares it
+  will NOT forward those packets, and the traffic says otherwise.
+- Rows are sorted with the interesting cases first: most `notObserved` entries first, then
+  `wildcardContradiction`, then most `undeclaredObserved` entries, then alphabetically by
+  name. A repeater in full agreement (no `notObserved`, no `wildcardContradiction`, no
+  `undeclaredObserved`) sorts to the bottom.
+- Cached 30 seconds per window, mirroring `/api/scope-stats`.
+- Blacklisted nodes and nodes matching an operator-configured hidden-name prefix are
+  excluded, same as other multi-node endpoints.
 
 ---
 

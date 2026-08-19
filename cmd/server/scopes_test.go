@@ -731,6 +731,251 @@ func TestHandleNodeScopesServesFromCache(t *testing.T) {
 	}
 }
 
+// --- GET /api/scope-audit handler tests ---
+
+// setupScopeAuditServer extends setupNodeScopesServer's schema with a
+// minimal nodes table (public_key/name/role) so scopeAuditNodeIdentities has
+// something to join against.
+func setupScopeAuditServer(t *testing.T) (*Server, *mux.Router) {
+	t.Helper()
+	srv, router := setupNodeScopesServer(t)
+	if _, err := srv.db.conn.Exec(`CREATE TABLE nodes (public_key TEXT PRIMARY KEY, name TEXT, role TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	return srv, router
+}
+
+// insertDeclared seeds one node_declared_regions row (the latest-observed_at
+// row wins per target, mirroring AllCurrentDeclaredRegions).
+func insertDeclared(t *testing.T, srv *Server, target, observedAt, regionsCSV string, truncated int) {
+	t.Helper()
+	if _, err := srv.db.conn.Exec(`
+		INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
+		VALUES (?, 'rxpubkeyhex', ?, ?, ?, ?)`,
+		target, observedAt, observedAt, regionsCSV, truncated); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func getScopeAudit(t *testing.T, router *mux.Router, query string) ScopeAuditResponse {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/api/scope-audit"+query, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var got ScopeAuditResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return got
+}
+
+// TestHandleScopeAuditNormalisesHashPrefix pins trap 1: transmissions.scope_name
+// keeps the '#' (hashRegions config), regions_csv arrives from the firmware
+// with it already stripped. Declared "be-van" and observed "#be-van" must be
+// recognised as the same scope, not reported as both missing and undeclared.
+func TestHandleScopeAuditNormalisesHashPrefix(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	hop := pk[:4]
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be-van", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("#be-van"), RouteFlood, recent)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 1 {
+		t.Fatalf("repeaters = %+v, want exactly 1", got.Repeaters)
+	}
+	row := got.Repeaters[0]
+	if len(row.NotObserved) != 0 {
+		t.Errorf("notObserved = %v, want empty — declared \"be-van\" observed as \"#be-van\" must match after normalisation", row.NotObserved)
+	}
+	if len(row.UndeclaredObserved) != 0 {
+		t.Errorf("undeclaredObserved = %+v, want empty", row.UndeclaredObserved)
+	}
+}
+
+// TestHandleScopeAuditExcludesWildcardFromComparison pins trap 2: '*' is the
+// root of the region tree (governs plain FLOOD), not a scope. It must never
+// appear in declaredRegions (or its count) or in notObserved/undeclaredObserved.
+func TestHandleScopeAuditExcludesWildcardFromComparison(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "*,be", 0)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 1 {
+		t.Fatalf("repeaters = %+v, want 1", got.Repeaters)
+	}
+	row := got.Repeaters[0]
+	if !row.DeclaredWildcard {
+		t.Error("declaredWildcard = false, want true")
+	}
+	if len(row.DeclaredRegions) != 1 || row.DeclaredRegions[0] != "be" {
+		t.Errorf("declaredRegions = %v, want [\"be\"] — '*' must be excluded from the region list and its count", row.DeclaredRegions)
+	}
+	for _, r := range row.NotObserved {
+		if r == "*" {
+			t.Error("notObserved contains '*' — it must never be treated as a scope")
+		}
+	}
+}
+
+// TestHandleScopeAuditOmitsRepeaterWithNoDeclaredRow pins trap 3: a repeater
+// that was never successfully asked is absent from the response entirely —
+// not shown as a row declaring nothing, which is a distinct, meaningful fact.
+func TestHandleScopeAuditOmitsRepeaterWithNoDeclaredRow(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	declaredPk := testFullPubkeyA
+	neverAskedPk := testFullPubkeyB
+	insertDeclared(t, srv, declaredPk, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	if _, err := srv.db.conn.Exec(`INSERT INTO nodes (public_key, name, role) VALUES (?, 'never-asked', 'repeater')`, neverAskedPk); err != nil {
+		t.Fatal(err)
+	}
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 1 || got.Repeaters[0].PublicKey != declaredPk {
+		t.Fatalf("repeaters = %+v, want exactly the one repeater that has declared", got.Repeaters)
+	}
+}
+
+// TestHandleScopeAuditWildcardContradiction: observed forwarding unscoped
+// (plain-FLOOD) traffic while the declared list omits '*' is the wildcard
+// contradiction this endpoint must flag — the repeater says it does NOT
+// forward those packets, and the traffic says otherwise.
+func TestHandleScopeAuditWildcardContradiction(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	hop := pk[:4]
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be", 0) // no '*'
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeUnscoped(), RouteFlood, recent)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 1 {
+		t.Fatalf("repeaters = %+v, want 1", got.Repeaters)
+	}
+	row := got.Repeaters[0]
+	if !row.WildcardContradiction {
+		t.Error("wildcardContradiction = false, want true — observed unscoped forwarding but '*' not declared")
+	}
+	if row.ObservedUnscopedPackets != 1 {
+		t.Errorf("observedUnscopedPackets = %d, want 1", row.ObservedUnscopedPackets)
+	}
+}
+
+// TestHandleScopeAuditWildcardDeclaredIsNotAContradiction is the other half:
+// the same observed unscoped traffic is expected, not a contradiction, once
+// '*' is declared.
+func TestHandleScopeAuditWildcardDeclaredIsNotAContradiction(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	hop := pk[:4]
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "*,be", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeUnscoped(), RouteFlood, recent)
+
+	got := getScopeAudit(t, router, "")
+	if got.Repeaters[0].WildcardContradiction {
+		t.Error("wildcardContradiction = true, want false — '*' IS declared, so unscoped forwarding is expected")
+	}
+}
+
+// TestHandleScopeAuditNotObservedAndUndeclaredObserved exercises both
+// comparison directions in one repeater: a declared region with zero
+// observed forwarding, and an observed scope absent from the declared list.
+func TestHandleScopeAuditNotObservedAndUndeclaredObserved(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	hop := pk[:4]
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be,be-vlg", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("#be"), RouteFlood, recent)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("#de-nw"), RouteFlood, recent)
+
+	got := getScopeAudit(t, router, "")
+	row := got.Repeaters[0]
+	if len(row.NotObserved) != 1 || row.NotObserved[0] != "be-vlg" {
+		t.Errorf("notObserved = %v, want [\"be-vlg\"]", row.NotObserved)
+	}
+	if len(row.UndeclaredObserved) != 1 || row.UndeclaredObserved[0].Scope != "de-nw" {
+		t.Errorf("undeclaredObserved = %+v, want exactly \"de-nw\"", row.UndeclaredObserved)
+	}
+}
+
+// TestHandleScopeAuditSortsMissingRegionsFirst: the repeater with a declared
+// region it is not forwarding must rank above a repeater in full agreement —
+// that's the headline this endpoint exists to surface, not the boring majority.
+func TestHandleScopeAuditSortsMissingRegionsFirst(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	agreePk := testFullPubkeyA
+	missingPk := testFullPubkeyB
+	agreeHop := agreePk[:4]
+	missingHop := missingPk[:4]
+	insertDeclared(t, srv, agreePk, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	insertDeclared(t, srv, missingPk, time.Now().UTC().Format(time.RFC3339), "be,be-vlg", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, agreeHop, scopeMatched("#be"), RouteFlood, recent)
+	seedTransmissionRouteAt(t, srv.store, missingHop, scopeMatched("#be"), RouteFlood, recent)
+	// missingPk never forwards be-vlg -> 1 missing declared region; agreePk has 0.
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 2 {
+		t.Fatalf("repeaters = %+v, want 2", got.Repeaters)
+	}
+	if got.Repeaters[0].PublicKey != missingPk {
+		t.Errorf("repeaters[0] = %s, want %s (the row missing a declared region) ranked first", got.Repeaters[0].PublicKey, missingPk)
+	}
+}
+
+// TestHandleScopeAuditWindowVocabulary confirms this endpoint matches the
+// vocabulary used by the sibling /api/scope-stats and /api/nodes/{pubkey}/scopes
+// endpoints (1h, 24h, 7d), not the broader ParseTimeWindow alias set.
+func TestHandleScopeAuditWindowVocabulary(t *testing.T) {
+	_, router := setupScopeAuditServer(t)
+	req := httptest.NewRequest("GET", "/api/scope-audit?window=30d", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("window=30d: status = %d, want 400 (not part of this endpoint's vocabulary)", w.Code)
+	}
+}
+
+// TestHandleScopeAuditFiltersBlacklistedNode confirms a blacklisted repeater
+// is dropped from the audit even though it has declared a region list,
+// mirroring the blacklist filtering applied by other multi-node endpoints.
+func TestHandleScopeAuditFiltersBlacklistedNode(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	srv.cfg.NodeBlacklist = []string{pk}
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 0 {
+		t.Errorf("repeaters = %+v, want empty — blacklisted node must be excluded", got.Repeaters)
+	}
+}
+
+// TestHandleScopeAuditNoDeclaredRegionsTable covers the missing-table
+// degrade path (mirrors TestHandleNodeScopesNoDeclaredRegionsTable): an
+// older database predating node_declared_regions must not fail the request.
+func TestHandleScopeAuditNoDeclaredRegionsTable(t *testing.T) {
+	db := setupScopeConformanceDB(t) // no node_declared_regions table at all
+	cfg := &Config{Port: 3000}
+	hub := NewHub()
+	srv := NewServer(db, cfg, hub)
+	srv.store = newTestStoreWithDB(t, db, cfg)
+	router := mux.NewRouter()
+	srv.RegisterRoutes(router)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 0 {
+		t.Errorf("repeaters = %+v, want empty when node_declared_regions doesn't exist", got.Repeaters)
+	}
+}
+
 // TestHandleNodeScopesDifferentWindowIsSeparateCacheEntry confirms the cache
 // key includes window: a request for a different window must recompute
 // rather than reuse another window's cached entry.

@@ -25,6 +25,7 @@
     "/api/perf/write-sources",
     "/api/rx-coverage",
     "/api/rx-leaderboard",
+    "/api/scope-audit",
     "/api/scope-stats",
     "/api/spec"
   ]
