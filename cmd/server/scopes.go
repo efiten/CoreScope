@@ -329,8 +329,8 @@ func (db *DB) AllCurrentDeclaredRegions() ([]DeclaredRegionsRow, error) {
 // scope-audit row, resolved in bulk (one IN query for every declared
 // target) rather than one GetNodeByPubkey call per repeater.
 type scopeAuditNodeIdentity struct {
-	Name string
-	Role string
+	Name *string
+	Role *string
 }
 
 // scopeAuditNodeIdentities resolves name/role for pubkeys in a single query.
@@ -361,7 +361,16 @@ func (db *DB) scopeAuditNodeIdentities(pubkeys []string) map[string]scopeAuditNo
 		if rows.Scan(&pk, &name, &role) != nil {
 			continue
 		}
-		result[strings.ToLower(pk)] = scopeAuditNodeIdentity{Name: name.String, Role: role.String}
+		id := scopeAuditNodeIdentity{}
+		if name.Valid {
+			v := name.String
+			id.Name = &v
+		}
+		if role.Valid {
+			v := role.String
+			id.Role = &v
+		}
+		result[strings.ToLower(pk)] = id
 	}
 	return result
 }
@@ -514,8 +523,13 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 // WildcardContradiction for its counterpart.
 type ScopeAuditRow struct {
 	PublicKey string `json:"publicKey"`
-	Name      string `json:"name"`
-	Role      string `json:"role"`
+	// Name/Role are pointers so "we hold no nodes row for this target" serialises
+	// as null rather than "". A declared-regions row can name a repeater this
+	// instance has never recorded, and an empty string would make that
+	// indistinguishable from a node we DO know that simply has no name — the
+	// same absent-is-not-empty rule the declared side already follows.
+	Name *string `json:"name"`
+	Role *string `json:"role"`
 
 	DeclaredRegions  []string `json:"declaredRegions"`  // '*' excluded — see DeclaredWildcard
 	DeclaredWildcard bool     `json:"declaredWildcard"` // '*' present in the raw declared list

@@ -841,6 +841,43 @@ func TestHandleScopeAuditOmitsRepeaterWithNoDeclaredRow(t *testing.T) {
 	}
 }
 
+// TestHandleScopeAuditUnknownNodeNameIsNullNotEmpty proves a declared target
+// this instance holds no nodes row for serialises name/role as null, not "".
+// A declared-regions answer can name a repeater the network has never recorded,
+// and "" would make that indistinguishable from a node we DO know that simply
+// has no name — the same absent-is-not-empty rule the declared side follows.
+func TestHandleScopeAuditUnknownNodeNameIsNullNotEmpty(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	// deliberately NO nodes row for pk
+
+	req := httptest.NewRequest("GET", "/api/scope-audit", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"name":null`) {
+		t.Errorf(`body must carry "name":null for a target with no nodes row, got: %s`, body)
+	}
+	if strings.Contains(body, `"name":""`) {
+		t.Error(`"name":"" collapses "unknown node" into "node with no name"`)
+	}
+
+	var got ScopeAuditResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repeaters) != 1 {
+		t.Fatalf("repeaters = %d, want 1", len(got.Repeaters))
+	}
+	if got.Repeaters[0].Name != nil {
+		t.Errorf("Name = %q, want nil", *got.Repeaters[0].Name)
+	}
+}
+
 // TestHandleScopeAuditWildcardContradiction: observed forwarding unscoped
 // (plain-FLOOD) traffic while the declared list omits '*' is the wildcard
 // contradiction this endpoint must flag — the repeater says it does NOT

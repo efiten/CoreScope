@@ -3564,7 +3564,9 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		id := identities[pk]
-		if s.cfg != nil && s.cfg.IsNameHidden(id.Name) {
+		// A target with no nodes row has no name to match a hidden-prefix rule
+		// against; it cannot be hidden by name, so only check when we have one.
+		if id.Name != nil && s.cfg != nil && s.cfg.IsNameHidden(*id.Name) {
 			continue
 		}
 
@@ -3642,12 +3644,14 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 		if len(a.UndeclaredObserved) != len(b.UndeclaredObserved) {
 			return len(a.UndeclaredObserved) > len(b.UndeclaredObserved)
 		}
-		an, bn := a.Name, b.Name
-		if an == "" {
-			an = a.PublicKey
+		// Fall back to the pubkey for an unnamed or unknown node so the order is
+		// still total and stable rather than grouping every nameless row together.
+		an, bn := a.PublicKey, b.PublicKey
+		if a.Name != nil && *a.Name != "" {
+			an = *a.Name
 		}
-		if bn == "" {
-			bn = b.PublicKey
+		if b.Name != nil && *b.Name != "" {
+			bn = *b.Name
 		}
 		return an < bn
 	})
