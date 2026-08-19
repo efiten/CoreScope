@@ -21,6 +21,7 @@
 .sa-table { min-width: 720px; }
 .sa-name a { color: var(--link-color); text-decoration: none; }
 .sa-name a:hover { text-decoration: underline; }
+.sa-name-unknown { color: var(--text-muted); font-style: italic; }
 .sa-role { font-size: 10px; text-transform: uppercase; letter-spacing: .3px; }
 
 .sa-chip {

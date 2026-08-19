@@ -66,9 +66,24 @@
     }).join(' ');
   }
 
-  function rowHtml(row) {
+  // nameHtml renders the repeater identity cell. row.name == null means this
+  // instance holds NO nodes row for the target at all (a declared-regions
+  // answer can name a repeater the network has never recorded) — distinct
+  // from row.name === "" (a known node that simply has no name). A
+  // truthiness check collapses those two into the same pubkey-stub
+  // rendering, which defeats the point of the API making the field
+  // nullable. The unknown case also gets no link (FIX 4): #/nodes/<pubkey>
+  // cannot resolve a target we hold no row for.
+  function nameHtml(row) {
+    if (row.name == null) {
+      return '<span class="sa-name-unknown" title="No nodes row held for this target — a declared-regions answer can name a repeater this instance has never recorded.">' +
+        escapeHtml(row.publicKey.slice(0, 10)) + '… (unknown node)</span>';
+    }
     var name = row.name ? escapeHtml(row.name) : escapeHtml(row.publicKey.slice(0, 10)) + '…';
-    var link = '<a href="#/nodes/' + encodeURIComponent(row.publicKey) + '">' + name + '</a>';
+    return '<a href="#/nodes/' + encodeURIComponent(row.publicKey) + '">' + name + '</a>';
+  }
+
+  function rowHtml(row) {
     var issues = [];
     if (row.notObserved.length) issues.push('<span class="ns-decl ns-decl-quiet" title="Declared flood-allowed but not observed forwarding it this window.">' + row.notObserved.length + ' not observed</span>');
     if (row.wildcardContradiction) issues.push('<span class="ns-decl ns-decl-warn" title="Observed forwarding plain (unscoped) floods, but the declared list omits the &#39;*&#39; wildcard that would allow that.">wildcard contradiction</span>');
@@ -76,7 +91,7 @@
     var issuesHtml = issues.length ? issues.join(' ') : '<span class="ns-decl ns-decl-yes" title="Every declared region was observed forwarding, and nothing undeclared was observed.">agrees</span>';
 
     return '<tr>' +
-      '<td class="sa-name">' + link + (row.role ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
+      '<td class="sa-name">' + nameHtml(row) + (row.role != null && row.role !== '' ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
       '<td>' + issuesHtml + '</td>' +
       '<td>' + scopeChips(row.declaredRegions, 'sa-chip-declared') + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + '</td>' +
       '<td>' + scopeChips(row.notObserved, 'sa-chip-missing') + '</td>' +
