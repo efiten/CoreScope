@@ -1822,7 +1822,8 @@ not being the same as "declared nothing"), which apply here identically.
         { "scope": string, "packets": number, "firstSeen": string (ISO), "lastSeen": string (ISO) }
       ],
       "observedUnscopedPackets": number,               // plain-FLOOD packets forwarded this window
-      "wildcardContradiction":   boolean               // observed unscoped forwarding but '*' not declared
+      "wildcardContradiction":   boolean,               // observed unscoped forwarding but '*' not declared
+      "ambiguousHops":           number                 // forwarder hops this window that could not be attributed — see note below
     }
   ]
 }
@@ -1844,7 +1845,22 @@ not being the same as "declared nothing"), which apply here identically.
   `declared.observedAt` on the per-node endpoint. **A "declared but not observed" result
   is weak evidence at `window=1h` (a quiet region can simply have had no traffic) and much
   stronger at `window=7d`; a client MUST show which window a result belongs to and must
-  not present a `1h` result as if it were `7d`.**
+  not present a `1h` result as if it were `7d`.** Because `declaredAt` is not bounded by
+  `window`, the declared answer and the forwarding evidence are not guaranteed to be
+  temporally aligned — a repeater could have declared its regions well before, or even
+  after, the window that produced `notObserved` — and the server makes no attempt to
+  align them; the `declaredAt` column in the UI is the mitigation (so a stale declared
+  answer is visible to the reader), not a guarantee that the two sides describe the same
+  period.
+- `ambiguousHops` counts forwarder-hop observations in this window whose truncated hash
+  prefix matched more than one declared target's pubkey — i.e. two or more repeaters that
+  declared a region list happen to share that prefix. Such a hop is attributed to **none**
+  of the matching targets (crediting all of them risks papering over a real gap in a
+  colliding neighbour's row; crediting none of them invents no failure) and this counter
+  is incremented on **every** matching target instead. A row with a non-zero
+  `ambiguousHops` carries weaker evidence than one with zero: any entry in that row's
+  `notObserved` could be explained by a prefix collision rather than a genuine absence of
+  forwarding, and a client should present it as a caveat rather than a confirmed finding.
 - All scope names in `declaredRegions` / `notObserved` / `undeclaredObserved[].scope` are
   already normalised (no leading `#`) — the server does the `#`/no-`#` reconciliation
   described on the per-node endpoint so this response is directly comparable without a

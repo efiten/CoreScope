@@ -396,6 +396,11 @@ func normScope(s string) string {
 type scopeAuditTargetAgg struct {
 	scopes          map[string]*ScopeObservation
 	unscopedPackets int64
+	// ambiguousHops counts forwarder-hop observations in the window whose
+	// truncated hash prefix matched this target AND at least one other
+	// declared target — see ScopeAuditForwarding's doc comment for why
+	// those hops are attributed to neither candidate instead of both.
+	ambiguousHops int64
 }
 
 // scopeAuditPrefixIndex builds, for every even hex length from
@@ -449,12 +454,25 @@ var scopeAuditForwarderScanQuery = `
 `
 
 // ScopeAuditForwarding runs scopeAuditForwarderScanQuery once for the whole
-// window and attributes every forwarder hop it finds to zero or more of
-// targets, by the same truncated-hash prefix match ScopeConformance uses
-// for a single pubkey. Each (target, transmission) pair is counted at most
-// once even if seen via multiple observations — the same de-duplication
-// scopeConformanceQuery gets for free from EXISTS, done explicitly here
-// since this scan is not correlated per target.
+// window and attributes every forwarder hop it finds to targets, by the same
+// truncated-hash prefix match ScopeConformance uses for a single pubkey.
+//
+// A hop is attributed only when its prefix matches EXACTLY ONE declared
+// target. This endpoint exists to find a repeater that declares a region and
+// is not actually forwarding it — crediting a hop to every target sharing
+// its prefix would let a colliding neighbour's traffic silently paper over a
+// real gap, and crediting nobody (the alternative of dropping the hop
+// entirely) would invent failures for targets that simply share a collision-
+// prone prefix. Instead, an ambiguous hop is credited to NEITHER candidate,
+// and every candidate's ambiguousHops counter is incremented instead, so the
+// row can say "this notObserved might just be a prefix collision" rather
+// than presenting it as a confirmed finding. See scopeAuditTargetAgg's
+// ambiguousHops field and ScopeAuditRow.AmbiguousHops.
+//
+// Each (target, transmission) pair is counted at most once even if seen via
+// multiple observations, for both the attributed and the ambiguous count —
+// the same de-duplication scopeConformanceQuery gets for free from EXISTS,
+// done explicitly here since this scan is not correlated per target.
 func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (map[string]*scopeAuditTargetAgg, error) {
 	byLen := scopeAuditPrefixIndex(targets)
 	result := make(map[string]*scopeAuditTargetAgg, len(targets))
@@ -465,7 +483,16 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 	}
 	defer rows.Close()
 
-	seen := make(map[string]bool) // "<target>|<txID>" already counted
+	getAgg := func(target string) *scopeAuditTargetAgg {
+		agg, ok := result[target]
+		if !ok {
+			agg = &scopeAuditTargetAgg{scopes: map[string]*ScopeObservation{}}
+			result[target] = agg
+		}
+		return agg
+	}
+
+	seen := make(map[string]bool) // "<target>|<txID>" already counted (attributed or ambiguous)
 	for rows.Next() {
 		var txID int64
 		var hop string
@@ -475,18 +502,27 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 			return nil, fmt.Errorf("scope audit forwarder scan scan: %w", err)
 		}
 		hop = strings.ToLower(hop)
-		for _, target := range byLen[len(hop)][hop] {
+		candidates := byLen[len(hop)][hop]
+
+		if len(candidates) > 1 {
+			for _, target := range candidates {
+				key := target + "|" + strconv.FormatInt(txID, 10)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				getAgg(target).ambiguousHops++
+			}
+			continue
+		}
+		for _, target := range candidates {
 			key := target + "|" + strconv.FormatInt(txID, 10)
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
 
-			agg, ok := result[target]
-			if !ok {
-				agg = &scopeAuditTargetAgg{scopes: map[string]*ScopeObservation{}}
-				result[target] = agg
-			}
+			agg := getAgg(target)
 			if !scopeName.Valid {
 				agg.unscopedPackets++
 				continue
@@ -551,6 +587,17 @@ type ScopeAuditRow struct {
 	// forwarding unscoped floods but its declared list omits '*' — it says
 	// it does NOT forward them, and the traffic says otherwise.
 	WildcardContradiction bool `json:"wildcardContradiction"`
+
+	// AmbiguousHops counts forwarder-hop observations in the window whose
+	// truncated hash prefix matched this target's pubkey AND at least one
+	// other declared target's — see ScopeAuditForwarding's doc comment for
+	// why those hops are attributed to neither and instead counted here on
+	// every candidate. A non-zero value is a caveat, not a finding: any
+	// NotObserved entry on this row could be explained by a colliding
+	// neighbour's traffic rather than a real absence, and any
+	// UndeclaredObserved entry is unaffected by it (ambiguous hops are never
+	// attributed to a scope at all).
+	AmbiguousHops int64 `json:"ambiguousHops"`
 }
 
 // ScopeAuditResponse is the payload for GET /api/scope-audit. Only

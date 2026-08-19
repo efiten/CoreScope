@@ -3612,9 +3612,10 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var unscopedPackets int64
+		var unscopedPackets, ambiguousHops int64
 		if agg != nil {
 			unscopedPackets = agg.unscopedPackets
+			ambiguousHops = agg.ambiguousHops
 		}
 
 		resp.Repeaters = append(resp.Repeaters, ScopeAuditRow{
@@ -3629,6 +3630,7 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 			UndeclaredObserved:      undeclared,
 			ObservedUnscopedPackets: unscopedPackets,
 			WildcardContradiction:   unscopedPackets > 0 && !declaredWildcard,
+			AmbiguousHops:           ambiguousHops,
 		})
 	}
 

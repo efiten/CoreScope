@@ -83,6 +83,16 @@
     return '<a href="#/nodes/' + encodeURIComponent(row.publicKey) + '">' + name + '</a>';
   }
 
+  // ambiguousCaveat flags rows with a non-zero FIX 1 ambiguity count: hops
+  // whose truncated hash prefix matched more than one declared target were
+  // credited to none of them, so a notObserved finding here could be a
+  // prefix collision rather than a confirmed gap.
+  function ambiguousCaveat(row) {
+    if (!row.ambiguousHops) return '';
+    return ' <span class="sa-chip sa-chip-ambiguous" title="' + row.ambiguousHops + ' forwarder hop' + (row.ambiguousHops === 1 ? '' : 's') +
+      ' in this window matched more than one declared target\'s pubkey prefix and could not be attributed to any of them. Any “not observed” entry on this row may be explained by that prefix collision rather than a real gap.">possibly ambiguous</span>';
+  }
+
   function rowHtml(row) {
     var issues = [];
     if (row.notObserved.length) issues.push('<span class="ns-decl ns-decl-quiet" title="Declared flood-allowed but not observed forwarding it this window.">' + row.notObserved.length + ' not observed</span>');
@@ -94,7 +104,7 @@
       '<td class="sa-name">' + nameHtml(row) + (row.role != null && row.role !== '' ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
       '<td>' + issuesHtml + '</td>' +
       '<td>' + scopeChips(row.declaredRegions, 'sa-chip-declared') + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + '</td>' +
-      '<td>' + scopeChips(row.notObserved, 'sa-chip-missing') + '</td>' +
+      '<td>' + scopeChips(row.notObserved, 'sa-chip-missing') + ambiguousCaveat(row) + '</td>' +
       '<td>' + undeclaredChips(row.undeclaredObserved) + '</td>' +
       '<td>' + ageHtml(row) + (row.truncated ? ' <span class="ns-truncated" title="Declared list was truncated by the repeater — a missing region here is not necessarily a real absence.">truncated</span>' : '') + '</td>' +
       '</tr>';

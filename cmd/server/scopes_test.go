@@ -731,6 +731,67 @@ func TestHandleNodeScopesServesFromCache(t *testing.T) {
 	}
 }
 
+// --- FIX 1: ScopeAuditForwarding ambiguous-hop attribution ---
+
+// TestScopeAuditForwardingAttributesUnambiguousHop confirms a hop matching
+// exactly one target still attributes normally, with ambiguousHops left at 0
+// — the common case must be unaffected by the ambiguity rule.
+func TestScopeAuditForwardingAttributesUnambiguousHop(t *testing.T) {
+	s := newScopeTestStore(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, s, hop, scopeMatched("#be"), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil || agg.scopes["be"] == nil || agg.scopes["be"].Packets != 1 {
+		t.Fatalf("want the hop attributed to the sole matching target, got %+v", got)
+	}
+	if agg.ambiguousHops != 0 {
+		t.Errorf("ambiguousHops = %d, want 0 — nothing here is ambiguous", agg.ambiguousHops)
+	}
+}
+
+// TestScopeAuditForwardingAmbiguousHopCreditsNeitherTarget is FIX 1's core
+// case: two declared targets share a 2-byte prefix. A hop at that prefix
+// must be attributed to NEITHER of them (crediting both would let a
+// colliding neighbour's traffic silently paper over a real notObserved
+// finding), and BOTH candidates' ambiguousHops counters must increment (so
+// the row can surface the caveat regardless of which candidate is being
+// looked at).
+func TestScopeAuditForwardingAmbiguousHopCreditsNeitherTarget(t *testing.T) {
+	s := newScopeTestStore(t)
+	pkA := "1a2b" + strings.Repeat("11", 30)
+	pkB := "1a2b" + strings.Repeat("22", 30) // shares pkA's first 4 hex chars
+	hop := pkA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, s, hop, scopeMatched("#be"), RouteFlood, recent)
+
+	targets := []string{pkA, pkB}
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pk := range targets {
+		agg := got[pk]
+		if agg == nil {
+			t.Fatalf("%s: want an agg present to carry the ambiguity counter, got none (result = %+v)", pk, got)
+		}
+		if len(agg.scopes) != 0 {
+			t.Errorf("%s: scopes = %+v, want empty — an ambiguous hop must not be attributed to either candidate", pk, agg.scopes)
+		}
+		if agg.unscopedPackets != 0 {
+			t.Errorf("%s: unscopedPackets = %d, want 0", pk, agg.unscopedPackets)
+		}
+		if agg.ambiguousHops != 1 {
+			t.Errorf("%s: ambiguousHops = %d, want 1", pk, agg.ambiguousHops)
+		}
+	}
+}
+
 // --- GET /api/scope-audit handler tests ---
 
 // setupScopeAuditServer extends setupNodeScopesServer's schema with a
@@ -983,6 +1044,37 @@ func TestHandleScopeAuditNotObservedAndUndeclaredObserved(t *testing.T) {
 	}
 	if len(row.UndeclaredObserved) != 1 || row.UndeclaredObserved[0].Scope != "de-nw" {
 		t.Errorf("undeclaredObserved = %+v, want exactly \"de-nw\"", row.UndeclaredObserved)
+	}
+}
+
+// TestHandleScopeAuditSurfacesAmbiguousHops is FIX 1's handler-level case:
+// two repeaters both declare "be" and share a 2-byte pubkey prefix. The one
+// hop seen in the window can't be attributed to either, so both rows must
+// still show "be" as notObserved (an ambiguous hop invents no attribution,
+// so it cannot silently satisfy the declared region) AND both rows must
+// carry ambiguousHops=1, the caveat that the notObserved finding might be a
+// prefix collision rather than a real gap.
+func TestHandleScopeAuditSurfacesAmbiguousHops(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pkA := "1a2b" + strings.Repeat("11", 30)
+	pkB := "1a2b" + strings.Repeat("22", 30)
+	hop := pkA[:4]
+	insertDeclared(t, srv, pkA, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	insertDeclared(t, srv, pkB, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, hop, scopeMatched("#be"), RouteFlood, recent)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 2 {
+		t.Fatalf("repeaters = %+v, want 2", got.Repeaters)
+	}
+	for _, row := range got.Repeaters {
+		if row.AmbiguousHops != 1 {
+			t.Errorf("%s: ambiguousHops = %d, want 1", row.PublicKey, row.AmbiguousHops)
+		}
+		if len(row.NotObserved) != 1 || row.NotObserved[0] != "be" {
+			t.Errorf("%s: notObserved = %v, want [\"be\"] — an ambiguous hop must not silently satisfy the declared region", row.PublicKey, row.NotObserved)
+		}
 	}
 }
 

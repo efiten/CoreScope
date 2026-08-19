@@ -32,6 +32,7 @@
 .sa-chip-missing { background: color-mix(in srgb, var(--status-red) 16%, transparent); color: var(--danger); }
 .sa-chip-undeclared { background: color-mix(in srgb, var(--status-yellow) 18%, transparent); color: var(--status-amber-text); }
 .sa-chip-wildcard { background: var(--section-bg, var(--card-bg)); color: var(--text-muted); font-weight: 700; }
+.sa-chip-ambiguous { background: var(--section-bg, var(--card-bg)); color: var(--text-muted); border: 1px dashed var(--border); font-family: inherit; font-style: italic; }
 
 .sa-count { font-size: 11px; margin-top: 6px; }
 
