@@ -17,6 +17,9 @@
     { key: '7d', label: '7d' }
   ];
   var win = DEFAULT_WINDOW;
+  var searchQuery = ''; // free-text filter over name/pubkey/region, applied client-side
+  var searchIndex = {}; // publicKey -> lowercased searchable haystack, rebuilt every renderBody
+  var sortCtl = null; // tracked TableSort controller for destroy-before-reinit (mirrors observers.js)
 
   function windowBtn(key, cur, label) {
     var on = key === cur;
@@ -44,6 +47,7 @@
       WINDOWS.map(function (w) { return windowBtn(w.key, win, w.label); }).join('') +
       '</div></div>' +
       '<div class="sa-intro">Network-wide comparison of declared vs. observed region-scope forwarding, across every repeater that has declared a region list over RF. <a href="#/nodes">Per-node detail lives on each node\'s page</a>.</div>' +
+      '<div class="sa-search-bar"><input type="text" class="nodes-search sa-search" id="saSearch" placeholder="Search by repeater, pubkey, or region…" aria-label="Search scope audit rows"></div>' +
       '<div id="saBody"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading scope audit…</div></div>' +
       '</div>';
   }
@@ -145,6 +149,14 @@
       ' in this window matched more than one declared target\'s pubkey prefix and could not be attributed to any of them. Any “not observed” entry on this row may be explained by that prefix collision rather than a real gap.">possibly ambiguous</span>';
   }
 
+  // statusScore ranks a row's Status column numerically for sorting — a
+  // simple weighted count (notObserved dominates, matching the server's own
+  // findings-first ranking) rather than the badge text, which the Status
+  // column shows as chips, not a single sortable label.
+  function statusScore(row) {
+    return row.notObserved.length * 100 + (row.wildcardContradiction ? 10 : 0) + row.undeclaredObserved.length;
+  }
+
   function rowHtml(row) {
     var issues = [];
     if (row.notObserved.length) issues.push('<span class="ns-decl ns-decl-quiet" title="Declared flood-allowed but not observed forwarding it this window.">' + row.notObserved.length + ' not observed</span>');
@@ -152,32 +164,108 @@
     if (row.undeclaredObserved.length) issues.push('<span class="ns-decl ns-decl-unknown" title="Observed forwarding scopes absent from the declared list.">' + row.undeclaredObserved.length + ' undeclared</span>');
     var issuesHtml = issues.length ? issues.join(' ') : '<span class="ns-decl ns-decl-yes" title="Every declared region was observed forwarding, and nothing undeclared was observed.">agrees</span>';
 
-    return '<tr>' +
-      '<td class="sa-name">' + nameHtml(row) + (row.role != null && row.role !== '' ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
-      '<td>' + issuesHtml + '</td>' +
-      '<td>' + configStateHtml(row) + '</td>' +
-      '<td>' + scopeChips(row.declaredRegions, 'sa-chip-declared') + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + '</td>' +
-      '<td>' + scopeChips(row.notObserved, 'sa-chip-missing') + ambiguousCaveat(row) + '</td>' +
-      '<td>' + undeclaredChips(row.undeclaredObserved) + '</td>' +
-      '<td>' + ageHtml(row) + (row.truncated ? ' <span class="ns-truncated" title="Declared list was truncated by the repeater — a missing region here is not necessarily a real absence.">truncated</span>' : '') + '</td>' +
+    // declaredAtMs is the underlying declaredAt timestamp in epoch ms, fed to
+    // the Declared age <td> as data-value (mirroring observers.js's
+    // _lastSeenMs) so TableSort's numeric comparator sorts on the real
+    // timestamp instead of the rendered "4h ago" text, which cannot be
+    // parsed back into a date.
+    var declaredAtMs = row.declaredAt ? new Date(row.declaredAt).getTime() : NaN;
+    var nameSortValue = row.name != null ? row.name : row.publicKey;
+    var declaredCount = row.declaredRegions.length + (row.declaredWildcard ? 1 : 0);
+
+    return '<tr data-pubkey="' + escapeHtml(row.publicKey) + '">' +
+      '<td class="sa-name" data-value="' + escapeHtml(nameSortValue) + '">' + nameHtml(row) + (row.role != null && row.role !== '' ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
+      '<td data-value="' + statusScore(row) + '">' + issuesHtml + '</td>' +
+      '<td data-value="' + escapeHtml(CONFIG_STATES[row.configState].label) + '">' + configStateHtml(row) + '</td>' +
+      '<td data-value="' + declaredCount + '">' + scopeChips(row.declaredRegions, 'sa-chip-declared') + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + '</td>' +
+      '<td data-value="' + row.notObserved.length + '">' + scopeChips(row.notObserved, 'sa-chip-missing') + ambiguousCaveat(row) + '</td>' +
+      '<td data-value="' + row.undeclaredObserved.length + '">' + undeclaredChips(row.undeclaredObserved) + '</td>' +
+      '<td data-value="' + (isNaN(declaredAtMs) ? '' : declaredAtMs) + '">' + ageHtml(row) + (row.truncated ? ' <span class="ns-truncated" title="Declared list was truncated by the repeater — a missing region here is not necessarily a real absence.">truncated</span>' : '') + '</td>' +
       '</tr>';
+  }
+
+  // buildSearchIndex maps publicKey -> lowercased haystack (name, pubkey,
+  // and every region name this row mentions — declared, not-observed, and
+  // undeclared-observed) so applyFilter can match a row without re-deriving
+  // it from rendered chip text.
+  function buildSearchIndex(repeaters) {
+    var idx = {};
+    repeaters.forEach(function (row) {
+      var parts = [row.publicKey];
+      if (row.name) parts.push(row.name);
+      row.declaredRegions.forEach(function (r) { parts.push(r); });
+      row.notObserved.forEach(function (r) { parts.push(r); });
+      row.undeclaredObserved.forEach(function (o) { parts.push(o.scope); });
+      idx[row.publicKey] = parts.join(' ').toLowerCase();
+    });
+    return idx;
+  }
+
+  // applyFilter toggles row visibility against searchQuery and refreshes the
+  // shown-count line — independent of sort order, since it only sets
+  // style.display on whatever <tr> elements are currently in the tbody, so
+  // filtering a sorted table keeps the sort and sorting a filtered table
+  // keeps the filter.
+  function applyFilter() {
+    var tbody = document.querySelector('#saTable tbody');
+    var countEl = document.getElementById('saCount');
+    if (!tbody) return;
+    var q = searchQuery.trim().toLowerCase();
+    var rows = tbody.querySelectorAll('tr');
+    var shown = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var pk = rows[i].getAttribute('data-pubkey');
+      var hay = searchIndex[pk] || '';
+      var match = !q || hay.indexOf(q) !== -1;
+      rows[i].style.display = match ? '' : 'none';
+      if (match) shown++;
+    }
+    if (!countEl) return;
+    if (q) {
+      countEl.textContent = 'Showing ' + shown + ' of ' + rows.length + ' repeater' + (rows.length === 1 ? '' : 's') + ' matching “' + searchQuery.trim() + '”.';
+    } else {
+      countEl.textContent = rows.length + ' repeater' + (rows.length === 1 ? '' : 's') + ' with a declared region list.';
+    }
   }
 
   function renderBody(d) {
     var el = document.getElementById('saBody');
     if (!el) return;
+    if (sortCtl && typeof sortCtl.destroy === 'function') {
+      try { sortCtl.destroy(); } catch (e) { /* ignore */ }
+    }
+    sortCtl = null;
     if (!d.repeaters.length) {
+      searchIndex = {};
       el.innerHTML = '<div class="ns-empty">No repeater has declared a region list yet — this fills in as devices drive and answer over RF.</div>';
       return;
     }
+    searchIndex = buildSearchIndex(d.repeaters);
     el.innerHTML = configStateSummaryHtml(d.repeaters) +
       windowHonestyNote(d.window) +
-      '<div class="sa-table-wrap"><table class="ns-table sa-table"><thead><tr>' +
-      '<th>Repeater</th><th>Status</th><th>Config</th><th>Declared</th><th>Not observed</th><th>Undeclared observed</th><th>Declared age</th>' +
+      '<div class="sa-table-wrap"><table class="ns-table sa-table" id="saTable"><thead><tr>' +
+      '<th data-sort-key="name">Repeater</th>' +
+      '<th data-sort-key="status" data-type="numeric">Status</th>' +
+      '<th data-sort-key="config">Config</th>' +
+      '<th data-sort-key="declared" data-type="numeric">Declared</th>' +
+      '<th data-sort-key="notObserved" data-type="numeric">Not observed</th>' +
+      '<th data-sort-key="undeclared" data-type="numeric">Undeclared observed</th>' +
+      '<th data-sort-key="declaredAt" data-type="numeric">Declared age</th>' +
       '</tr></thead><tbody>' +
       d.repeaters.map(rowHtml).join('') +
       '</tbody></table></div>' +
-      '<div class="sa-count text-muted">' + d.repeaters.length + ' repeater' + (d.repeaters.length === 1 ? '' : 's') + ' with a declared region list.</div>';
+      '<div class="sa-count text-muted" id="saCount"></div>';
+
+    var saTbl = document.getElementById('saTable');
+    if (saTbl && window.TableSort) {
+      // No defaultColumn: the server's own findings-first order (most
+      // notObserved at the top) stays the default until the reader picks a
+      // column — that ordering is the reason this page exists.
+      sortCtl = TableSort.init(saTbl, { storageKey: 'meshcore-scope-audit-sort' });
+    } else if (saTbl && !window.TableSort) {
+      console.warn('[scope-audit] window.TableSort missing — table will not be sortable');
+    }
+    applyFilter();
   }
 
   async function load(w) {
@@ -211,6 +299,7 @@
 
   function init(container) {
     win = DEFAULT_WINDOW;
+    searchQuery = '';
     try {
       var p = (typeof getHashParams === 'function') ? getHashParams() : null;
       var qw = p ? p.get('window') : null;
@@ -222,10 +311,21 @@
       var b = e.target.closest('button[data-window]');
       if (b) load(b.getAttribute('data-window'));
     });
+    var search = document.getElementById('saSearch');
+    if (search) search.addEventListener('input', debounce(function (e) {
+      searchQuery = e.target.value;
+      applyFilter();
+    }, 250));
     load(win);
   }
 
-  function destroy() { loadGen++; }
+  function destroy() {
+    loadGen++;
+    if (sortCtl && typeof sortCtl.destroy === 'function') {
+      try { sortCtl.destroy(); } catch (e) { /* ignore */ }
+    }
+    sortCtl = null;
+  }
 
   registerPage('scope-audit', { init: init, destroy: destroy });
 })();
