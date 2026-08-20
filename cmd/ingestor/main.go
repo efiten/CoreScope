@@ -1604,12 +1604,32 @@ func loadRegionKeys(cfg *Config) map[string][]byte {
 	return keys
 }
 
-// matchScope performs one HMAC-SHA256 per configured region. Expected
-// len(regionKeys) ≤ 50; beyond that, consider a pre-indexed lookup table.
+// matchScope names the region scope of a transport-scoped packet. It performs
+// one HMAC-SHA256 per configured region (expected len(regionKeys) ≤ 50;
+// beyond that, consider a pre-indexed lookup table), HMACing the payload with
+// each region key and looking for the one whose derived 2-byte code matches
+// code1. Two bytes is only 65536 values, so with enough configured regions,
+// unrelated keys collide by pure chance often enough to matter (#1609): with
+// 58 keys, ~78k transport-scoped packets measured ~34 coincidental matches in
+// production. Returning the first match found named the wrong region on
+// those packets.
+//
+// Fix: collect every matching key instead of returning at the first. Exactly
+// one match names that region, as before; more than one match is ambiguous —
+// we cannot know which region the sender meant, so this returns the same ""
+// used when nothing matches at all (scopeNameForDB's third state: transport-
+// scoped but unnameable). Collecting all matches before deciding also removes
+// the dependency on regionKeys' (map) iteration order: the old code's result
+// for a colliding packet depended on which key Go's randomised map order
+// visited first, so the same packet could be labelled differently across
+// runs. That nondeterminism is a consequence of returning early, not of the
+// map itself, so it goes away once every key is checked before deciding.
 func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) string {
 	if code1 == "0000" || len(regionKeys) == 0 || len(payloadRaw) == 0 {
 		return ""
 	}
+	var matchName string
+	var matched []string
 	for name, key := range regionKeys {
 		mac := hmac.New(sha256.New, key)
 		mac.Write([]byte{payloadType})
@@ -1623,10 +1643,17 @@ func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byt
 		}
 		codeBytes := [2]byte{byte(code & 0xFF), byte(code >> 8)}
 		if strings.ToUpper(hex.EncodeToString(codeBytes[:])) == code1 {
-			return name
+			if len(matched) == 0 {
+				matchName = name
+			}
+			matched = append(matched, name)
 		}
 	}
-	return ""
+	if len(matched) > 1 {
+		log.Printf("matchScope: ambiguous code1=%s matched %d region keys %v; returning unmatched", code1, len(matched), matched)
+		return ""
+	}
+	return matchName
 }
 
 // Version info (set via ldflags)
