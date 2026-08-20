@@ -26,6 +26,13 @@ import (
 )
 
 func main() {
+	// scope-repair is a one-off maintenance subcommand (#1609); it never
+	// runs as part of normal startup, only when explicitly invoked. See
+	// scope_repair.go.
+	if len(os.Args) > 1 && os.Args[1] == "scope-repair" {
+		os.Exit(runScopeRepair(os.Args[2:]))
+	}
+
 	// pprof profiling — off by default, enable with ENABLE_PPROF=true
 	if os.Getenv("ENABLE_PPROF") == "true" {
 		pprofPort := os.Getenv("PPROF_PORT")
@@ -1625,10 +1632,27 @@ func loadRegionKeys(cfg *Config) map[string][]byte {
 // runs. That nondeterminism is a consequence of returning early, not of the
 // map itself, so it goes away once every key is checked before deciding.
 func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) string {
-	if code1 == "0000" || len(regionKeys) == 0 || len(payloadRaw) == 0 {
+	matched := matchingRegions(regionKeys, payloadType, payloadRaw, code1)
+	if len(matched) > 1 {
+		log.Printf("matchScope: ambiguous code1=%s matched %d region keys %v; returning unmatched", code1, len(matched), matched)
 		return ""
 	}
-	var matchName string
+	if len(matched) == 1 {
+		return matched[0]
+	}
+	return ""
+}
+
+// matchingRegions returns the name of every configured region whose derived
+// 2-byte code equals code1, in no particular order. matchScope uses the
+// length of this list to decide between a unique match, no match, and an
+// ambiguous match; the scope-repair tool (#1609, scope_repair.go) uses it
+// directly to tell an ambiguous multi-key match apart from no match at all —
+// only the former is the historical first-match bug and safe to correct.
+func matchingRegions(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) []string {
+	if code1 == "0000" || len(regionKeys) == 0 || len(payloadRaw) == 0 {
+		return nil
+	}
 	var matched []string
 	for name, key := range regionKeys {
 		mac := hmac.New(sha256.New, key)
@@ -1643,17 +1667,10 @@ func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byt
 		}
 		codeBytes := [2]byte{byte(code & 0xFF), byte(code >> 8)}
 		if strings.ToUpper(hex.EncodeToString(codeBytes[:])) == code1 {
-			if len(matched) == 0 {
-				matchName = name
-			}
 			matched = append(matched, name)
 		}
 	}
-	if len(matched) > 1 {
-		log.Printf("matchScope: ambiguous code1=%s matched %d region keys %v; returning unmatched", code1, len(matched), matched)
-		return ""
-	}
-	return matchName
+	return matched
 }
 
 // Version info (set via ldflags)
