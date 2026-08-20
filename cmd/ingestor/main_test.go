@@ -879,6 +879,53 @@ func TestMatchScope(t *testing.T) {
 	if got := matchScope(belgiumKeys, 5, []byte("hello"), "BEEF"); got != "" {
 		t.Errorf("no match: matchScope = %q, want empty", got)
 	}
+
+	// Guards: code1=="0000", empty regionKeys, empty payload all short-circuit
+	// to "" before any HMAC is computed.
+	//
+	// The empty-payload vector below is deliberately NOT an arbitrary code1:
+	// "76AC" is the real code #belgium's key derives for payloadType=5 with a
+	// zero-length payload (pre-computed offline). If the len(payloadRaw)==0
+	// guard were ever removed, this call would compute a genuine match and
+	// return "#belgium" instead of "", so this case actually kills that
+	// mutant. (code1=="0000" and empty-regionKeys, by contrast, can never be
+	// distinguished this way: the code-remap logic guarantees no real key
+	// ever derives "0000", and ranging over an empty map never executes the
+	// loop body — so those two guards are unobservable defense-in-depth, not
+	// missing coverage.)
+	if got := matchScope(belgiumKeys, 5, []byte{}, "76AC"); got != "" {
+		t.Errorf("empty payload: matchScope = %q, want empty", got)
+	}
+	if got := matchScope(map[string][]byte{}, 5, []byte("hello"), "4A75"); got != "" {
+		t.Errorf("empty regionKeys: matchScope = %q, want empty", got)
+	}
+}
+
+// TestMatchScopeAmbiguous covers the #1609 fix: when more than one configured
+// region key produces the same code1 for a packet, matchScope must return ""
+// (the same "unmatched" state used when nothing matches) rather than
+// guessing. The two keys below are constructed offline (brute-forced against
+// the fixed payloadType=5/"hello" vector, not hoped for) so the collision is
+// deterministic and reproducible, not a chance real-world event:
+//   - "#test"     -> SHA256("#test")[:16]     -> code1 2AB5
+//   - "#collide"  -> a 16-byte key chosen so it ALSO derives code1 2AB5
+//
+// A revert to "return name on first match" makes this test flaky-to-failing
+// depending on map iteration order; collecting all matches first makes it
+// fail deterministically every run.
+func TestMatchScopeAmbiguous(t *testing.T) {
+	testKey, _ := hex.DecodeString("9cd8fcf22a47333b591d96a2b848b73f")
+	collideKey, _ := hex.DecodeString("66e51699772a5a52628e8b7686c7d8fd")
+	keys := map[string][]byte{
+		"#test":    testKey,
+		"#collide": collideKey,
+	}
+
+	for i := 0; i < 20; i++ {
+		if got := matchScope(keys, 5, []byte("hello"), "2AB5"); got != "" {
+			t.Fatalf("iteration %d: matchScope = %q, want empty (ambiguous match)", i, got)
+		}
+	}
 }
 
 func TestBuildPacketDataScopeMatching(t *testing.T) {
