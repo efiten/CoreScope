@@ -116,5 +116,60 @@ test('dark + provider with only baseUrl as function → getTileUrl returns strin
   assert.ok(/\{z\}/.test(out), 'returned string must contain {z}; got: ' + out);
 });
 
+console.log('\n── light mode must resolve through the registry too ──');
+
+// The light branch used to `return TILE_LIGHT` without ever consulting the
+// registry. Invisible until CARTO started requiring an API key: the registry's
+// carto styles append `?key=`, the bare TILE_LIGHT constant does not, so every
+// light-theme caller (analytics.js, nodes.js) served watermarked tiles even
+// with a key configured.
+
+test('light + provider with url:function → getTileUrl resolves it, not the bare constant', () => {
+  const ctx = makeSandbox('light');
+  ctx.window.MC_TILE_PROVIDERS = {
+    'carto-light': {
+      provider: 'carto', label: 'Carto Positron',
+      url: function () { return 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png?key=abc123'; },
+      attribution: '© OSM © CartoDB',
+    },
+  };
+  ctx.window.MC_getLightTileProvider = function () { return 'carto-light'; };
+
+  const out = ctx.window.getTileUrl();
+  assert.strictEqual(typeof out, 'string', 'must return a string, got ' + typeof out);
+  assert.ok(out.indexOf('?key=abc123') !== -1,
+    'light mode must carry the configured Carto key; got: ' + out);
+  assert.notStrictEqual(out, ctx.window.TILE_LIGHT,
+    'light mode must not short-circuit to the unkeyed TILE_LIGHT constant');
+});
+
+test('light + provider with url:string → returned verbatim', () => {
+  const ctx = makeSandbox('light');
+  const STR = 'https://tiles.example.com/light/{z}/{x}/{y}.png';
+  ctx.window.MC_TILE_PROVIDERS = {
+    'str-light': { provider: 'carto', label: 'Str', url: STR, attribution: 'x' },
+  };
+  ctx.window.MC_getLightTileProvider = function () { return 'str-light'; };
+
+  assert.strictEqual(ctx.window.getTileUrl(), STR);
+});
+
+test('light + no registry → still falls back to TILE_LIGHT', () => {
+  const ctx = makeSandbox('light');
+  delete ctx.window.MC_TILE_PROVIDERS;
+  delete ctx.window.MC_getLightTileProvider;
+
+  assert.strictEqual(ctx.window.getTileUrl(), ctx.window.TILE_LIGHT,
+    'the constant remains the last-resort fallback when the registry is absent');
+});
+
+test('dark fallback is unchanged when the registry is absent', () => {
+  const ctx = makeSandbox('dark');
+  delete ctx.window.MC_TILE_PROVIDERS;
+  delete ctx.window.MC_getDarkTileProvider;
+
+  assert.strictEqual(ctx.window.getTileUrl(), ctx.window.TILE_DARK);
+});
+
 console.log('\n#1614 getTileUrl() string contract: ' + passed + ' passed, ' + failed + ' failed');
 process.exit(failed === 0 ? 0 : 1);

@@ -460,12 +460,20 @@
     var isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' &&
        window.matchMedia('(prefers-color-scheme: dark)').matches);
-    if (!isDark) return TILE_LIGHT;
-    // #1461 followup: honor customizer's dark-tile-provider pick (#1420 / #1430)
-    // when the registry is loaded. Falls back to TILE_DARK if absent.
+    // #1461 followup: honor the customizer's tile-provider pick (#1420 / #1430)
+    // when the registry is loaded. Falls back to TILE_DARK / TILE_LIGHT if absent.
+    //
+    // The light branch used to `return TILE_LIGHT` here without consulting the
+    // registry at all. That was invisible until CARTO began requiring an API
+    // key: the registry's carto styles append `?key=` (see _getCartoKey in
+    // map-tile-providers.js), the bare TILE_LIGHT constant does not. So every
+    // light-theme caller of this function — analytics.js:2200 and nodes.js:94 —
+    // kept serving watermarked tiles even with a key configured. Both branches
+    // now resolve through the registry.
     try {
-      if (window.MC_getDarkTileProvider && window.MC_TILE_PROVIDERS) {
-        var id = window.MC_getDarkTileProvider();
+      var getId = isDark ? window.MC_getDarkTileProvider : window.MC_getLightTileProvider;
+      if (getId && window.MC_TILE_PROVIDERS) {
+        var id = getId();
         var p = window.MC_TILE_PROVIDERS[id];
         if (p && (p.url || p.baseUrl)) {
           // #1614: providers added in #1533 (carto/osm/stamen) declare
@@ -477,7 +485,7 @@
         }
       }
     } catch (_e) {}
-    return TILE_DARK;
+    return isDark ? TILE_DARK : TILE_LIGHT;
   };
   /* Helper: get the full provider object (for callers that also need the
    * invertFilter or refUrl/attribution). Returns null when no customizer
