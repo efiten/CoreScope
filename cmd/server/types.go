@@ -1045,6 +1045,7 @@ type ClientConfigResponse struct {
 	Customizer          CustomizerClientConfig `json:"customizer"`
 	ClientRxCoverage    bool                   `json:"clientRxCoverage"`
 	ClientRfSamples     bool                   `json:"clientRfSamples"`
+	PathTrust           *PathTrustConfig       `json:"pathTrust,omitempty"`
 }
 
 // CustomizerClientConfig is the operator-side customizer-modal knobs that

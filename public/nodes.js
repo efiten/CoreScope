@@ -189,14 +189,22 @@
     // Prefer last_heard (from in-memory packets) > _lastHeard (health API) > last_seen (DB)
     const lastHeardTime = n._lastHeard || n.last_heard || n.last_seen;
     const lastHeardMs = lastHeardTime ? new Date(lastHeardTime).getTime() : 0;
-    const status = getNodeStatus(role, lastHeardMs);
+    // #1598: pass the full node so infra staleness also considers last_relayed
+    const status = getNodeStatus(n);
     const statusTooltip = getStatusTooltip(role, status);
     const statusLabel = status === 'active' ? '<span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Active' : '<span style="color:var(--text-muted)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Stale';
     const statusAge = lastHeardMs ? (Date.now() - lastHeardMs) : Infinity;
 
     let explanation = '';
     if (status === 'active') {
-      explanation = 'Last heard ' + (lastHeardTime ? renderNodeTimestampText(lastHeardTime) : 'unknown');
+      // #1598: an infra node can be active purely via relay participation —
+      // surface that instead of a misleading old "last heard".
+      const relayedMs = n.last_relayed ? new Date(n.last_relayed).getTime() : 0;
+      if (relayedMs > lastHeardMs) {
+        explanation = 'Last relayed ' + renderNodeTimestampText(n.last_relayed);
+      } else {
+        explanation = 'Last heard ' + (lastHeardTime ? renderNodeTimestampText(lastHeardTime) : 'unknown');
+      }
     } else {
       const ageDays = Math.floor(statusAge / 86400000);
       const ageHours = Math.floor(statusAge / 3600000);
@@ -257,7 +265,16 @@
     // collision sharply; 3-byte (~16M) is effectively unambiguous. Bucket 0
     // is the legacy/unknown bucket used for edges loaded from the persisted
     // snapshot (no per-mode breakdown stored) — weight is conservative 0.5.
+    // #1784 — path trust threshold: if the configured minimum hash bytes
+    // for mapping is >= 2, observations below it get zero weight in the
+    // confidence computation (they're excluded from trusted evidence). This
+    // also excludes bucket 0: its legacy/unknown hash length cannot prove it
+    // meets a strict threshold, so refreshed observations replace its weight.
+    var _tt = (typeof window !== 'undefined' && window.MC_getPathTrustThreshold) ? window.MC_getPathTrustThreshold() : 1;
     var modeWeight = { 0: 0.5, 1: 0.125, 2: 0.875, 3: 1.0 };
+    if (_tt >= 2) {
+      for (var _m = 0; _m < _tt; _m++) modeWeight[_m] = 0;
+    }
     var cbm = entry.counts_by_mode || null;
     var weighted;
     if (cbm) {
@@ -1246,12 +1263,7 @@
       }
       // Status filter (active/stale)
       if (statusFilter === 'active' || statusFilter === 'stale') {
-        filtered = filtered.filter(n => {
-          const role = (n.role || 'companion').toLowerCase();
-          const t = n.last_heard || n.last_seen;
-          const lastMs = t ? new Date(t).getTime() : 0;
-          return getNodeStatus(role, lastMs) === statusFilter;
-        });
+        filtered = filtered.filter(n => getNodeStatus(n) === statusFilter); // #1598
       }
       nodes = filtered;
 
@@ -1486,7 +1498,7 @@
       const roleColor = ROLE_COLORS[n.role] || '#6b7280';
       const isClaimed = myKeys.has(n.public_key);
       const lastSeenTime = n.last_heard || n.last_seen;
-      const status = getNodeStatus(n.role || 'companion', lastSeenTime ? new Date(lastSeenTime).getTime() : 0);
+      const status = getNodeStatus(n); // #1598: relay-aware for infra
       const lastSeenClass = status === 'active' ? 'last-seen-active' : 'last-seen-stale';
       const cs = _fleetSkew && _fleetSkew[n.public_key];
       const skewBadgeHtml = cs && cs.severity && cs.severity !== 'ok' ? renderSkewBadge(cs.severity, window.currentSkewValue(cs), cs) : '';

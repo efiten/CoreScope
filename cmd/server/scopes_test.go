@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -410,7 +411,11 @@ func setupNodeScopesServer(t *testing.T) (*Server, *mux.Router) {
 		)`); err != nil {
 		t.Fatal(err)
 	}
-	db.detectSchema() // picks up hasDeclaredRegionsTable now that the table exists
+	// picks up hasDeclaredRegionsTable now that the table exists. detectSchema
+	// takes (ctx, rowQuerier) since #1901 and returns an error.
+	if err := db.detectSchema(context.Background(), db.conn); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := &Config{Port: 3000}
 	hub := NewHub()
