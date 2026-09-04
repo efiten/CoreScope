@@ -37,3 +37,7 @@ docs/superpowers/
 # Environment-specific deploy scripts — live only on the deploy host, not tracked
 deploy-live.sh
 deploy-staging.sh
+
+# Runtime prune-request queue: the server writes request-<id>.json here and
+# the ingestor consumes it (cmd/ingestor/prune_geofilter.go). Never commit it.
+cmd/server/prune-requests/
