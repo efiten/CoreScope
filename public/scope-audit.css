@@ -52,3 +52,8 @@
 @media (max-width: 640px) {
   .sa-table th:nth-child(6), .sa-table td:nth-child(6) { display: none; }
 }
+
+/* Observed forwarding, the green half of the merged Scopes column. Pairs with
+   .sa-chip-missing above, which keeps the red. Same colour-mix construction so
+   the two read as one scale rather than two unrelated styles. */
+.sa-chip-observed { background: color-mix(in srgb, var(--status-green) 16%, transparent); color: var(--status-green-text); }
