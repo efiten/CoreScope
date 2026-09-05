@@ -57,17 +57,32 @@
     return '<span title="Declared regions answer captured ' + escapeHtml(row.declaredAt) + '">' + escapeHtml(age) + '</span>';
   }
 
-  function scopeChips(names, cls) {
-    if (!names.length) return '<span class="text-muted">—</span>';
-    return names.map(function (n) { return '<span class="sa-chip ' + cls + '">' + escapeHtml(n) + '</span>'; }).join(' ');
-  }
-
-  function undeclaredChips(rows) {
-    if (!rows.length) return '<span class="text-muted">—</span>';
-    return rows.map(function (o) {
-      return '<span class="sa-chip sa-chip-undeclared" title="' + o.packets + ' packet' + (o.packets === 1 ? '' : 's') +
-        ', last seen ' + escapeHtml(timeAgo(o.lastSeen)) + '">' + escapeHtml(o.scope) + '</span>';
-    }).join(' ');
+  // mergedScopeChips renders ONE chip per declared region, coloured by whether
+  // that region was actually observed forwarding in the window.
+  //
+  // This replaces the old DECLARED and NOT OBSERVED pair. They were never
+  // independent: notObserved is a strict subset of declaredRegions, checked
+  // against a live 197-row response where it held on 197 of 197 rows. The two
+  // columns printed the same set twice, once whole and once filtered, and left
+  // the reader to diff them. On a typical mixed row that meant comparing two
+  // lists of eight to find the one or two entries that differ. Here the
+  // observed ones are simply the green ones.
+  //
+  // No new claim is made about the data: a region present in declaredRegions
+  // and absent from notObserved is exactly what the server already means by
+  // "observed forwarding in this window".
+  function mergedScopeChips(row) {
+    var missing = Object.create(null);
+    row.notObserved.forEach(function (n) { missing[n] = true; });
+    var chips = row.declaredRegions.map(function (n) {
+      var observed = !missing[n];
+      return '<span class="sa-chip ' + (observed ? 'sa-chip-observed' : 'sa-chip-missing') +
+        '" title="' + escapeHtml(n) +
+        (observed ? ': observed forwarding in this window' : ': declared, but no forwarding observed in this window') +
+        '">' + escapeHtml(n) + '</span>';
+    });
+    if (!chips.length) return '<span class="text-muted">—</span>';
+    return chips.join(' ');
   }
 
   // nameHtml renders the repeater identity cell. row.name == null means this
@@ -171,15 +186,12 @@
     // parsed back into a date.
     var declaredAtMs = row.declaredAt ? new Date(row.declaredAt).getTime() : NaN;
     var nameSortValue = row.name != null ? row.name : row.publicKey;
-    var declaredCount = row.declaredRegions.length + (row.declaredWildcard ? 1 : 0);
 
     return '<tr data-pubkey="' + escapeHtml(row.publicKey) + '">' +
       '<td class="sa-name" data-value="' + escapeHtml(nameSortValue) + '">' + nameHtml(row) + (row.role != null && row.role !== '' ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
       '<td data-value="' + statusScore(row) + '">' + issuesHtml + '</td>' +
       '<td data-value="' + escapeHtml(CONFIG_STATES[row.configState].label) + '">' + configStateHtml(row) + '</td>' +
-      '<td data-value="' + declaredCount + '">' + scopeChips(row.declaredRegions, 'sa-chip-declared') + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + '</td>' +
-      '<td data-value="' + row.notObserved.length + '">' + scopeChips(row.notObserved, 'sa-chip-missing') + ambiguousCaveat(row) + '</td>' +
-      '<td data-value="' + row.undeclaredObserved.length + '">' + undeclaredChips(row.undeclaredObserved) + '</td>' +
+      '<td data-value="' + row.notObserved.length + '">' + mergedScopeChips(row) + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + ambiguousCaveat(row) + '</td>' +
       '<td data-value="' + (isNaN(declaredAtMs) ? '' : declaredAtMs) + '">' + ageHtml(row) + (row.truncated ? ' <span class="ns-truncated" title="Declared list was truncated by the repeater — a missing region here is not necessarily a real absence.">truncated</span>' : '') + '</td>' +
       '</tr>';
   }
@@ -247,9 +259,7 @@
       '<th data-sort-key="name">Repeater</th>' +
       '<th data-sort-key="status" data-type="numeric">Status</th>' +
       '<th data-sort-key="config">Config</th>' +
-      '<th data-sort-key="declared" data-type="numeric">Declared</th>' +
-      '<th data-sort-key="notObserved" data-type="numeric">Not observed</th>' +
-      '<th data-sort-key="undeclared" data-type="numeric">Undeclared observed</th>' +
+      '<th data-sort-key="notObserved" data-type="numeric" title="Declared regions, coloured by whether forwarding was observed in this window. Green = observed, red = declared but not observed.">Scopes</th>' +
       '<th data-sort-key="declaredAt" data-type="numeric">Declared age</th>' +
       '</tr></thead><tbody>' +
       d.repeaters.map(rowHtml).join('') +
@@ -325,6 +335,13 @@
       try { sortCtl.destroy(); } catch (e) { /* ignore */ }
     }
     sortCtl = null;
+  }
+
+  if (typeof window !== 'undefined') {
+    // Exposed so the helper tests can assert what the Scopes column RENDERS
+    // rather than grepping this file, the same reason map.js exposes its label
+    // builder (#1356/#1933).
+    window.__meshcoreScopeAuditInternals = { mergedScopeChips: mergedScopeChips };
   }
 
   registerPage('scope-audit', { init: init, destroy: destroy });
