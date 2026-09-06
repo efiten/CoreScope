@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -193,4 +195,119 @@ func TestScopeRepairApply(t *testing.T) {
 	assertScopeName(t, store, fixtureRawC, "#belgium", true)
 	assertScopeName(t, store, fixtureRawD, "", false)
 	assertScopeName(t, store, fixtureRawE, "#ghost", true)
+}
+
+// --- newly matchable rows ---
+//
+// The other direction of config drift: a row stored as "" (transport-scoped,
+// no configured region key matched at ingest) that now matches exactly one
+// key, because the region was added to hashRegions afterwards. Without this,
+// every packet ingested before its region was configured keeps rendering as
+// "unknown scope" forever.
+
+const (
+	// Uniquely matches "#test" (payload "unnamed"); "#collide" derives 737D.
+	fixtureRawF = "1437CC000000756E6E616D6564"
+	// The same genuine two-key collision as row B (payload "hello"), but
+	// stored as "" — re-derives to "" as well, so it must stay untouched.
+	fixtureRawG = "142AB500000068656C6C6F"
+	// code1 9999 matches no configured key; stays "".
+	fixtureRawH = "1499990000006162636465"
+)
+
+func newScopeRepairUnnamedFixture(t *testing.T) *Store {
+	t.Helper()
+	store := newTestStore(t)
+	insertScopeRepairFixtureRow(t, store, fixtureRawF, "", true)
+	insertScopeRepairFixtureRow(t, store, fixtureRawG, "", true)
+	insertScopeRepairFixtureRow(t, store, fixtureRawH, "", true)
+	return store
+}
+
+func TestScopeRepairDryRunReportsNewlyMatchableRows(t *testing.T) {
+	store := newScopeRepairUnnamedFixture(t)
+
+	report, err := repairScopeNames(store.db, scopeRepairTestKeys(t), false)
+	if err != nil {
+		t.Fatalf("repairScopeNames: %v", err)
+	}
+
+	if report.NamedTotal != 1 {
+		t.Errorf("NamedTotal = %d, want 1 (row F)", report.NamedTotal)
+	}
+	if got := report.NamedByNewName["#test"]; got != 1 {
+		t.Errorf(`NamedByNewName["#test"] = %d, want 1`, got)
+	}
+	if report.Unchanged != 2 {
+		t.Errorf("Unchanged = %d, want 2 (rows G and H)", report.Unchanged)
+	}
+	if len(report.Unexpected) != 0 {
+		t.Errorf("len(Unexpected) = %d, want 0", len(report.Unexpected))
+	}
+
+	// Dry run must touch nothing.
+	assertScopeName(t, store, fixtureRawF, "", true)
+	assertScopeName(t, store, fixtureRawG, "", true)
+	assertScopeName(t, store, fixtureRawH, "", true)
+}
+
+func TestScopeRepairApplyNamesNewlyMatchableRows(t *testing.T) {
+	store := newScopeRepairUnnamedFixture(t)
+	regionKeys := scopeRepairTestKeys(t)
+
+	report1, err := repairScopeNames(store.db, regionKeys, true)
+	if err != nil {
+		t.Fatalf("repairScopeNames (apply): %v", err)
+	}
+	if report1.NamedTotal != 1 {
+		t.Fatalf("first apply: NamedTotal = %d, want 1", report1.NamedTotal)
+	}
+
+	assertScopeName(t, store, fixtureRawF, "#test", true) // named: was "", now uniquely matched
+	assertScopeName(t, store, fixtureRawG, "", true)      // untouched: still ambiguous
+	assertScopeName(t, store, fixtureRawH, "", true)      // untouched: still matches nothing
+
+	report2, err := repairScopeNames(store.db, regionKeys, true)
+	if err != nil {
+		t.Fatalf("repairScopeNames (second apply): %v", err)
+	}
+	if report2.NamedTotal != 0 {
+		t.Errorf("second apply: NamedTotal = %d, want 0 (idempotent)", report2.NamedTotal)
+	}
+	if report2.Unchanged != 3 {
+		t.Errorf("second apply: Unchanged = %d, want 3 (rows F, G, H)", report2.Unchanged)
+	}
+	if len(report2.Unexpected) != 0 {
+		t.Errorf("second apply: len(Unexpected) = %d, want 0", len(report2.Unexpected))
+	}
+	assertScopeName(t, store, fixtureRawF, "#test", true)
+}
+
+// TestScopeRepairReportCountsBothDirections pins the report's after-totals
+// arithmetic now that a run can move rows in both directions: NamedTotal
+// rows gain a name and CorrectedTotal rows lose one.
+func TestScopeRepairReportCountsBothDirections(t *testing.T) {
+	var buf bytes.Buffer
+	writeScopeRepairReport(&buf, &scopeRepairReport{
+		Applied:            true,
+		ScannedNotNull:     10,
+		NamedBefore:        6,
+		UnnamedBefore:      4,
+		CorrectedTotal:     1,
+		CorrectedByOldName: map[string]int{"#test": 1},
+		NamedTotal:         3,
+		NamedByNewName:     map[string]int{"#bx": 2, "#fr": 1},
+	})
+	out := buf.String()
+
+	for _, want := range []string{
+		"newly named (unmatched \"\" -> region):                   3",
+		"named after:  8, unnamed (\"\") after:  2",
+		"#bx: 2 row(s)",
+		"#fr: 1 row(s)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q; got:\n%s", want, out)
+		}
+	}
 }
