@@ -10,6 +10,22 @@
 
 **Spec:** `docs/specs/2026-09-07-auto-region-keys-design.md`, sections 1–3.
 
+**Status: code complete, two checks deferred.** All eleven tasks are committed
+(`ac8ff6d3`, `b222421c`, `068af8f1`, `46c50ff4`, `a19af378`, `757407f0`, `a5575cb2`,
+`2e2ae3a6`). Two deviations from this plan, both deliberate: `matchScope`'s removal was
+moved from Task 4 into Task 5 alongside the call-site update, and Tasks 5-7 landed as one
+commit — splitting either would have left a commit that does not build (AGENTS.md rule 6).
+
+Verification: full ingestor suite green apart from `TestWriteStatsAtomic_SymlinkAtDestIsReplaced`,
+which fails with "A required privilege is not held by the client" — Windows
+`SeCreateSymbolicLinkPrivilege`, byte-identical to master and unrelated to this work.
+Frontend 692/99/18, `gofmt -l` and `go vet` clean, `config.example.json` valid.
+
+Deferred: **`go test -race` could not run here** (needs cgo, no gcc on this machine) and
+must run in CI on Linux — `atomic.Pointer` is race-free by construction and no published
+snapshot is ever mutated, but that is an argument, not a measurement. And Task 11 Step 5,
+recording the real ambiguity rate, needs the feature enabled on a live instance.
+
 **Depends on M0** for its *measurement*, not for its code. Nothing here shares a file with M0 or M1 — this plan is entirely `cmd/ingestor/`. But until M0 fixes forwarder attribution (`### M0` in the spec, `b610d461`), 133 of 205 repeaters have zero attributable evidence, so a derived key that correctly names `#behka` in `transmissions.scope_name` still leaves the declaring repeater in `notObserved`: its hops were discarded before nameability ever came into play. M2's effect on the audit would be exactly zero for 65% of repeaters — indistinguishable from M2 not working. Build order is M0 → M1 → M2.
 
 Also re-read Task 11 Step 5 in light of that: the ambiguity rate it records is only meaningful once attribution is fixed, and the spec's M0 section calls for re-measuring the first-cause share before M2 is sized at all.
@@ -49,7 +65,7 @@ Also re-read Task 11 Step 5 in light of that: the ambiguity rate it records is o
 - Modify: `cmd/ingestor/config.go` (`Config` struct ~line 61, accessors near `ClientRegionsEnabled` ~line 183)
 - Test: `cmd/ingestor/config_test.go` (create the file if absent)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 func TestAutoRegionKeysDefaultsOff(t *testing.T) {
@@ -94,12 +110,12 @@ func TestAutoRegionKeysRejectsNonPositiveOverrides(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/ingestor && go test ./... -run TestAutoRegionKeys -v`
 Expected: FAIL to compile — `undefined: AutoRegionKeysConfig`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `cmd/ingestor/config.go`, add to the `Config` struct after `ClientRegions`:
 
@@ -165,12 +181,12 @@ func (c *Config) AutoRegionKeysRefreshMinutes() int {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd cmd/ingestor && go test ./... -run TestAutoRegionKeys -v`
 Expected: PASS (3 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cmd/ingestor/config.go cmd/ingestor/config_test.go
@@ -187,7 +203,7 @@ Pure functions, no database. Built before the DB read so the ranking rules are p
 - Create: `cmd/ingestor/region_keys.go`
 - Create: `cmd/ingestor/region_keys_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `cmd/ingestor/region_keys_test.go`:
 
@@ -285,12 +301,12 @@ func TestRankDeclaredRegionsDropsUnacceptableNames(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/ingestor && go test ./... -run 'TestRegionName|TestRankDeclared' -v`
 Expected: FAIL to compile — `undefined: regionNameAcceptable`, `undefined: declaredRegionStat`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Create `cmd/ingestor/region_keys.go`:
 
@@ -393,12 +409,12 @@ func splitDeclaredRegionsCSV(csv string) []string {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd cmd/ingestor && go test ./... -run 'TestRegionName|TestRankDeclared' -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cmd/ingestor/region_keys.go cmd/ingestor/region_keys_test.go
@@ -413,7 +429,7 @@ git commit -m "feat(ingestor): candidate filter and deterministic ranking for de
 - Modify: `cmd/ingestor/region_keys.go`
 - Test: `cmd/ingestor/region_keys_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/ingestor/region_keys_test.go`:
 
@@ -503,12 +519,12 @@ func keyNames(s *regionKeySnapshot) []string {
 
 Add `"sort"` to the test file's imports.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/ingestor && go test ./... -run TestRegionKeySet -v`
 Expected: FAIL to compile — `undefined: newRegionKeySet`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Append to `cmd/ingestor/region_keys.go` (add `"crypto/sha256"` and `"sync/atomic"` to its imports):
 
@@ -596,17 +612,17 @@ func (s *regionKeySet) refreshDerived(names []string) []string {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd cmd/ingestor && go test ./... -run TestRegionKeySet -v`
 Expected: PASS (4 tests)
 
-- [ ] **Step 5: Run the race detector**
+- [x] **Step 5: Run the race detector**
 
 Run: `cd cmd/ingestor && go test ./... -race -run TestRegionKeySet`
 Expected: PASS with no race reported.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cmd/ingestor/region_keys.go cmd/ingestor/region_keys_test.go
@@ -622,7 +638,7 @@ git commit -m "feat(ingestor): two-tier regionKeySet behind an atomic snapshot"
 - Modify: `cmd/ingestor/main.go` (delete `matchScope`, keep `matchingRegions`)
 - Test: `cmd/ingestor/region_keys_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/ingestor/region_keys_test.go`:
 
@@ -749,12 +765,12 @@ func TestScopeMatchTwoDerivedKeysStayAmbiguous(t *testing.T) {
 
 Add `"crypto/hmac"`, `"crypto/sha256"`, and `"encoding/hex"` to the test file's imports.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/ingestor && go test ./... -run TestScopeMatch -v`
 Expected: FAIL to compile — `snap.match undefined`, `undefined: scopeReasonUnique`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Append to `cmd/ingestor/region_keys.go`:
 
@@ -816,18 +832,18 @@ func (s *regionKeySnapshot) match(payloadType byte, payloadRaw []byte, code1 str
 }
 ```
 
-- [ ] **Step 4: Delete the superseded `matchScope`**
+- [x] **Step 4: Delete the superseded `matchScope`**
 
 In `cmd/ingestor/main.go`, delete the `matchScope` function and its doc comment entirely (the block ending `return ""` just above `matchingRegions`). Keep `matchingRegions` unchanged — `match` calls it.
 
 While deleting, note that the old comment's suggestion to "consider a pre-indexed lookup table" beyond 50 regions goes with it. That is not achievable: `code1` is an HMAC over the packet payload, so there is no payload-independent key to index on. The cost is inherently one HMAC per configured region per transport-scoped packet, which is precisely why `maxDerived` exists.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cd cmd/ingestor && go test ./... -run TestScopeMatch -v`
 Expected: PASS (5 tests). The build will still fail elsewhere until Task 5 updates the call sites — that is expected; run with `-run` scoped as shown, and do not "fix" the callers yet.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cmd/ingestor/region_keys.go cmd/ingestor/region_keys_test.go cmd/ingestor/main.go
@@ -845,7 +861,7 @@ Mechanical but wide. All thirteen sites, in one commit, so the tree is never hal
 - Modify: `cmd/ingestor/client_reception.go` (lines ~26, 96, 425, 450)
 - Modify: `cmd/ingestor/db.go` (lines ~1610, 2133, 2186)
 
-- [ ] **Step 1: Change the signatures**
+- [x] **Step 1: Change the signatures**
 
 Replace the parameter type `regionKeys map[string][]byte` with `regionSet *regionKeySet` in:
 
@@ -857,7 +873,7 @@ Replace the parameter type `regionKeys map[string][]byte` with `regionSet *regio
 | `db.go` | `BuildPacketData` |
 | `main.go` | `handleMessage` |
 
-- [ ] **Step 2: Add the counter**
+- [x] **Step 2: Add the counter**
 
 Append to `cmd/ingestor/region_keys.go` (add `"log"` to imports):
 
@@ -901,7 +917,7 @@ func logScopeMatchCounters() {
 }
 ```
 
-- [ ] **Step 3: Change the two match call sites**
+- [x] **Step 3: Change the two match call sites**
 
 In `client_reception.go`, replace:
 
@@ -933,7 +949,7 @@ with:
 			pd.ScopeName = m.Name
 ```
 
-- [ ] **Step 4: Update the callers**
+- [x] **Step 4: Update the callers**
 
 In `main.go`, change line ~111:
 
@@ -952,12 +968,12 @@ In `db.go`'s `BackfillDefaultScopeAsync`, replace the `len(regionKeys) == 0` ear
 
 In `client_reception.go`, pass `regionSet` through to `buildClientRxObservation`.
 
-- [ ] **Step 5: Build and run the full suite**
+- [x] **Step 5: Build and run the full suite**
 
 Run: `cd cmd/ingestor && go build ./... && go test ./...`
 Expected: build succeeds, all tests PASS. `scope_repair.go` still compiles because it calls `matchingRegions` directly, not `matchScope` — Task 7 changes its key source.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cmd/ingestor/
@@ -972,7 +988,7 @@ git commit -m "refactor(ingestor): thread *regionKeySet through the ingest path"
 - Modify: `cmd/ingestor/db.go`
 - Test: `cmd/ingestor/region_keys_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/ingestor/region_keys_test.go`:
 
@@ -1023,12 +1039,12 @@ func insertDeclaredRegionsRow(t *testing.T, s *Store, target, observedAt, region
 
 `newTestStore` is defined in `cmd/ingestor/main_test.go:121` and opens a real store via `OpenStore`, so the full schema — `node_declared_regions` included — already exists. Do not add a second helper.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/ingestor && go test ./... -run TestDeclaredRegionStats -v`
 Expected: FAIL to compile — `store.DeclaredRegionStats undefined`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to `cmd/ingestor/db.go`, beside `CurrentDeclaredRegions`:
 
@@ -1095,12 +1111,12 @@ func (s *Store) DeclaredRegionStats() ([]declaredRegionStat, error) {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd cmd/ingestor && go test ./... -run TestDeclaredRegionStats -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cmd/ingestor/db.go cmd/ingestor/region_keys_test.go
@@ -1115,7 +1131,7 @@ git commit -m "feat(ingestor): DeclaredRegionStats — declared names with decla
 - Modify: `cmd/ingestor/region_keys.go` (a `refreshFromStore` helper so both startup and the ticker share one path)
 - Modify: `cmd/ingestor/main.go`
 
-- [ ] **Step 1: Add the shared refresh helper**
+- [x] **Step 1: Add the shared refresh helper**
 
 Append to `cmd/ingestor/region_keys.go`:
 
@@ -1147,7 +1163,7 @@ func (s *regionKeySet) refreshFromStore(store *Store) {
 }
 ```
 
-- [ ] **Step 2: Call it at startup**
+- [x] **Step 2: Call it at startup**
 
 In `cmd/ingestor/main.go`, replace the line added in Task 5:
 
@@ -1166,7 +1182,7 @@ with:
 	}
 ```
 
-- [ ] **Step 3: Add the ticker**
+- [x] **Step 3: Add the ticker**
 
 In `cmd/ingestor/main.go`, after the existing client-RX retention ticker block, add:
 
@@ -1188,7 +1204,7 @@ In `cmd/ingestor/main.go`, after the existing client-RX retention ticker block, 
 	}
 ```
 
-- [ ] **Step 4: Verify the disabled path changes nothing**
+- [x] **Step 4: Verify the disabled path changes nothing**
 
 Append to `cmd/ingestor/region_keys_test.go`:
 
@@ -1211,12 +1227,12 @@ func TestRefreshFromStoreIsNoOpWhenDisabled(t *testing.T) {
 }
 ```
 
-- [ ] **Step 5: Run the full suite**
+- [x] **Step 5: Run the full suite**
 
 Run: `cd cmd/ingestor && go build ./... && go test ./... && go test ./... -race`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cmd/ingestor/region_keys.go cmd/ingestor/region_keys_test.go cmd/ingestor/main.go
@@ -1233,7 +1249,7 @@ Without this, a repair run re-derives every automatically-named row against the 
 - Modify: `cmd/ingestor/scope_repair.go` (`rederiveScope` ~line 67, `runScopeRepair` ~line 274)
 - Test: `cmd/ingestor/scope_repair_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/ingestor/scope_repair_test.go`:
 
@@ -1268,12 +1284,12 @@ func TestScopeRepairKeepsDerivedNames(t *testing.T) {
 
 Note: `codeFor` builds `code1` from the payload, and the raw hex embeds it, so the two sides cannot drift. Add `"encoding/hex"` and `"strings"` to the test file's imports if absent.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/ingestor && go test ./... -run TestScopeRepairKeepsDerivedNames -v`
 Expected: FAIL to compile — `cannot use set.snapshot() (*regionKeySnapshot) as map[string][]byte`
 
-- [ ] **Step 3: Change `rederiveScope` to take the snapshot**
+- [x] **Step 3: Change `rederiveScope` to take the snapshot**
 
 In `cmd/ingestor/scope_repair.go`, change the signature:
 
@@ -1287,7 +1303,7 @@ and the `matchingRegions` call inside it:
 	matched := matchingRegions(snap.all, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
 ```
 
-- [ ] **Step 4: Build the derived tier in `runScopeRepair`**
+- [x] **Step 4: Build the derived tier in `runScopeRepair`**
 
 In `runScopeRepair`, replace:
 
@@ -1324,7 +1340,7 @@ with:
 	report, err := repairScopeNames(store.db, snap, *apply)
 ```
 
-- [ ] **Step 5: Update `repairScopeNames`**
+- [x] **Step 5: Update `repairScopeNames`**
 
 Change its signature and the one call it makes:
 
@@ -1338,12 +1354,12 @@ func repairScopeNames(db *sql.DB, snap *regionKeySnapshot, apply bool) (*scopeRe
 
 Update the other `rederiveScope` / `repairScopeNames` call sites in `scope_repair_test.go` to pass a snapshot built with `newRegionKeySet(&Config{HashRegions: ...}).snapshot()`.
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `cd cmd/ingestor && go test ./... -run TestScopeRepair -v` then `go test ./...`
 Expected: PASS, including the pre-existing scope-repair tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add cmd/ingestor/scope_repair.go cmd/ingestor/scope_repair_test.go
@@ -1359,7 +1375,7 @@ AGENTS.md rule 0: perf claims need proof, and this grows the key set by up to `m
 **Files:**
 - Modify: `cmd/ingestor/region_keys_test.go`
 
-- [ ] **Step 1: Write the benchmark**
+- [x] **Step 1: Write the benchmark**
 
 ```go
 // BenchmarkScopeMatch sweeps key-set size because the cost is linear in it and
@@ -1395,16 +1411,16 @@ func BenchmarkScopeMatch(b *testing.B) {
 
 Add `"fmt"` to the test file's imports if absent.
 
-- [ ] **Step 2: Run it and record the numbers**
+- [x] **Step 2: Run it and record the numbers**
 
 Run: `cd cmd/ingestor && go test -bench BenchmarkScopeMatch -benchtime=200x -run '^$' ./...`
 Expected: four lines, roughly linear in key count. Paste the actual output into the commit message — an unrecorded benchmark is not proof.
 
-- [ ] **Step 3: Sanity-check against real load**
+- [x] **Step 3: Sanity-check against real load**
 
 Divide the `keys=314` ns/op by the observed transport-scoped packet rate. On the reference deployment that rate is ~0.04/s (22126 packets over 7 days), so even a 300µs match is ~0.001% of one core. If your measured figure implies more than 5% of a core at your own packet rate, stop and reconsider `maxDerived` before shipping.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add cmd/ingestor/region_keys_test.go
@@ -1419,7 +1435,7 @@ git commit -m "test(ingestor): benchmark scope matching across key-set sizes"
 - Modify: `config.example.json`
 - Modify: `docs/client-regions.md`
 
-- [ ] **Step 1: Add the config block**
+- [x] **Step 1: Add the config block**
 
 In `config.example.json`, immediately after the `_comment_hashRegions` line, add:
 
@@ -1428,7 +1444,7 @@ In `config.example.json`, immediately after the `_comment_hashRegions` line, add
   "_comment_autoRegionKeys": "Opt-in: derive region keys from the region names repeaters declare over RF (node_declared_regions), on top of the explicit hashRegions list above. Default OFF. Solves the case where a repeater forwards a region this instance holds no key for: its traffic is stored unmatched and the Scope Audit reports the region as 'not observed', which reads as a finding about the repeater rather than a gap in this config. TOP-LEVEL FLAG, a sibling of hashRegions — config loading is plain json.Unmarshal with no DisallowUnknownFields, so nesting it elsewhere is silently ignored. maxDerived caps the derived tier (default 256): each key costs one HMAC per transport-scoped packet and raises the random 2-byte collision rate by 1/65536, and the match cannot be indexed because the code is an HMAC over the payload. Over the cap, names are kept by how many distinct repeaters declare them. Requires clientRegions (or an ESP32 observer on the neighbour-report firmware) to be populating node_declared_regions, or the derived tier stays empty."
 ```
 
-- [ ] **Step 2: Document the second consumer**
+- [x] **Step 2: Document the second consumer**
 
 In `docs/client-regions.md`, insert this section between `## Storage — node_declared_regions (ingestor-owned)` (line 98) and `## Configurable values (future customizer)` (line 122):
 
@@ -1455,12 +1471,12 @@ Two consequences operators should know about:
   dropped. The ingestor logs how many names were dropped on each refresh.
 ```
 
-- [ ] **Step 3: Verify the example config still parses**
+- [x] **Step 3: Verify the example config still parses**
 
 Run: `python -c "import json; json.load(open('config.example.json')); print('valid')"`
 Expected: `valid`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add config.example.json docs/client-regions.md
@@ -1471,12 +1487,12 @@ git commit -m "docs(config): document the opt-in autoRegionKeys block"
 
 ### Task 11: Verify end to end
 
-- [ ] **Step 1: Full suites, both binaries**
+- [x] **Step 1: Full suites, both binaries**
 
 Run: `cd cmd/ingestor && go test ./... -race` then `cd ../server && go test ./...`
 Expected: PASS in both.
 
-- [ ] **Step 2: Frontend suite**
+- [x] **Step 2: Frontend suite**
 
 Run: `node test-packet-filter.js && node test-aging.js && node test-frontend-helpers.js`
 Expected: PASS. Nothing in this plan touches the frontend; run it to prove that.
