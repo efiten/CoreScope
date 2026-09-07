@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 )
 
@@ -92,4 +93,56 @@ func regionCode(name string, payloadType byte, payload []byte) string {
 		code = 0xFFFE
 	}
 	return strings.ToUpper(hex.EncodeToString([]byte{byte(code & 0xFF), byte(code >> 8)}))
+}
+
+// unmatchedTransmissionRow is one transmission that carried a transport scope
+// no configured region key matched, with the raw bytes needed to test a region
+// hypothesis against it.
+type unmatchedTransmissionRow struct {
+	txID   int64
+	rawHex string
+}
+
+// unmatchedTransmissionsInWindow is the SECOND, narrow query behind the audit -
+// deliberately not a widening of scopeAuditForwarderScanQuery.
+//
+// That scan returns one row per hop per flood packet: on a 2,000-packet sample
+// after M0 that is 19,049 rows, and carrying raw_hex on every one of them would
+// load the hot path to serve a few hundred packets. This selects only the
+// transmissions that are actually candidates - scope_name = '' inside the
+// window, ~400 over 7 days on the reference deployment - and the main scan is
+// left exactly as it is.
+//
+// scope_name = '' is the "transport-scoped but unnameable" state; NULL means
+// the packet carried no scope at all and can never verify against a region.
+// The route filter matches the forwarder scan's, so the two agree on which
+// packets count as forwarded.
+//
+// Selection only: a row whose raw_hex cannot be walked is still returned, and
+// dropped by newScopeVerifier. Filtering that in SQL is not possible and
+// filtering it here would hide how many candidates the window actually held.
+func (s *PacketStore) unmatchedTransmissionsInWindow(sinceISO string) ([]unmatchedTransmissionRow, error) {
+	rows, err := s.db.conn.Query(`
+		SELECT t.id, t.raw_hex
+		FROM transmissions t
+		WHERE t.first_seen >= ?
+		  AND t.scope_name = ''
+		  AND `+scopeConformanceForwarderRouteTypesSQL, sinceISO)
+	if err != nil {
+		return nil, fmt.Errorf("unmatched transmissions scan: %w", err)
+	}
+	defer rows.Close()
+
+	var out []unmatchedTransmissionRow
+	for rows.Next() {
+		var r unmatchedTransmissionRow
+		if err := rows.Scan(&r.txID, &r.rawHex); err != nil {
+			return nil, fmt.Errorf("unmatched transmissions scan row: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("unmatched transmissions rows: %w", err)
+	}
+	return out, nil
 }

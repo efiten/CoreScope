@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 // realTransportFloodPacket is transmission 0a065d41d51f1f77 from the live
@@ -94,5 +95,30 @@ func TestRegionCodeIsCaseSensitive(t *testing.T) {
 	payloadType, payload, _, _ := scopeHMACInputs(realTransportFloodPacket)
 	if regionCode("behss", payloadType, payload) == regionCode("BEHSS", payloadType, payload) {
 		t.Error("regionCode folded case — the key is a hash over raw bytes and must not")
+	}
+}
+
+func TestUnmatchedTransmissionsInWindow(t *testing.T) {
+	s := newScopeTestStore(t)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	old := "2020-01-01T00:00:00Z"
+	seedTransmissionRouteAt(t, s, "E3D3", scopeUnmatched(), RouteFlood, recent)
+	seedTransmissionRouteAt(t, s, "E3D3", scopeMatched("#be"), RouteFlood, recent)
+	seedTransmissionRouteAt(t, s, "E3D3", scopeUnscoped(), RouteFlood, recent)
+	seedTransmissionRouteAt(t, s, "E3D3", scopeUnmatched(), RouteFlood, old)
+
+	since := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	got, err := s.unmatchedTransmissionsInWindow(since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1 — only the recent scope_name='' row qualifies", len(got))
+	}
+	// scopeUnmatched() seeds raw_hex 'AA', which scopeHMACInputs rejects. The
+	// query's job is selection; unparseable rows are dropped by the caller, so
+	// they must still be returned here rather than filtered in SQL.
+	if got[0].txID == 0 {
+		t.Error("txID = 0, want the transmission's real id")
 	}
 }
