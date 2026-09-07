@@ -117,7 +117,10 @@ func TestScopeHMACInputsRejectsMalformed(t *testing.T) {
 		{"14", "header only, no transport codes"},
 		{"1492090000", "transport codes but no path byte"},
 		{"149209000041", "path byte claims one 2-byte hop, none present"},
-		{"14920900004180" + strings.Repeat("00", 200), "hash_size 4 is reserved (pathByte 0x80 upper bits)"},
+		// pathByte 0xC0: upper two bits 11 -> hash_size 4, which firmware
+		// reserves and isValidPathLen rejects even at hash_count 0
+		// (cmd/server/decoder.go, mirroring Packet.cpp:13-18).
+		{"1492090000C0" + strings.Repeat("00", 8), "hash_size 4 is reserved"},
 	} {
 		if _, _, _, ok := scopeHMACInputs(c.hex); ok {
 			t.Errorf("ok = true for %q (%s), want false", c.hex, c.why)
