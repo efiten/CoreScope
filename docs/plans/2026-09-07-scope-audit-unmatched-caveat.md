@@ -433,17 +433,29 @@ Expected: PASS in both. The ingestor is untouched by this plan; run it to prove 
 Run: `node test-packet-filter.js && node test-aging.js && node test-frontend-helpers.js`
 Expected: PASS
 
-- [ ] **Step 3: Browser validation** (AGENTS.md rule 2)
+- [x] **Step 3: Browser validation** (AGENTS.md rule 2)
 
-Start the server against a database with declared-regions data, open `#/scope-audit`, and confirm a row with unmatched traffic shows the new chip next to its grey chips, with the title text readable on hover. Take a screenshot. If no local database has such a row, say so rather than claiming the check passed.
+Done 2026-09-07 on staging (`staging.on8ar.eu`; `/api/health` reports `commit: e8725306`, this branch's head). The `BE-LML-RP01` row at window 24h shows the chip reading `8 forwarded packets unexplained` beside its five grey chips; at 7d it reads `21 forwarded packets unexplained`. Both match the API for the same window at the same moment: 24h `observedUnmatchedPackets: 9` minus 1 packet explained by `regionEvidence`, 7d `observedUnmatchedPackets: 25` minus 4. Screenshots taken by the operator.
 
-- [ ] **Step 4: Confirm the fix against the real case**
+- [x] **Step 4: Confirm the fix against the real case**
 
-With the live database or the fixture, the row for `e3d3f4d7edd02aced3442b4ca77acb0824d9fcf1dc53cc42dca1ee0abe1cc0b1` must show a non-zero unnameable count alongside its `behss` and `fm-112` chips. That is the case this plan exists for; if it does not show, the plan has not worked regardless of what the unit tests say.
+Confirmed by a different row, because the original case no longer exists in this form. `#behss` and `#fm-112` were merged into the live `hashRegions` on 2026-09-07 08:42 (`config.json.bak-hashregions-20260907-084120`, 58 keys to 159), so both regions are now named at ingest and the `e3d3f4d7` row reads `notObserved: []` with `regionEvidence: {}` on live and on staging. Its unnameable count is non-zero (`observedUnmatchedPackets: 9` at 24h), which is the part of Step 4 that still applies.
 
-- [ ] **Step 5: Check the two caveats are not both permanently on**
+The chip was instead confirmed against `BE-LML-RP01` (`97028e5a`), whose declared `belml`, `nl-li` and `bx` have no configured key. See Step 3 for the numbers.
 
-M0 widens attribution from 222 distinct last-hops to every hop in every flood path (964 distinct prefixes on a 2000-packet sample), so `ambiguousHops` — currently 0 on all 205 rows precisely because so few hops were considered — will start firing. If both this chip and `possibly ambiguous` end up lit on most rows, neither tells the reader anything and the column is worse than before M0. Count how many rows carry each after M0 and report the numbers; if both exceed roughly half the rows, raise it rather than shipping two permanent caveats.
+- [x] **Step 5: Check the two caveats are not both permanently on**
+
+Measured on staging after deploy, 206 rows, 2026-09-07:
+
+| | 24h | 7d |
+|---|---|---|
+| `ambiguousHops > 0` | 2 | 2 |
+| `observedUnmatchedPackets > 0` | 63 | 78 |
+| both | 0 | 0 |
+
+`ambiguousHops` did start firing after M0 (0 rows before, 2 after) but stays far below the "roughly half the rows" line, and no row carries both caveats. Nothing to raise.
+
+Caveat on the comparison: this is staging with live's 159-key `hashRegions` and live's 1024 `node_declared_regions` rows imported, after `scope-repair -apply`. It is not the same database as the 119/205 pre-deploy baseline taken on live, so the row counts are comparable in shape, not row for row.
 
 ---
 

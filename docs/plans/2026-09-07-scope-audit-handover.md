@@ -122,6 +122,35 @@ core at this network's 0.037 transport-scoped packets/s.
 
 ## Outstanding — and where each piece has to happen
 
+### Session of 2026-09-07 evening: what has since been done
+
+Staging runs this branch (`/api/health` reports the branch head). To make it a usable
+test bed its config was given live's 159 `hashRegions`, `clientRegions.enabled` and
+`retention.clientRegionsDays: 90`, live's 1024 `node_declared_regions` rows were
+imported into the staging database, and `scope-repair -apply` was run there (597 rows
+newly named, 402 corrected to unmatched). Live was not touched.
+
+- **Item 1: staging done, live not done.**
+- **Item 2: done**, but not on the row this document names. `#behss` and `#fm-112`
+  were merged into the live `hashRegions` on 2026-09-07 08:42, so both are named at
+  ingest now and the `e3d3f4d7` row reads `notObserved: []` with `regionEvidence: {}`.
+  A region this instance can name is the one case M1b does not handle, so that row can
+  no longer prove it either way. The proof came from `BE-LML-RP01` (`97028e5a`)
+  instead: at 7d, `nl-nb` green with a dotted underline on 3 corroborating packets,
+  `belml` grey on 1. See the M1b plan's Task 8 Step 5.
+- **Item 3: already done before this session** (that 08:42 config change, 58 keys to
+  159). Its cost is worth knowing: the added keys collide on `code1`, and
+  `scope-repair` on staging moved 402 rows from a name back to unmatched, 98 of them
+  `#be` and 57 `#de`.
+- **Item 4: three of four measured.** Default-off proof, feature-on proof and the
+  double-caveat check are recorded in the plans and the spec. The ambiguity rate is
+  **still open**: it prints on a 15-minute ticker and each deploy replaces the
+  container, taking `docker logs` with it.
+- **New, found while validating: `/api/scope-audit?window=7d` costs 16.7s cold** on a
+  live-shaped database, against 4.0s for 24h and 0.15s for 1h. Two commits address it
+  (`942761c4`, `b7515cec`); the spec's M0 section carries the measurements, including
+  the three SQL-side approaches that measured worse and were rejected.
+
 ### On the build/publish laptop (server access)
 
 1. **Deploy the branch to staging, then live.** Nothing here is running anywhere. The

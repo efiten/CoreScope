@@ -429,6 +429,38 @@ the one with the largest effect on what the audit reports.
   M2's sizing depends on what remains once attribution is fixed, not on the 45%
   measured through the last-hop rule
 
+#### What widening attribution costs, measured on staging 2026-09-07
+
+Reading every hop instead of `path[last]` multiplies the rows the scan returns.
+On a live-shaped database (206 declared repeaters, 965k transmissions) the 7d
+window returns **3,470,188 hop rows** from 1,368,761 observations carrying a
+path, and `GET /api/scope-audit?window=7d` took **16.7s** cold, against 4.0s for
+24h and 0.15s for 1h. SQLite accounts for 2.7s of that; the rest was the Go side
+reading rows.
+
+Three SQL-side reductions were measured on that database and all were rejected,
+because each costs more than it saves:
+
+| approach | rows returned | time in SQLite |
+|---|---|---|
+| the query as written | 3,470,188 | 2.7s |
+| pre-filter on the declared targets' first 4 hex chars | 1,971,126 | 20.9s |
+| `GROUP BY t.id, hop` | 965,025 | 38.0s |
+| `SELECT DISTINCT t.id, path_json` | 1,229,966 | 17.7s |
+
+The query plan is already index-driven (`idx_transmissions_first_seen`, then
+`idx_observations_tx_ts`), so there is no missing index behind this: the rows are
+inherent to the data. Note for anyone attempting a hop comparison in SQL:
+**80% of stored hops are uppercase** (1,026,814 of 1,284,897 in a 24h window)
+because `packetpath.DecodePathFromRawHex` writes them that way, while targets are
+lowercase. A case-sensitive comparison silently drops most attributable hops.
+
+What did work was taking the per-transmission columns out of the per-hop rows
+(`942761c4`) and not recomputing the same window concurrently or every 30s
+(`b7515cec`). Measured after both, warm process: **24h 2.79-2.89s across six
+samples** (from 4.04s) and **7d 11.6s** (from 16.7s), with repeat requests inside
+the TTL served in ~1ms.
+
 ### M1 — Scope-audit honesty
 
 `cmd/server/` and `public/` only. Ships value on its own and reviews independently.
@@ -509,6 +541,46 @@ plumbing path evidence into the decode path.
 **Build only if M2's `ambiguous` logging shows the volume justifies it.** The
 design remains the tiered one; the last tier is built on measurement rather than
 expectation.
+
+#### What the first run on staging measured (2026-09-07)
+
+The gate is **still open, and the first tally points at closing it**. After 15
+minutes on staging:
+
+```
+[regions] scope matches: unique=1306 explicit-over-derived=0 ambiguous=0 none=0
+```
+
+Zero ambiguous in 1306 scoped packets. That is one ticker interval, not the day the
+gate asks for, and it is not identically zero either: the same container logged nine
+`ambiguous collision between [#lu #be]` lines in the seconds after an MQTT reconnect,
+so the rate is low rather than absent. The full reading has to come from a container
+left running, because each deploy replaces it and takes `docker logs` along.
+
+What the same run did settle is the size of the derived tier on this network, and it
+is not what the estimate above assumes:
+
+```
+[regions] derived-key refresh: 124 name(s) declared, 124 kept after filter+cap(256), 160 total key(s) in force
+[regions] derived keys now active: [#null]
+```
+
+159 explicit keys plus **one** derived. The 123 other declared names had already been
+merged into the live `hashRegions` by hand that morning (58 keys to 159), so the
+derived tier had nothing left to add but the one name no operator would type.
+`scope-repair --dry-run` with the feature on: 0 rows newly named, 2 corrected.
+
+`#null` is a repeater that declares a region literally named `null`
+(`95f8e61c…`). `regionNameAcceptable` accepts it deliberately — the rules are
+structural, and its own comment names `null` as an example of a junk-looking name
+that costs one slot out of `maxDerived` and one 1-in-65536 collision chance. The
+measurement confirms the rule behaves as designed; it is not a filter gap.
+
+The consequence for sizing: at ~160 keys rather than the ~180 assumed above, and with
+tier 2 absorbing explicit-against-derived collisions, the ambiguous share this network
+can produce is smaller than the estimate that gates M3. That makes the reading more
+likely to close the gate than to open it, which is a reason to take it rather than
+skip it.
 
 If built: candidate X wins when at least one resolvable path hop declares X and no
 resolvable hop declares a competing candidate. Hops shorter than

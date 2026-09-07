@@ -1258,13 +1258,22 @@ git add cmd/server/scope_verify_test.go
 git commit -m "test(scope-audit): benchmark the verification pass at audit scale"
 ```
 
-- [ ] **Step 5: Confirm against the real case after deploy**
+- [x] **Step 5: Confirm against the real case after deploy**
 
-Deferred, like M1's, and for the same reason: `test-fixtures/e2e-fixture.db` predates the feature and has neither `node_declared_regions` nor `scope_name`.
+Done 2026-09-07 on staging (`commit: e8725306`), against a different repeater than planned, because the planned one stopped being a test case.
 
-On staging or live, the row for `e3d3f4d7edd02aced3442b4ca77acb0824d9fcf1dc53cc42dca1ee0abe1cc0b1` must show **`fm-112` and `behss` green with dotted underlines**, and its `regionEvidence` must report counts in the same proportion measured by hand on 2026-09-07: 23 for `fm-112`, 3 for `behss` out of 36 unmatched rows in a 2000-packet sample. Exact numbers will differ — that sample was one node's packets, not a window — but both regions must clear the threshold of 2. If either stays grey, the feature has not worked whatever the unit tests say.
+`#behss` and `#fm-112` were merged into the live `hashRegions` on 2026-09-07 08:42 (58 keys to 159). Both are now named at ingest, so the `e3d3f4d7` row reads `notObserved: []` and `regionEvidence: {}`: green by the ordinary route, with nothing left for verification to establish. A region this instance can name is exactly the case M1b does not handle, so this row can no longer prove or disprove it.
 
-Then re-run the caveat measurement (`caveat-check.py`) and compare against the pre-deploy baseline of 119/205 rows carrying a finding. The expected direction is fewer findings and a sharply smaller unexplained-caveat count.
+The proof came from `BE-LML-RP01` (`97028e5a`), which declares `belml`, `nl-li`, `nl-nb` and `bx`, none of which have a configured key. At window 7d:
+
+- `regionEvidence: {"nl-nb": 3, "belml": 1}`, `notObserved: ["nl-li", "bx", "belml"]`
+- `nl-nb` renders **green with a dotted underline**, tooltip: "observed — 3 forwarded packets in this window derive to this region, verified against the repeater's own declared list. This instance holds no hashRegions key for it, so it could not be named directly."
+- `belml`, with a single hit, **stays grey**. That is the threshold doing its job, and it is visible in the product rather than only in a test.
+- At window 24h the same row has `nl-nb` at 1 hit and it is grey there too, so the threshold is not a function of the window boundary.
+
+Five other repeaters clear the threshold at 7d: `BE-KRO-RP02`, `BE-LML-RP02`, `BE-MGU-RP01`, `BE-BRE-RP03` (all `nl-nb`) and `BE-TUR-REP1` (`nl-nb`, with `nl` at one hit and correctly grey).
+
+Not done: the pre/post comparison against the 119/205 live baseline. Staging carries live's key set and declared-region rows but its own packet history, so the numbers are not row-comparable; the caveat counts that were measured are in the M1 plan's Step 5.
 
 ---
 
