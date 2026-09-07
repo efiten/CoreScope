@@ -700,6 +700,21 @@ type ScopeAuditRow struct {
 	// UndeclaredObserved entry is unaffected by it (ambiguous hops are never
 	// attributed to a scope at all).
 	AmbiguousHops int64 `json:"ambiguousHops"`
+
+	// ObservedUnmatchedPackets counts packets this repeater was observed
+	// forwarding whose transport scope matched no region key this instance
+	// holds. Like AmbiguousHops it is a caveat rather than a finding, but the
+	// two have different causes and different fixes: AmbiguousHops is a
+	// pubkey-prefix collision between two repeaters and nobody's fault,
+	// ObservedUnmatchedPackets is a missing entry in this instance's own
+	// hashRegions and the reader can act on it. A non-zero value means any
+	// NotObserved entry on this row may name a region this instance cannot
+	// name rather than one the repeater is not forwarding.
+	//
+	// It says nothing about DeclaredWildcard: unmatched traffic IS scoped, so
+	// it never feeds WildcardContradiction, which counts only plain unscoped
+	// floods.
+	ObservedUnmatchedPackets int64 `json:"observedUnmatchedPackets"`
 }
 
 // ScopeAuditResponse is the payload for GET /api/scope-audit. Only

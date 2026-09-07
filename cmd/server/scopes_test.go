@@ -1331,6 +1331,35 @@ func TestHandleScopeAuditSurfacesAmbiguousHops(t *testing.T) {
 	}
 }
 
+// TestHandleScopeAuditSurfacesUnmatchedPackets: a repeater declares "behss",
+// and this instance sees it forward transport-scoped traffic it cannot name.
+// The row must still list "behss" as notObserved — an unmatched packet names
+// no region, so it cannot satisfy the declaration — but it must also carry
+// observedUnmatchedPackets, so a client can say the finding might be a missing
+// region key rather than a silent repeater.
+func TestHandleScopeAuditSurfacesUnmatchedPackets(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "behss", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, pk[:4], scopeUnmatched(), RouteFlood, recent)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 1 {
+		t.Fatalf("repeaters = %+v, want 1", got.Repeaters)
+	}
+	row := got.Repeaters[0]
+	if row.ObservedUnmatchedPackets != 1 {
+		t.Errorf("observedUnmatchedPackets = %d, want 1", row.ObservedUnmatchedPackets)
+	}
+	if len(row.NotObserved) != 1 || row.NotObserved[0] != "behss" {
+		t.Errorf("notObserved = %v, want [\"behss\"] — an unmatched packet names no region and cannot satisfy a declaration", row.NotObserved)
+	}
+	if row.WildcardContradiction {
+		t.Error("wildcardContradiction = true, want false — unmatched traffic is scoped, so it says nothing about '*'")
+	}
+}
+
 // TestHandleScopeAuditSortsMissingRegionsFirst: the repeater with a declared
 // region it is not forwarding must rank above a repeater in full agreement —
 // that's the headline this endpoint exists to surface, not the boring majority.

@@ -3629,26 +3629,28 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var unscopedPackets, ambiguousHops int64
+		var unscopedPackets, ambiguousHops, unmatchedPackets int64
 		if agg != nil {
 			unscopedPackets = agg.unscopedPackets
 			ambiguousHops = agg.ambiguousHops
+			unmatchedPackets = agg.unmatchedPackets
 		}
 
 		resp.Repeaters = append(resp.Repeaters, ScopeAuditRow{
-			PublicKey:               pk,
-			Name:                    id.Name,
-			Role:                    id.Role,
-			DeclaredRegions:         declaredNamed,
-			DeclaredWildcard:        declaredWildcard,
-			ConfigState:             scopeAuditConfigState(declaredNamed, declaredWildcard),
-			DeclaredAt:              d.ObservedAt,
-			Truncated:               d.Truncated,
-			NotObserved:             notObserved,
-			UndeclaredObserved:      undeclared,
-			ObservedUnscopedPackets: unscopedPackets,
-			WildcardContradiction:   unscopedPackets > 0 && !declaredWildcard,
-			AmbiguousHops:           ambiguousHops,
+			PublicKey:                pk,
+			Name:                     id.Name,
+			Role:                     id.Role,
+			DeclaredRegions:          declaredNamed,
+			DeclaredWildcard:         declaredWildcard,
+			ConfigState:              scopeAuditConfigState(declaredNamed, declaredWildcard),
+			DeclaredAt:               d.ObservedAt,
+			Truncated:                d.Truncated,
+			NotObserved:              notObserved,
+			UndeclaredObserved:       undeclared,
+			ObservedUnscopedPackets:  unscopedPackets,
+			WildcardContradiction:    unscopedPackets > 0 && !declaredWildcard,
+			AmbiguousHops:            ambiguousHops,
+			ObservedUnmatchedPackets: unmatchedPackets,
 		})
 	}
 
