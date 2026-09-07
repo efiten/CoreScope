@@ -178,12 +178,21 @@ the first of those is today's baseline; the others are what the cap buys.
 
 ## Scope
 
-M0, M1 and M2 below. M3 is explicitly gated on measurements taken during M2. M4 is
-tracked, not built.
+M0, M1, M1b and M2 below. M3 is explicitly gated on measurements taken during M2.
+M4 is tracked, not built.
 
 M0 was added by the 2026-09-07 amendment and comes first: it is a `cmd/server/`
 change of two SQL predicates, and until it lands neither M1's counter nor M2's
 effect can be observed on the audit at all.
+
+M1b was added by a second 2026-09-07 amendment, and it changes what M2 is for.
+M1 marks a declared region this instance cannot name with a row-level caveat, but
+leaves its chip grey — and grey reads as "declared but not forwarding", a claim
+the data does not support either. M1b resolves that question directly instead of
+footnoting it. Once it lands, **M2 no longer fixes the audit**; it fixes the rest
+of the product (the packets page, scope-stats, `default_scope`, the per-node
+observed list), which is real but a different and less urgent kind of value than
+this document originally claimed for it.
 
 Out of scope: regions in use but never declared over RF. Neither the config fix
 nor this design can name those — both lean on the declared side.
@@ -333,6 +342,50 @@ every automatically-named row as unmatched and write `""` back over it. It must
 build the same two-tier `regionKeySet`, including a derived-tier refresh, before
 scanning. This is a data-loss bug if missed, not a detail.
 
+### 3b. Declared-region verification (independent of 1–3)
+
+M1's caveat says "some of this row's grey chips may be unnameable rather than
+unforwarded". That is honest but weak: the question it declines to answer is
+answerable, per chip, from data already in the database.
+
+For a repeater R declaring region X, with unmatched packets it was observed
+forwarding: derive `SHA256("#X")[:16]`, HMAC each of those packets' payloads with
+it, and compare to the packet's stored `code1` — exactly the computation
+`matchingRegions` performs, but with the candidate set narrowed to R's own
+declarations rather than every key this instance holds.
+
+Three properties make this a better instrument for *this* question than the
+global derivation in section 1:
+
+  - **Better signal-to-noise.** Section 1 tests ~180 hypotheses against every
+    packet, of which at most one is related to it; that is why it needs a cap, a
+    ranking and a tie-break to contain the noise it creates. Here the ~9
+    hypotheses per repeater are each independently supported before the test runs:
+    the repeater says it forwards these regions.
+  - **Corroboration is available, and it is not available to section 1.** The
+    ingest-time path names each packet in isolation: one packet, one decision, a
+    1-in-65536 chance of a coincidental match. Verification looks at a set. If
+    two or more of R's unmatched packets derive to X, the odds of coincidence are
+    (1/65536)² or better. **A chip turns green on ≥2 corroborating packets;
+    exactly one leaves it grey with its own tooltip**, because a single match is
+    not evidence.
+  - **Nothing is written.** This is a read-time inference in `cmd/server/`, so a
+    wrong answer expires with the window rather than persisting in
+    `transmissions.scope_name` until someone runs `scope-repair`. It also keeps
+    the read/write invariant intact without argument.
+
+**Query shape matters here.** `scopeAuditForwarderScanQuery` returns one row per
+hop per flood packet — 19,049 rows in a 2,000-packet sample after M0 — so widening
+it to carry `raw_hex` would load the hot scan for nothing. Verification takes a
+**second, narrow query** over only the unmatched transmissions in the window
+(~400 over 7 days), fetching `id` and `raw_hex`, decoding each once and reusing the
+payload across every candidate name. The main scan is untouched.
+
+What survives of M1's chip: after M1b the row-level caveat fires only for
+unmatched traffic matching **none** of the repeater's declared names. That is
+rarer and more interesting than what it reports today — a repeater forwarding a
+region it does not declare *and* that this instance cannot name.
+
 ### 4. Scope-audit honesty (independent of 1–3)
 
 Regions stay unnameable even with derivation enabled: above the cap, or never
@@ -390,7 +443,37 @@ Sequenced after M0: the `unmatchedPackets` counter below counts unmatched rows
 - Tests: `cmd/server/scopes_test.go` (counter and field), `test-frontend-helpers.js`
   (chip renders only when non-zero)
 
+### M1b — Declared-region verification
+
+`cmd/server/` and `public/` only, like M1. No config, no schema change, nothing
+written. See Architecture 3b.
+
+- second query over the window's unmatched transmissions (`id`, `raw_hex`),
+  separate from the main hop scan so that scan stays as it is
+- per repeater, derive a key for each of its declared regions and test it against
+  its own unmatched packets, decoding each packet once
+- a declared region with **≥2** corroborating packets is observed; with exactly
+  one it stays grey and its tooltip says why one match is not evidence
+- the chip carries how it was established, so a reader can tell a region named
+  from a configured key apart from one verified against the repeater's own
+  declaration
+- narrow M1's row caveat to unmatched traffic matching none of the declared names
+- Tests: two corroborating packets turn a chip green; one does not; a packet
+  matching no declared name still feeds the narrowed caveat; a repeater with no
+  unmatched traffic is unaffected
+- Perf: bound the work at (unmatched transmissions in window × declared names per
+  repeater), deduplicated per transmission, and benchmark it — AGENTS.md rule 0.
+  The 30s audit cache already absorbs the cost, but the bound is what stops a
+  future window widening turning it into a hot path
+
 ### M2 — Auto-derived region keys
+
+**Re-scoped by the M1b amendment.** This no longer fixes the audit — M1b does.
+What is left is the rest of the product still not seeing these regions:
+`/api/packets` shows an empty scope on a packet that has one, `/api/scope-stats`
+omits whole regions from `byRegion`, `nodes.default_scope` is never set for them,
+and the per-node observed list is short. Worth doing, lower urgency, and it should
+be sized against what M1b leaves rather than against the original 42%.
 
 - `region_keys.go`: `regionKeySet`, `regionKeys`, atomic snapshot, two tiers
 - bulk declared-regions read in the ingestor
