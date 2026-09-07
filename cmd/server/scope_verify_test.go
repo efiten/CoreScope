@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -178,7 +179,7 @@ func TestScopeVerifierSkipsUnparseablePackets(t *testing.T) {
 	}
 }
 
-func TestScopeVerifierMemoisesAcrossTargets(t *testing.T) {
+func TestScopeVerifierCachesAcrossTargets(t *testing.T) {
 	// The cost argument: work depends on (region, transmission), not on which
 	// target asked. Two targets declaring the same region over the same packets
 	// must not double the HMACs.
@@ -187,7 +188,7 @@ func TestScopeVerifierMemoisesAcrossTargets(t *testing.T) {
 	after := v.hmacCount
 	v.evidence([]int64{1, 2}, []string{"fm-112"})
 	if v.hmacCount != after {
-		t.Errorf("hmacCount %d -> %d on a repeat query, want unchanged - the memo is what keeps this inside rule 0", after, v.hmacCount)
+		t.Errorf("hmacCount %d -> %d on a repeat query, want unchanged - the cache is what keeps this inside rule 0", after, v.hmacCount)
 	}
 }
 
@@ -199,5 +200,30 @@ func TestScopeVerifierUnknownTxIDIsHarmless(t *testing.T) {
 	got := v.evidence([]int64{1, 999}, []string{"fm-112"})
 	if got["fm-112"] != 1 {
 		t.Errorf("evidence = %v, want fm-112:1 - the unknown id contributes nothing", got)
+	}
+}
+
+// BenchmarkScopeVerifierAudit models a full audit refresh: every declared name
+// against every unmatched packet, once, through the memo. The naive shape would
+// be targets x names x packets; this asserts the memo keeps it at names x
+// packets, which is what makes the feature affordable (AGENTS.md rule 0).
+func BenchmarkScopeVerifierAudit(b *testing.B) {
+	const packets, names, targets = 400, 124, 205
+	rows := make([]unmatchedTransmissionRow, 0, packets)
+	txIDs := make([]int64, 0, packets)
+	for i := 0; i < packets; i++ {
+		rows = append(rows, unmatchedTransmissionRow{txID: int64(i + 1), rawHex: realTransportFloodPacket})
+		txIDs = append(txIDs, int64(i+1))
+	}
+	declared := make([]string, 0, names)
+	for i := 0; i < names; i++ {
+		declared = append(declared, fmt.Sprintf("r%04d", i))
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		v := newScopeVerifier(rows)
+		for t := 0; t < targets; t++ {
+			v.evidence(txIDs, declared)
+		}
 	}
 }

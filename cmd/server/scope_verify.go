@@ -167,20 +167,29 @@ func (s *PacketStore) unmatchedTransmissionsInWindow(sinceISO string) ([]unmatch
 const scopeVerifyMinCorroboration = 2
 
 // scopeVerifier answers "how many of these transmissions are region X" while
-// computing each (region, transmission) pair at most once.
+// deriving each region's code over each packet at most once.
 //
-// The memo is not a nicety. Naively the audit would do
-// targets x declaredNames x unmatchedPackets HMACs - 205 x 9 x 400 is roughly
-// 740,000, about 0.7s per refresh. The work depends only on the pair, and
-// distinct pairs are distinctNames x packets = 124 x 400, roughly 50,000 and
-// ~50ms. That difference is what puts this inside AGENTS.md rule 0.
+// The cache is not a nicety, and where it has to sit was measured rather than
+// guessed. Naively the audit does targets x declaredNames x unmatchedPackets
+// HMACs — 205 x 124 x 400 is roughly 10,000,000. Caching per
+// (region, transmission) pair cuts the HMACs to names x packets, ~50,000, but
+// leaves the ITERATION cubic: a benchmark of that shape spent 501ms on 10.2M
+// map lookups at ~49ns each, with the HMACs a rounding error beside it.
+//
+// So the cache is keyed per REGION, holding the set of transmissions that
+// derive to it. A region is HMACed over every packet once, and a target then
+// asks one question per declared region instead of one per (region, packet).
+// The overwhelmingly common answer is an empty set — most declared regions
+// match nothing — which costs a single lookup and no packet loop at all.
 //
 // Not safe for concurrent use: one verifier is built per audit computation,
 // which handleScopeAudit already serialises behind its cache.
 type scopeVerifier struct {
 	packets map[int64]scopeVerifyInputs
-	memo    map[scopeVerifyKey]bool
-	// hmacCount is incremented per actual derivation, asserted by the memo
+	// matchesByRegion caches, per region, the transmissions that derive to it.
+	// Computed once over every packet, never per target.
+	matchesByRegion map[string]map[int64]bool
+	// hmacCount is incremented per actual derivation, asserted by the cache
 	// test so a future refactor cannot quietly reintroduce the naive cost.
 	hmacCount int
 }
@@ -192,18 +201,13 @@ type scopeVerifyInputs struct {
 	ok          bool
 }
 
-type scopeVerifyKey struct {
-	region string
-	txID   int64
-}
-
 // newScopeVerifier parses each row once. A row whose raw_hex cannot be walked
-// is kept with ok=false rather than dropped, so the memo still short-circuits
-// repeat lookups for it.
+// is kept with ok=false rather than dropped, so its id still resolves and a
+// caller asking about it gets "no evidence" instead of a miss.
 func newScopeVerifier(rows []unmatchedTransmissionRow) *scopeVerifier {
 	v := &scopeVerifier{
-		packets: make(map[int64]scopeVerifyInputs, len(rows)),
-		memo:    map[scopeVerifyKey]bool{},
+		packets:         make(map[int64]scopeVerifyInputs, len(rows)),
+		matchesByRegion: map[string]map[int64]bool{},
 	}
 	for _, r := range rows {
 		pt, payload, code1, ok := scopeHMACInputs(r.rawHex)
@@ -212,21 +216,25 @@ func newScopeVerifier(rows []unmatchedTransmissionRow) *scopeVerifier {
 	return v
 }
 
-// matches reports whether transmission txID is region, deriving at most once
-// per pair.
-func (v *scopeVerifier) matches(region string, txID int64) bool {
-	key := scopeVerifyKey{region: region, txID: txID}
-	if got, seen := v.memo[key]; seen {
-		return got
+// regionMatches returns the transmissions deriving to region, computing the
+// whole set on first ask. Unparseable packets are skipped rather than counted
+// as misses, so one malformed row in the window cannot blank a region.
+func (v *scopeVerifier) regionMatches(region string) map[int64]bool {
+	if m, ok := v.matchesByRegion[region]; ok {
+		return m
 	}
-	in, known := v.packets[txID]
-	got := false
-	if known && in.ok {
+	m := map[int64]bool{}
+	for txID, in := range v.packets {
+		if !in.ok {
+			continue
+		}
 		v.hmacCount++
-		got = regionCode(region, in.payloadType, in.payload) == in.code1
+		if regionCode(region, in.payloadType, in.payload) == in.code1 {
+			m[txID] = true
+		}
 	}
-	v.memo[key] = got
-	return got
+	v.matchesByRegion[region] = m
+	return m
 }
 
 // evidence counts, for each declared region, how many of txIDs derive to it.
@@ -235,9 +243,13 @@ func (v *scopeVerifier) matches(region string, txID int64) bool {
 func (v *scopeVerifier) evidence(txIDs []int64, declaredRegions []string) map[string]int {
 	out := map[string]int{}
 	for _, region := range declaredRegions {
+		m := v.regionMatches(region)
+		if len(m) == 0 {
+			continue // the common case: one lookup, no packet loop
+		}
 		n := 0
 		for _, txID := range txIDs {
-			if v.matches(region, txID) {
+			if m[txID] {
 				n++
 			}
 		}

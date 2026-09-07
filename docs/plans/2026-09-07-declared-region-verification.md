@@ -22,11 +22,17 @@
 
 ---
 
-## Cost, and the memo that makes it acceptable
+## Cost — where it actually sits (measured, not estimated)
 
-Naively this is `targets × declaredNames × unmatchedPackets` HMACs — 205 × 9 × 400 ≈ 740,000 per refresh, roughly 0.7s. Too much for a 30s cache to hide comfortably.
+Naively this is `targets × declaredNames × unmatchedPackets` HMACs — 205 × 124 × 400 ≈ 10,000,000.
 
-But the work only depends on `(regionName, transmission)`, not on which target asked. Distinct pairs are `distinctDeclaredNames × unmatchedPackets` = 124 × 400 ≈ 50,000, about 50ms. **The memo is not an optimisation, it is what puts this inside AGENTS.md rule 0**, so it is built in from the first task rather than added later.
+The first cut cached per `(region, transmission)` pair, which cuts the HMACs to `names × packets` ≈ 50,000. **That was not enough, and the plan's original estimate of ~50ms was wrong about why.** Benchmarked at audit scale it took **501ms**: the HMACs had become a rounding error, but the *iteration* was still cubic — 10.2M map lookups at ~49ns each.
+
+The cache is therefore keyed per **region**, holding the set of transmissions deriving to it. A region is HMACed over every packet once; a target then asks one question per declared region instead of one per (region, packet). Most declared regions match nothing, so the common case is a single lookup and no packet loop at all.
+
+Measured after that change: **36ms** at the same worst-case shape (every one of 205 targets declaring all 124 names over all 400 packets). Real rows declare ~9 names and hold far fewer packets, so this is an upper bound with a lot of headroom under the 30s cache.
+
+The lesson worth keeping: caching the expensive operation is not the same as removing the expensive loop. `hmacCount` exists so a test can assert the first, and the benchmark exists because only it catches the second.
 
 ---
 
