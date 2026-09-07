@@ -64,7 +64,7 @@ type scopeDerivation struct {
 // — the same helper matchScope itself uses. channelKeys is nil and
 // validateSignatures is false because region matching depends on neither —
 // only on the undecrypted payload bytes.
-func rederiveScope(rawHex string, regionKeys map[string][]byte) (scopeDerivation, error) {
+func rederiveScope(rawHex string, snap *regionKeySnapshot) (scopeDerivation, error) {
 	decoded, err := DecodePacket(rawHex, nil, false)
 	if err != nil {
 		return scopeDerivation{}, err
@@ -72,7 +72,7 @@ func rederiveScope(rawHex string, regionKeys map[string][]byte) (scopeDerivation
 	if decoded.TransportCodes == nil || decoded.TransportCodes.Code1 == "0000" {
 		return scopeDerivation{State: scopeState{Valid: false}}, nil
 	}
-	matched := matchingRegions(regionKeys, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+	matched := matchingRegions(snap.all, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
 	name := ""
 	if len(matched) == 1 {
 		name = matched[0]
@@ -137,7 +137,7 @@ type scopeRepairReport struct {
 // Running repairScopeNames(apply=true) twice in a row writes nothing the
 // second time: every row it just wrote now re-derives to the state it
 // holds, which is the Unchanged case.
-func repairScopeNames(db *sql.DB, regionKeys map[string][]byte, apply bool) (*scopeRepairReport, error) {
+func repairScopeNames(db *sql.DB, snap *regionKeySnapshot, apply bool) (*scopeRepairReport, error) {
 	rows, err := db.Query(`SELECT id, raw_hex, scope_name FROM transmissions WHERE scope_name IS NOT NULL ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("query transport-scoped rows: %w", err)
@@ -165,7 +165,7 @@ func repairScopeNames(db *sql.DB, regionKeys map[string][]byte, apply bool) (*sc
 			report.NamedBefore++
 		}
 
-		d, err := rederiveScope(rawHex, regionKeys)
+		d, err := rederiveScope(rawHex, snap)
 		if err != nil {
 			report.DecodeFailed++
 			continue
@@ -287,15 +287,22 @@ func runScopeRepair(args []string) int {
 	if *dbPathOverride != "" {
 		dbPath = *dbPathOverride
 	}
-	regionKeys := loadRegionKeys(cfg)
-
 	store, err := OpenStore(dbPath)
 	if err != nil {
 		log.Fatalf("scope-repair: db: %v", err)
 	}
 	defer store.Close()
 
-	report, err := repairScopeNames(store.db, regionKeys, *apply)
+	// The derived tier must be rebuilt before scanning. Repairing against the
+	// explicit tier alone would find no key for any automatically-named row,
+	// classify it as "named -> unmatched", and erase the name - turning a
+	// maintenance tool into data loss.
+	regionSet := newRegionKeySet(cfg)
+	regionSet.refreshFromStore(store)
+	snap := regionSet.snapshot()
+	log.Printf("scope-repair: %d region key(s) in force", len(snap.all))
+
+	report, err := repairScopeNames(store.db, snap, *apply)
 	if err != nil {
 		log.Fatalf("scope-repair: %v", err)
 	}

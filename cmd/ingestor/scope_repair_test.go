@@ -110,7 +110,7 @@ func TestScopeRepairDryRun(t *testing.T) {
 	store := newScopeRepairFixture(t)
 	regionKeys := scopeRepairTestKeys(t)
 
-	report, err := repairScopeNames(store.db, regionKeys, false)
+	report, err := repairScopeNames(store.db, regionSetFromKeys(regionKeys).snapshot(), false)
 	if err != nil {
 		t.Fatalf("repairScopeNames: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestScopeRepairApply(t *testing.T) {
 	store := newScopeRepairFixture(t)
 	regionKeys := scopeRepairTestKeys(t)
 
-	report1, err := repairScopeNames(store.db, regionKeys, true)
+	report1, err := repairScopeNames(store.db, regionSetFromKeys(regionKeys).snapshot(), true)
 	if err != nil {
 		t.Fatalf("repairScopeNames (apply): %v", err)
 	}
@@ -172,7 +172,7 @@ func TestScopeRepairApply(t *testing.T) {
 	assertScopeName(t, store, fixtureRawD, "", false)        // untouched: not transport-scoped, stays NULL
 	assertScopeName(t, store, fixtureRawE, "#ghost", true)   // untouched: unexpected, not applied
 
-	report2, err := repairScopeNames(store.db, regionKeys, true)
+	report2, err := repairScopeNames(store.db, regionSetFromKeys(regionKeys).snapshot(), true)
 	if err != nil {
 		t.Fatalf("repairScopeNames (second apply): %v", err)
 	}
@@ -227,7 +227,7 @@ func newScopeRepairUnnamedFixture(t *testing.T) *Store {
 func TestScopeRepairDryRunReportsNewlyMatchableRows(t *testing.T) {
 	store := newScopeRepairUnnamedFixture(t)
 
-	report, err := repairScopeNames(store.db, scopeRepairTestKeys(t), false)
+	report, err := repairScopeNames(store.db, regionSetFromKeys(scopeRepairTestKeys(t)).snapshot(), false)
 	if err != nil {
 		t.Fatalf("repairScopeNames: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestScopeRepairApplyNamesNewlyMatchableRows(t *testing.T) {
 	store := newScopeRepairUnnamedFixture(t)
 	regionKeys := scopeRepairTestKeys(t)
 
-	report1, err := repairScopeNames(store.db, regionKeys, true)
+	report1, err := repairScopeNames(store.db, regionSetFromKeys(regionKeys).snapshot(), true)
 	if err != nil {
 		t.Fatalf("repairScopeNames (apply): %v", err)
 	}
@@ -267,7 +267,7 @@ func TestScopeRepairApplyNamesNewlyMatchableRows(t *testing.T) {
 	assertScopeName(t, store, fixtureRawG, "", true)      // untouched: still ambiguous
 	assertScopeName(t, store, fixtureRawH, "", true)      // untouched: still matches nothing
 
-	report2, err := repairScopeNames(store.db, regionKeys, true)
+	report2, err := repairScopeNames(store.db, regionSetFromKeys(regionKeys).snapshot(), true)
 	if err != nil {
 		t.Fatalf("repairScopeNames (second apply): %v", err)
 	}
@@ -309,5 +309,33 @@ func TestScopeRepairReportCountsBothDirections(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("report missing %q; got:\n%s", want, out)
 		}
+	}
+}
+
+// TestScopeRepairKeepsDerivedNames: a row named from a derived key must survive
+// a repair run. If rederiveScope sees only the explicit tier it reports
+// MatchCount 0, which lands in the "named -> unmatched" branch and wipes the
+// name. This test is the guard against that, and the failure it prevents is
+// data loss from a maintenance tool, not a cosmetic gap.
+func TestScopeRepairKeepsDerivedNames(t *testing.T) {
+	payload := []byte{0x42, 0x43, 0x44}
+	// A transport-flood packet: header 0x14 (route 0, payload type 5),
+	// code1/code2, path byte 0x41 (hash_size 2, one hop), hop, then payload.
+	code1 := codeFor("#behss", 5, payload)
+	rawHex := "14" + code1 + "0000" + "41" + "E3D3" + strings.ToUpper(hex.EncodeToString(payload))
+
+	cfg := &Config{AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true}}
+	set := newRegionKeySet(cfg)
+	set.refreshDerived([]string{"behss"})
+
+	got, err := rederiveScope(rawHex, set.snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State.Name != "#behss" {
+		t.Errorf("State.Name = %q, want %q — a derived key must name the row during repair", got.State.Name, "#behss")
+	}
+	if got.MatchCount != 1 {
+		t.Errorf("MatchCount = %d, want 1", got.MatchCount)
 	}
 }
