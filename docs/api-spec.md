@@ -1895,7 +1895,8 @@ not being the same as "declared nothing"), which apply here identically.
       ],
       "observedUnscopedPackets": number,               // plain-FLOOD packets forwarded this window
       "wildcardContradiction":   boolean,               // observed unscoped forwarding but '*' not declared
-      "ambiguousHops":           number                 // forwarder hops this window that could not be attributed — see note below
+      "ambiguousHops":            number,                // forwarder hops this window that could not be attributed — see note below
+      "observedUnmatchedPackets": number                 // forwarded packets whose scope this instance holds no key for — see note below
     }
   ]
 }
@@ -1933,6 +1934,17 @@ not being the same as "declared nothing"), which apply here identically.
   `ambiguousHops` carries weaker evidence than one with zero: any entry in that row's
   `notObserved` could be explained by a prefix collision rather than a genuine absence of
   forwarding, and a client should present it as a caveat rather than a confirmed finding.
+- `observedUnmatchedPackets` counts packets this repeater was observed forwarding whose
+  transport scope matched no region key this instance has configured (`hashRegions`), so
+  the ingestor stored them with an empty `scope_name`. Those packets name no region and
+  therefore cannot satisfy a declared one, which means **a repeater forwarding a region
+  this instance cannot name is reported exactly like one forwarding nothing**. A non-zero
+  value is a caveat on this row's `notObserved`, in the same spirit as `ambiguousHops` but
+  with a different cause and a different fix: `ambiguousHops` is a pubkey-prefix collision
+  between two repeaters and nobody's fault, `observedUnmatchedPackets` is a missing entry
+  in this instance's own configuration and the operator can act on it. It is **not**
+  evidence for or against `declaredWildcard` — unmatched traffic is scoped, so it never
+  affects `wildcardContradiction`, which counts only plain unscoped floods.
 - All scope names in `declaredRegions` / `notObserved` / `undeclaredObserved[].scope` are
   already normalised (no leading `#`) — the server does the `#`/no-`#` reconciliation
   described on the per-node endpoint so this response is directly comparable without a
