@@ -7114,6 +7114,63 @@ console.log('\n=== scope-audit.js: unmatchedCaveat ===');
     assert.ok(h.includes('7 forwarded packets '), 'want the remainder, not the total');
   });
 
+  test('evidence the server refused to count is not subtracted either', () => {
+    // A region with a single deriving packet stays in notObserved on purpose:
+    // one match in 65536 is chance, not evidence (scopeVerifyMinCorroboration).
+    // Subtracting it here would call that packet explained while the chip
+    // beside it says the opposite. Keyed on notObserved rather than on the
+    // number, so the threshold lives in one place: the server.
+    const h = caveat({
+      observedUnmatchedPackets: 3,
+      regionEvidence: { 'fm-112': 1 },
+      notObserved: ['fm-112'],
+    });
+    assert.ok(h.includes('3 forwarded packets '), 'all three are still unexplained');
+  });
+
+  test('evidence that did establish a region is still subtracted', () => {
+    const h = caveat({
+      observedUnmatchedPackets: 10,
+      regionEvidence: { 'nl-nb': 3, belml: 1 },
+      notObserved: ['belml'],
+    });
+    assert.ok(h.includes('7 forwarded packets '), 'subtract the verified 3, keep the uncorroborated 1');
+  });
+
+  test('a sampled count is reported as an upper bound', () => {
+    // observedUnmatchedPackets counts every packet; the evidence can only come
+    // from the packets the verifier actually held. Subtracting an undercounted
+    // number from a complete one overstates what is unexplained, so the chip
+    // says at most rather than pretending to an exact figure.
+    const h = caveat({
+      observedUnmatchedPackets: 900,
+      observedUnmatchedSampled: 512,
+      regionEvidence: { 'nl-nb': 40 },
+    });
+    assert.ok(h.includes('at most 860 forwarded packets '), 'want the bound, stated as one');
+  });
+
+  test('an unsampled count keeps its exact wording', () => {
+    const h = caveat({
+      observedUnmatchedPackets: 30,
+      observedUnmatchedSampled: 30,
+      regionEvidence: { 'fm-112': 23 },
+    });
+    assert.ok(h.includes('7 forwarded packets '), 'exact remainder');
+    assert.ok(!/at most/.test(h), 'nothing was sampled away, so do not hedge');
+  });
+
+  test('a non-numeric count renders nothing rather than NaN', () => {
+    assert.strictEqual(caveat({ observedUnmatchedPackets: '12' }), '');
+    assert.strictEqual(caveat({ observedUnmatchedPackets: NaN }), '');
+  });
+
+  test('evidence exceeding the count cannot produce a negative remainder', () => {
+    // One packet can derive to two of a repeater's declared regions, so the
+    // evidence values can sum past the number of distinct packets.
+    assert.strictEqual(caveat({ observedUnmatchedPackets: 4, regionEvidence: { a: 3, b: 3 } }), '');
+  });
+
   test('the count is not injected raw into markup', () => {
     // observedUnmatchedPackets is server-supplied. It is a number in every
     // sane response, but the chip must not become an injection point if that

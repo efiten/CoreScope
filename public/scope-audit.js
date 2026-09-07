@@ -216,18 +216,39 @@
   // innocent repeater.
   function unmatchedCaveat(row) {
     var n = row.observedUnmatchedPackets;
-    if (!n) return '';
+    if (typeof n !== 'number' || !isFinite(n) || n <= 0) return '';
     // Traffic already accounted for by verification is explained, not
     // mysterious. What is left over is the interesting case: this repeater
     // forwards a region it does NOT declare and that this instance also cannot
     // name. Reporting the full count here would re-raise a question the Scopes
     // column has just answered.
+    // Only evidence that actually ESTABLISHED a region counts as an
+    // explanation. A region with a single deriving packet stays in notObserved
+    // by design — one match in 65536 is chance, not evidence — and subtracting
+    // it here would call that packet explained while the chip next to it says
+    // the region was not observed. Keyed on notObserved rather than on the
+    // count, so the corroboration threshold stays in one place: the server.
+    var established = Object.create(null);
+    Object.keys(row.regionEvidence || {}).forEach(function (k) { established[k] = true; });
+    (row.notObserved || []).forEach(function (rgn) { delete established[rgn]; });
+
     var explained = 0;
     var evidence = row.regionEvidence || {};
-    Object.keys(evidence).forEach(function (k) { explained += evidence[k]; });
+    Object.keys(established).forEach(function (k) { explained += evidence[k]; });
+    // One packet can derive to two of this repeater's declared regions, so the
+    // values can sum past the number of distinct packets behind them.
+    if (explained > n) explained = n;
     var left = n - explained;
     if (left <= 0) return '';
-    var label = escapeHtml(left) + ' forwarded packet' + (left === 1 ? '' : 's');
+
+    // observedUnmatchedPackets counts every unnameable packet; the evidence can
+    // only come from the ones the verifier actually held (both the per-target
+    // list and the per-window sample are capped). Subtracting an undercounted
+    // number from a complete one overstates what is unexplained, so when the
+    // count was sampled the chip states a bound instead of a figure.
+    var sampled = typeof row.observedUnmatchedSampled === 'number' ? row.observedUnmatchedSampled : n;
+    var bounded = sampled < n;
+    var label = (bounded ? 'at most ' : '') + escapeHtml(left) + ' forwarded packet' + (left === 1 ? '' : 's');
     return ' <span class="sa-chip sa-chip-unmatched" title="' + label +
       ' in this window carried a region scope this CoreScope instance holds no key for, and match none of this repeater&#39;s declared regions. ' +
       'So this repeater forwards at least one region it does not declare, which this instance also cannot name.">' +

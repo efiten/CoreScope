@@ -1897,6 +1897,7 @@ not being the same as "declared nothing"), which apply here identically.
       "wildcardContradiction":   boolean,               // observed unscoped forwarding but '*' not declared
       "ambiguousHops":            number,                // forwarder hops this window that could not be attributed — see note below
       "observedUnmatchedPackets": number,                // forwarded packets whose scope this instance holds no key for — see note below
+      "observedUnmatchedSampled": number,                // how many of those verification could examine — see note below
       "regionEvidence":           { "<region>": number } // declared regions corroborated by this repeater's own unnameable traffic — see note below
     }
   ]
@@ -1950,7 +1951,18 @@ not being the same as "declared nothing"), which apply here identically.
   attributable to a declared region after all. A client showing this as a caveat should
   subtract them and report only the remainder, which carries a sharper meaning — traffic
   this repeater forwards for a region it does **not** declare and this instance cannot
-  name.
+  name. Two rules on that subtraction: count only evidence for regions **absent** from
+  `notObserved` (a region with a single hit was deliberately not accepted as evidence, so
+  its packet is not explained either), and compare against `observedUnmatchedSampled`
+  first.
+- `observedUnmatchedSampled` is how many of those packets verification could actually
+  examine. Two caps sit between the count and the evidence: the per-repeater working set
+  (512 packets) and the per-window sample (the 4096 most recent unnameable packets, which
+  a deployment with few `hashRegions` entries will reach). `regionEvidence` can only ever
+  count packets inside that sample, so when this field is **smaller** than
+  `observedUnmatchedPackets` the difference between the count and the evidence is an
+  **upper bound** on the unexplained traffic rather than a figure, and a client should say
+  so. Equal values mean the subtraction is exact.
 - `regionEvidence` maps a declared region to how many of this repeater's own unmatched
   forwarded packets derive to it. The server tests each declared region this repeater has
   no *named* evidence for by deriving `SHA256("#region")[:16]` and HMAC-ing that
