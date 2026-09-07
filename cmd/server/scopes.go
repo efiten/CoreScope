@@ -423,6 +423,19 @@ type scopeAuditTargetAgg struct {
 	// declared target — see ScopeAuditForwarding's doc comment for why
 	// those hops are attributed to neither candidate instead of both.
 	ambiguousHops int64
+	// unmatchedPackets counts packets this target was observed forwarding
+	// that carried a transport scope no configured region key matched
+	// (transmissions.scope_name = ""). Deliberately NOT folded into
+	// unscopedPackets: those two are opposites. Unscoped means the packet
+	// carried no scope at all (scope_name SQL NULL) and is what '*' governs;
+	// unmatched means it IS scoped and this instance simply holds no key for
+	// that region, so '*' says nothing about it. See scopeNameForDB in the
+	// ingestor for the encoding.
+	//
+	// A non-zero value is a caveat on this target's notObserved entries: any
+	// of them may be a region this instance cannot name rather than one the
+	// repeater is not forwarding.
+	unmatchedPackets int64
 }
 
 // scopeAuditPrefixIndex builds, for every even hex length from
@@ -563,7 +576,14 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 				continue
 			}
 			if scopeName.String == "" {
-				continue // unmatched — not part of the declared/observed comparison
+				// Unmatched: transport-scoped, but no configured region key
+				// matched code1. Still not part of the declared/observed
+				// comparison — it names no region, so it can never satisfy a
+				// declaration — but it is the evidence that a notObserved
+				// finding on this row may be a gap in this instance's
+				// hashRegions rather than in the repeater's forwarding.
+				agg.unmatchedPackets++
+				continue
 			}
 			name := normScope(scopeName.String)
 			so, ok := agg.scopes[name]

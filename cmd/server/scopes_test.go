@@ -985,6 +985,66 @@ func TestScopeAuditForwardingCountsOneTransmissionOncePerTarget(t *testing.T) {
 	}
 }
 
+// TestScopeAuditForwardingCountsUnmatchedPackets: a transport-scoped packet
+// whose code1 matched no configured region key is stored with scope_name = ""
+// (scopeNameForDB's "transport-scoped but unnameable" state). It is not a
+// named scope, so it must not enter agg.scopes, and it is not an unscoped
+// plain flood either, so it must not enter unscopedPackets. It is its own
+// fact: this instance saw the target forward traffic it holds no key for.
+//
+// Without this counter the audit reports the declared region as "not
+// observed", which reads as a finding about the repeater when it is really a
+// gap in this instance's own hashRegions.
+func TestScopeAuditForwardingCountsUnmatchedPackets(t *testing.T) {
+	s := newScopeTestStore(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, s, hop, scopeUnmatched(), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil {
+		t.Fatalf("want an agg for the target, got none (result = %+v)", got)
+	}
+	if agg.unmatchedPackets != 1 {
+		t.Errorf("unmatchedPackets = %d, want 1", agg.unmatchedPackets)
+	}
+	if len(agg.scopes) != 0 {
+		t.Errorf("scopes = %+v, want empty — an unmatched packet names no region", agg.scopes)
+	}
+	if agg.unscopedPackets != 0 {
+		t.Errorf("unscopedPackets = %d, want 0 — unmatched is not the same as unscoped", agg.unscopedPackets)
+	}
+}
+
+// TestScopeAuditForwardingCountsUnmatchedOnMidPathHop is the post-M0 case that
+// carries almost all of this counter's real volume: before M0 only a last hop
+// was attributed, so a repeater deep in a flood path contributed nothing at
+// all. Now every hop counts, and the same de-duplication that protects the
+// named-scope tally must protect this one — a target appearing twice in one
+// path is still one packet, not two.
+func TestScopeAuditForwardingCountsUnmatchedOnMidPathHop(t *testing.T) {
+	s := newScopeTestStore(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionPathAt(t, s, []string{"AAAA", hop, "BBBB", hop}, scopeUnmatched(), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil {
+		t.Fatalf("want an agg for the mid-path target, got none (result = %+v)", got)
+	}
+	if agg.unmatchedPackets != 1 {
+		t.Errorf("unmatchedPackets = %d, want 1 — one transmission, matched on two of its hops", agg.unmatchedPackets)
+	}
+}
+
 // --- GET /api/scope-audit handler tests ---
 
 // setupScopeAuditServer extends setupNodeScopesServer's schema with a
