@@ -3572,6 +3572,26 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Declared-region verification (M1b): a region this instance holds no key
+	// for is unnameable, not absent, and the audit can settle which by deriving
+	// the key from the repeater's own declaration and testing it against that
+	// repeater's own unnameable traffic. One verifier serves every row so each
+	// (region, transmission) pair is derived at most once — see scope_verify.go
+	// for why that memo is what keeps this affordable.
+	//
+	// A failure here degrades to "no verification" rather than failing the
+	// request: the audit was useful before this existed and must stay useful if
+	// the extra query errors.
+	var verifier *scopeVerifier
+	if s.store != nil {
+		unmatchedRows, uErr := s.store.unmatchedTransmissionsInWindow(sinceISO)
+		if uErr != nil {
+			log.Printf("[scope-audit] declared-region verification unavailable: %v", uErr)
+		} else {
+			verifier = newScopeVerifier(unmatchedRows)
+		}
+	}
+
 	identities := s.db.scopeAuditNodeIdentities(targets)
 
 	resp := &ScopeAuditResponse{Window: window, Since: sinceISO, Repeaters: []ScopeAuditRow{}}
@@ -3608,9 +3628,28 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 
 		agg := forwarding[pk]
 
-		notObserved := []string{}
+		// Verify the declared regions this repeater has no NAMED evidence for,
+		// against its own unmatched traffic. Regions already observed by name
+		// need no verification and are not tested — that keeps the candidate
+		// set to exactly the open questions, which is also what keeps the
+		// verifier's work proportional to the problem rather than to the fleet.
+		unnamed := []string{}
 		for _, rgn := range declaredNamed {
 			if agg == nil || agg.scopes[rgn] == nil {
+				unnamed = append(unnamed, rgn)
+			}
+		}
+		regionEvidence := map[string]int{}
+		verifiedSet := map[string]bool{}
+		if verifier != nil && agg != nil && len(unnamed) > 0 {
+			regionEvidence = verifier.evidence(agg.unmatchedTxIDs, unnamed)
+			for _, rgn := range verifier.verified(regionEvidence) {
+				verifiedSet[rgn] = true
+			}
+		}
+		notObserved := []string{}
+		for _, rgn := range unnamed {
+			if !verifiedSet[rgn] {
 				notObserved = append(notObserved, rgn)
 			}
 		}
@@ -3651,6 +3690,7 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 			WildcardContradiction:    unscopedPackets > 0 && !declaredWildcard,
 			AmbiguousHops:            ambiguousHops,
 			ObservedUnmatchedPackets: unmatchedPackets,
+			RegionEvidence:           regionEvidence,
 		})
 	}
 

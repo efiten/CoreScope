@@ -727,6 +727,19 @@ type ScopeAuditRow struct {
 	// it never feeds WildcardContradiction, which counts only plain unscoped
 	// floods.
 	ObservedUnmatchedPackets int64 `json:"observedUnmatchedPackets"`
+
+	// RegionEvidence maps a declared region to how many of this repeater's own
+	// unmatched forwarded packets derive to it — see scope_verify.go. A region
+	// reaching scopeVerifyMinCorroboration is removed from NotObserved, so this
+	// field is NOT what decides the chip's colour; NotObserved remains the sole
+	// source of that. This exists so a client can say HOW a region was
+	// established, and can explain a region that got exactly one hit and
+	// therefore stayed in NotObserved.
+	//
+	// Absent regions simply had no matching traffic. Never nil in the response
+	// — an empty object and a missing key mean the same thing, and an empty map
+	// is the cheaper thing for a client to iterate.
+	RegionEvidence map[string]int `json:"regionEvidence"`
 }
 
 // ScopeAuditResponse is the payload for GET /api/scope-audit. Only
