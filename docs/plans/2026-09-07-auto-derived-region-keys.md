@@ -10,7 +10,9 @@
 
 **Spec:** `docs/specs/2026-09-07-auto-region-keys-design.md`, sections 1–3.
 
-**Depends on:** nothing. Independent of M1 (`docs/plans/2026-09-07-scope-audit-unmatched-caveat.md`), which touches only `cmd/server` and `public/`. The two can land in either order.
+**Depends on M0** for its *measurement*, not for its code. Nothing here shares a file with M0 or M1 — this plan is entirely `cmd/ingestor/`. But until M0 fixes forwarder attribution (`### M0` in the spec, `b610d461`), 133 of 205 repeaters have zero attributable evidence, so a derived key that correctly names `#behka` in `transmissions.scope_name` still leaves the declaring repeater in `notObserved`: its hops were discarded before nameability ever came into play. M2's effect on the audit would be exactly zero for 65% of repeaters — indistinguishable from M2 not working. Build order is M0 → M1 → M2.
+
+Also re-read Task 11 Step 5 in light of that: the ambiguity rate it records is only meaningful once attribution is fixed, and the spec's M0 section calls for re-measuring the first-cause share before M2 is sized at all.
 
 ---
 

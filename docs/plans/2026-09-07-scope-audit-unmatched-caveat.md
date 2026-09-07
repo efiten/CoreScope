@@ -10,6 +10,10 @@
 
 **Spec:** `docs/specs/2026-09-07-auto-region-keys-design.md`, section "4. Scope-audit honesty".
 
+**Depends on M0** (`### M0 — Forwarder attribution`, added to the spec in `b610d461`). Both queries currently credit a transmission to `path[last]` only, but on a flood route every forwarder appends its hash to the END of the path (`internal/packetpath/route.go:20`), so `path[last]` means "heard directly by an uplinked observer", not "forwarded it". Measured live: 133 of 205 repeaters have zero attributable evidence. The `unmatchedPackets` counter below counts unmatched rows **among the rows attribution admits**, so before M0 it reads zero for that same 65% — inviting exactly the wrong conclusion in a brand-new field. Do not start Tasks 1, 2 or 5 until M0 has landed.
+
+**Status:** Task 3 (the frontend caveat) is **done** — commit `79f38ef1`. It was safe to land ahead of M0 and ahead of the server field because the chip renders the empty string when `observedUnmatchedPackets` is absent, which is asserted. Tasks 1, 2, 4 and 5 remain.
+
 ---
 
 ## Why this is a real defect, not a nicety
@@ -241,14 +245,18 @@ git commit -m "feat(scope-audit): expose observedUnmatchedPackets on the API row
 
 ---
 
-### Task 3: Render the caveat
+### Task 3: Render the caveat — DONE (`79f38ef1`)
+
+Landed ahead of the rest: the chip is inert until the server sends the field, so it
+could not break anything, and `public/scope-audit.js` was the one file M0 was not
+holding. Steps kept below as the record of what was built; do not redo them.
 
 **Files:**
 - Modify: `public/scope-audit.js` (new `unmatchedCaveat`, called in `rowHtml`, added to `window.__meshcoreScopeAuditInternals`)
 - Modify: `public/scope-audit.css`
 - Test: `test-frontend-helpers.js`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test-frontend-helpers.js`, after the `mergedScopeChips` block:
 
@@ -294,12 +302,12 @@ console.log('\n=== scope-audit.js: unmatchedCaveat ===');
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `node test-frontend-helpers.js`
 Expected: FAIL — `TypeError: caveat is not a function`
 
-- [ ] **Step 3: Implement `unmatchedCaveat`**
+- [x] **Step 3: Implement `unmatchedCaveat`**
 
 In `public/scope-audit.js`, add immediately after `ambiguousCaveat`:
 
@@ -333,7 +341,7 @@ And export it, extending the existing internals object:
     window.__meshcoreScopeAuditInternals = { mergedScopeChips: mergedScopeChips, emptyStateHtml: emptyStateHtml, sourcesLineHtml: sourcesLineHtml, unmatchedCaveat: unmatchedCaveat };
 ```
 
-- [ ] **Step 4: Style the chip**
+- [x] **Step 4: Style the chip**
 
 In `public/scope-audit.css`, add after the `.sa-chip-ambiguous` rule:
 
@@ -341,12 +349,12 @@ In `public/scope-audit.css`, add after the `.sa-chip-ambiguous` rule:
 .sa-chip-unmatched { background: var(--section-bg, var(--card-bg)); color: var(--text-muted); border: 1px dashed var(--border); font-family: inherit; font-style: italic; }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `node test-frontend-helpers.js`
 Expected: PASS, all assertions including the pre-existing `mergedScopeChips` block.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add public/scope-audit.js public/scope-audit.css test-frontend-helpers.js
@@ -420,6 +428,10 @@ Start the server against a database with declared-regions data, open `#/scope-au
 - [ ] **Step 4: Confirm the fix against the real case**
 
 With the live database or the fixture, the row for `e3d3f4d7edd02aced3442b4ca77acb0824d9fcf1dc53cc42dca1ee0abe1cc0b1` must show a non-zero unnameable count alongside its `behss` and `fm-112` chips. That is the case this plan exists for; if it does not show, the plan has not worked regardless of what the unit tests say.
+
+- [ ] **Step 5: Check the two caveats are not both permanently on**
+
+M0 widens attribution from 222 distinct last-hops to every hop in every flood path (964 distinct prefixes on a 2000-packet sample), so `ambiguousHops` — currently 0 on all 205 rows precisely because so few hops were considered — will start firing. If both this chip and `possibly ambiguous` end up lit on most rows, neither tells the reader anything and the column is worse than before M0. Count how many rows carry each after M0 and report the numbers; if both exceed roughly half the rows, raise it rather than shipping two permanent caveats.
 
 ---
 
