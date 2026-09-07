@@ -109,12 +109,15 @@ type unmatchedTransmissionRow struct {
 // That scan returns one row per hop per flood packet: on a 2,000-packet sample
 // after M0 that is 19,049 rows, and carrying raw_hex on every one of them would
 // load the hot path to serve a few hundred packets. This selects only the
-// transmissions that are actually candidates - scope_name = '' inside the
+// transmissions that are actually candidates - an empty scope_name inside the
 // window, ~400 over 7 days on the reference deployment - and the main scan is
 // left exactly as it is.
 //
-// scope_name = '' is the "transport-scoped but unnameable" state; NULL means
-// the packet carried no scope at all and can never verify against a region.
+// An empty scope_name is the "transport-scoped but unnameable" state; NULL
+// means the packet carried no scope at all and can never verify against a
+// region. (Written out rather than as the two-quote literal: gofmt rewrites
+// that digraph into a typographic quote inside doc comments, which silently
+// misstates the value this whole query keys on.)
 // The route filter matches the forwarder scan's, so the two agree on which
 // packets count as forwarded.
 //
