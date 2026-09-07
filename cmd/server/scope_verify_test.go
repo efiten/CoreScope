@@ -122,3 +122,82 @@ func TestUnmatchedTransmissionsInWindow(t *testing.T) {
 		t.Error("txID = 0, want the transmission's real id")
 	}
 }
+
+// buildVerifierFromPackets is a test helper: wraps raw hex strings as rows the
+// verifier consumes, with ids 1..N in order.
+func buildVerifierFromPackets(t *testing.T, hexes ...string) *scopeVerifier {
+	t.Helper()
+	rows := make([]unmatchedTransmissionRow, 0, len(hexes))
+	for i, h := range hexes {
+		rows = append(rows, unmatchedTransmissionRow{txID: int64(i + 1), rawHex: h})
+	}
+	return newScopeVerifier(rows)
+}
+
+func TestScopeVerifierNeedsTwoCorroboratingPackets(t *testing.T) {
+	// One match is 1-in-65536 and must not be enough; a second makes it
+	// (1/65536)^2. This threshold is the reason the approach is sound.
+	v := buildVerifierFromPackets(t, realTransportFloodPacket)
+	one := v.evidence([]int64{1}, []string{"fm-112"})
+	if one["fm-112"] != 1 {
+		t.Fatalf("evidence = %v, want fm-112:1", one)
+	}
+	if got := v.verified(one); len(got) != 0 {
+		t.Errorf("verified = %v, want none - one corroborating packet is not evidence", got)
+	}
+
+	// The same packet twice under different ids: two distinct transmissions
+	// both deriving to fm-112.
+	v2 := buildVerifierFromPackets(t, realTransportFloodPacket, realTransportFloodPacket)
+	two := v2.evidence([]int64{1, 2}, []string{"fm-112"})
+	if two["fm-112"] != 2 {
+		t.Fatalf("evidence = %v, want fm-112:2", two)
+	}
+	got := v2.verified(two)
+	if len(got) != 1 || got[0] != "fm-112" {
+		t.Errorf("verified = %v, want [fm-112]", got)
+	}
+}
+
+func TestScopeVerifierIgnoresRegionsThatDoNotMatch(t *testing.T) {
+	v := buildVerifierFromPackets(t, realTransportFloodPacket, realTransportFloodPacket)
+	got := v.evidence([]int64{1, 2}, []string{"behss", "be", "eu"})
+	if len(got) != 0 {
+		t.Errorf("evidence = %v, want empty - none of these regions is this packet", got)
+	}
+}
+
+func TestScopeVerifierSkipsUnparseablePackets(t *testing.T) {
+	// A row whose raw_hex cannot be walked contributes nothing and must not
+	// error the pass: one malformed row in the window would otherwise blank
+	// the verification for every repeater.
+	v := buildVerifierFromPackets(t, "AA", realTransportFloodPacket)
+	got := v.evidence([]int64{1, 2}, []string{"fm-112"})
+	if got["fm-112"] != 1 {
+		t.Errorf("evidence = %v, want fm-112:1 - the malformed row is skipped, the good one still counts", got)
+	}
+}
+
+func TestScopeVerifierMemoisesAcrossTargets(t *testing.T) {
+	// The cost argument: work depends on (region, transmission), not on which
+	// target asked. Two targets declaring the same region over the same packets
+	// must not double the HMACs.
+	v := buildVerifierFromPackets(t, realTransportFloodPacket, realTransportFloodPacket)
+	v.evidence([]int64{1, 2}, []string{"fm-112"})
+	after := v.hmacCount
+	v.evidence([]int64{1, 2}, []string{"fm-112"})
+	if v.hmacCount != after {
+		t.Errorf("hmacCount %d -> %d on a repeat query, want unchanged - the memo is what keeps this inside rule 0", after, v.hmacCount)
+	}
+}
+
+func TestScopeVerifierUnknownTxIDIsHarmless(t *testing.T) {
+	// A target's unmatchedTxIDs come from a different query than the verifier's
+	// rows. They are taken in the same window, but a row pruned between the two
+	// must degrade to "no evidence", not panic.
+	v := buildVerifierFromPackets(t, realTransportFloodPacket)
+	got := v.evidence([]int64{1, 999}, []string{"fm-112"})
+	if got["fm-112"] != 1 {
+		t.Errorf("evidence = %v, want fm-112:1 - the unknown id contributes nothing", got)
+	}
+}
