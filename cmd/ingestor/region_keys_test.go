@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
 	"strings"
 	"testing"
@@ -188,4 +191,123 @@ func keyNames(s *regionKeySnapshot) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// codeFor derives the on-wire code1 a sender in region `name` would emit for
+// this payload - the same computation matchingRegions inverts. Used to build
+// packets that genuinely belong to a region rather than asserting on a
+// hardcoded string.
+func codeFor(name string, payloadType byte, payload []byte) string {
+	if !strings.HasPrefix(name, "#") {
+		name = "#" + name
+	}
+	sum := sha256.Sum256([]byte(name))
+	mac := hmac.New(sha256.New, sum[:16])
+	mac.Write([]byte{payloadType})
+	mac.Write(payload)
+	h := mac.Sum(nil)
+	code := uint16(h[0]) | uint16(h[1])<<8
+	if code == 0 {
+		code = 1
+	} else if code == 0xFFFF {
+		code = 0xFFFE
+	}
+	return strings.ToUpper(hex.EncodeToString([]byte{byte(code & 0xFF), byte(code >> 8)}))
+}
+
+func TestScopeMatchUniqueNamesTheRegion(t *testing.T) {
+	payload := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	cfg := &Config{HashRegions: []string{"#be"}}
+	set := newRegionKeySet(cfg)
+	code := codeFor("#be", 5, payload)
+
+	got := set.snapshot().match(5, payload, code)
+	if got.Name != "#be" {
+		t.Errorf("Name = %q, want %q", got.Name, "#be")
+	}
+	if got.Reason != scopeReasonUnique {
+		t.Errorf("Reason = %q, want %q", got.Reason, scopeReasonUnique)
+	}
+}
+
+func TestScopeMatchNoKeyMatches(t *testing.T) {
+	cfg := &Config{HashRegions: []string{"#be"}}
+	set := newRegionKeySet(cfg)
+
+	got := set.snapshot().match(5, []byte{1, 2, 3}, "0000")
+	if got.Name != "" || got.Reason != scopeReasonNone {
+		t.Errorf("got %+v, want an empty name with reason %q", got, scopeReasonNone)
+	}
+}
+
+func TestScopeMatchExplicitBeatsDerived(t *testing.T) {
+	// The ambiguity this feature introduces: a derived key collides with an
+	// operator-configured one on this payload. Operator config wins - it is
+	// intent, the derived name is hearsay picked up over RF.
+	payload := []byte{0x01, 0x02, 0x03, 0x04}
+	cfg := &Config{HashRegions: []string{"#be"}, AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true}}
+	set := newRegionKeySet(cfg)
+	code := codeFor("#be", 5, payload)
+
+	// Force the collision rather than searching for a natural one: inject a
+	// derived key whose bytes are the explicit key's, so both match.
+	snap := set.snapshot()
+	collide := make(map[string][]byte, len(snap.all)+1)
+	for k, v := range snap.all {
+		collide[k] = v
+	}
+	collide["#collider"] = snap.all["#be"]
+	forced := &regionKeySnapshot{all: collide, explicit: snap.explicit}
+
+	got := forced.match(5, payload, code)
+	if got.Name != "#be" {
+		t.Errorf("Name = %q, want %q - the explicit key must win", got.Name, "#be")
+	}
+	if got.Reason != scopeReasonExplicitOverDerived {
+		t.Errorf("Reason = %q, want %q", got.Reason, scopeReasonExplicitOverDerived)
+	}
+	if len(got.Candidates) != 2 {
+		t.Errorf("Candidates = %v, want both names recorded for the log", got.Candidates)
+	}
+}
+
+func TestScopeMatchTwoExplicitKeysStayAmbiguous(t *testing.T) {
+	// Two equally-sourced candidates: naming either would be a guess, and
+	// naming wrongly is worse than not naming. This is #1609's rule, unchanged.
+	payload := []byte{0x09, 0x08, 0x07}
+	cfg := &Config{HashRegions: []string{"#be", "#eu"}}
+	set := newRegionKeySet(cfg)
+	code := codeFor("#be", 5, payload)
+
+	snap := set.snapshot()
+	collide := map[string][]byte{"#be": snap.all["#be"], "#eu": snap.all["#be"]}
+	forced := &regionKeySnapshot{all: collide, explicit: snap.explicit}
+
+	got := forced.match(5, payload, code)
+	if got.Name != "" {
+		t.Errorf("Name = %q, want empty - two explicit candidates must abstain", got.Name)
+	}
+	if got.Reason != scopeReasonAmbiguous {
+		t.Errorf("Reason = %q, want %q", got.Reason, scopeReasonAmbiguous)
+	}
+}
+
+func TestScopeMatchTwoDerivedKeysStayAmbiguous(t *testing.T) {
+	// The tier-3 case, deliberately NOT resolved in M2. It must abstain rather
+	// than pick, and the reason must say ambiguous so the log can measure how
+	// often this happens before tier 3 is built.
+	payload := []byte{0x11, 0x22}
+	cfg := &Config{AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true}}
+	set := newRegionKeySet(cfg)
+	set.refreshDerived([]string{"aa", "bb"})
+
+	snap := set.snapshot()
+	collide := map[string][]byte{"#aa": snap.all["#aa"], "#bb": snap.all["#aa"]}
+	forced := &regionKeySnapshot{all: collide, explicit: snap.explicit}
+	code := codeFor("#aa", 5, payload)
+
+	got := forced.match(5, payload, code)
+	if got.Name != "" || got.Reason != scopeReasonAmbiguous {
+		t.Errorf("got %+v, want an empty name with reason %q", got, scopeReasonAmbiguous)
+	}
 }

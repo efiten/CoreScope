@@ -178,3 +178,60 @@ func (s *regionKeySet) refreshDerived(names []string) []string {
 	s.cur.Store(&regionKeySnapshot{all: all, explicit: old.explicit})
 	return added
 }
+
+// scopeReason records how a scope match was decided, so the outcome is
+// auditable in logs without a schema change. It is deliberately not stored:
+// transmissions.scope_name keeps its existing three-state encoding.
+type scopeReason string
+
+const (
+	scopeReasonNone                scopeReason = "none"                  // no key matched
+	scopeReasonUnique              scopeReason = "unique"                // exactly one key matched
+	scopeReasonExplicitOverDerived scopeReason = "explicit-over-derived" // several matched, one was operator config
+	scopeReasonAmbiguous           scopeReason = "ambiguous"             // several matched, no principled winner
+)
+
+// scopeMatch is the result of naming one packet's region scope.
+type scopeMatch struct {
+	Name       string // empty when unresolved - the caller stores that as the unmatched state
+	Reason     scopeReason
+	Candidates []string // every matching name, populated only when more than one matched
+}
+
+// match names the region scope of a transport-scoped packet, resolving a
+// multi-key collision by evidence rather than by map order.
+//
+// Tiers, in order:
+//
+//  1. Exactly one key matched - name it.
+//  2. Several matched but exactly one came from hashRegions - name that one.
+//     The operator's own configuration outranks a name picked up off the air,
+//     and this covers the bulk of the ambiguity auto-derivation introduces.
+//  3. Otherwise abstain, returning an empty name. Two equally-sourced
+//     candidates offer no principled winner, and naming a packet wrongly is
+//     worse than leaving it unnamed - the rule #1609 established, unchanged.
+//
+// (The spec's tier-3 path-evidence tie-break sits between 2 and 3 and is
+// deliberately not built here; see
+// docs/specs/2026-09-07-auto-region-keys-design.md. The scopeReasonAmbiguous
+// counter is what measures whether it is worth building.)
+func (s *regionKeySnapshot) match(payloadType byte, payloadRaw []byte, code1 string) scopeMatch {
+	matched := matchingRegions(s.all, payloadType, payloadRaw, code1)
+	switch len(matched) {
+	case 0:
+		return scopeMatch{Reason: scopeReasonNone}
+	case 1:
+		return scopeMatch{Name: matched[0], Reason: scopeReasonUnique}
+	}
+
+	var explicitMatches []string
+	for _, name := range matched {
+		if s.explicit[name] {
+			explicitMatches = append(explicitMatches, name)
+		}
+	}
+	if len(explicitMatches) == 1 {
+		return scopeMatch{Name: explicitMatches[0], Reason: scopeReasonExplicitOverDerived, Candidates: matched}
+	}
+	return scopeMatch{Reason: scopeReasonAmbiguous, Candidates: matched}
+}
