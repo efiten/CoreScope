@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"strings"
 	"testing"
 )
@@ -105,4 +106,86 @@ func TestSplitDeclaredRegionsCSV(t *testing.T) {
 	if n := len(splitDeclaredRegionsCSV("")); n != 0 {
 		t.Errorf("empty csv produced %d entries, want 0", n)
 	}
+}
+
+func TestRegionKeySetExplicitOnlyWhenDisabled(t *testing.T) {
+	// Derivation off: the snapshot must be exactly what loadRegionKeys built,
+	// and refreshDerived must be a no-op rather than a quiet opt-in.
+	cfg := &Config{HashRegions: []string{"#be"}}
+	set := newRegionKeySet(cfg)
+	set.refreshDerived([]string{"behss", "fm-112"})
+
+	snap := set.snapshot()
+	if len(snap.all) != 1 {
+		t.Fatalf("len(all) = %d, want 1 — refreshDerived must not add keys when disabled", len(snap.all))
+	}
+	if _, ok := snap.all["#be"]; !ok {
+		t.Error("want the explicit #be key present")
+	}
+	if !snap.isExplicit("#be") {
+		t.Error("isExplicit(#be) = false, want true")
+	}
+}
+
+func TestRegionKeySetMergesDerivedWhenEnabled(t *testing.T) {
+	cfg := &Config{
+		HashRegions:    []string{"#be"},
+		AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true},
+	}
+	set := newRegionKeySet(cfg)
+	set.refreshDerived([]string{"behss", "be"}) // "be" duplicates the explicit key
+
+	snap := set.snapshot()
+	if len(snap.all) != 2 {
+		t.Fatalf("len(all) = %d, want 2 (#be explicit + #behss derived), got keys %v", len(snap.all), keyNames(snap))
+	}
+	if _, ok := snap.all["#behss"]; !ok {
+		t.Errorf("want the derived #behss key present, got %v", keyNames(snap))
+	}
+	if snap.isExplicit("#behss") {
+		t.Error("isExplicit(#behss) = true, want false — a derived key is not operator config")
+	}
+	if !snap.isExplicit("#be") {
+		t.Error("isExplicit(#be) = false, want true — an explicit key must not be demoted by a duplicate declaration")
+	}
+}
+
+func TestRegionKeySetRefreshReplacesRatherThanAccumulates(t *testing.T) {
+	// A region that stops being declared must leave the derived tier, or the
+	// key set only ever grows and the cap stops meaning anything.
+	cfg := &Config{AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true}}
+	set := newRegionKeySet(cfg)
+	set.refreshDerived([]string{"aa"})
+	set.refreshDerived([]string{"bb"})
+
+	snap := set.snapshot()
+	if _, ok := snap.all["#aa"]; ok {
+		t.Error("want #aa gone after a refresh that no longer lists it")
+	}
+	if _, ok := snap.all["#bb"]; !ok {
+		t.Error("want #bb present after the refresh that lists it")
+	}
+}
+
+func TestRegionKeySetSnapshotIsStable(t *testing.T) {
+	// A snapshot handed to a packet must not change under it mid-match.
+	cfg := &Config{AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true}}
+	set := newRegionKeySet(cfg)
+	set.refreshDerived([]string{"aa"})
+	held := set.snapshot()
+	set.refreshDerived([]string{"bb"})
+
+	if _, ok := held.all["#aa"]; !ok {
+		t.Error("the held snapshot lost #aa — snapshots must be immutable, not aliases of live state")
+	}
+}
+
+// keyNames is a test helper for readable failure messages.
+func keyNames(s *regionKeySnapshot) []string {
+	out := make([]string, 0, len(s.all))
+	for k := range s.all {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

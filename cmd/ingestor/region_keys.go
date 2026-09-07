@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // declaredRegionStat is one region name as reported over RF, with the two
@@ -93,4 +95,86 @@ func splitDeclaredRegionsCSV(csv string) []string {
 		}
 	}
 	return out
+}
+
+// regionKeySnapshot is an immutable view of the region keys in force for one
+// packet. `all` is the single map matching iterates - merging at build time
+// rather than per packet keeps the hot path free of allocation. `explicit`
+// carries membership only, and exists so the ambiguity tie-break can tell an
+// operator-configured region from one derived off the air.
+type regionKeySnapshot struct {
+	all      map[string][]byte
+	explicit map[string]bool
+}
+
+func (s *regionKeySnapshot) isExplicit(name string) bool { return s.explicit[name] }
+
+// regionKeySet holds the live snapshot. Readers take one atomic load; a
+// refresh builds the replacement off to the side and swaps the pointer, so the
+// ingest hot path never blocks on a rebuild (AGENTS.md rule 0).
+type regionKeySet struct {
+	cur     atomic.Pointer[regionKeySnapshot]
+	enabled bool
+	max     int
+}
+
+// newRegionKeySet builds the explicit tier from hashRegions. The derived tier
+// starts empty; refreshDerived fills it, and does nothing at all when
+// autoRegionKeys is off.
+func newRegionKeySet(cfg *Config) *regionKeySet {
+	explicitKeys := loadRegionKeys(cfg)
+	explicitNames := make(map[string]bool, len(explicitKeys))
+	all := make(map[string][]byte, len(explicitKeys))
+	for name, key := range explicitKeys {
+		explicitNames[name] = true
+		all[name] = key
+	}
+	s := &regionKeySet{
+		enabled: cfg.AutoRegionKeysEnabled(),
+		max:     cfg.AutoRegionKeysMaxDerived(),
+	}
+	s.cur.Store(&regionKeySnapshot{all: all, explicit: explicitNames})
+	return s
+}
+
+func (s *regionKeySet) snapshot() *regionKeySnapshot { return s.cur.Load() }
+
+// refreshDerived rebuilds the derived tier from names (already ranked and
+// capped by the caller) and swaps in a new snapshot. It REPLACES the derived
+// tier rather than merging into it, so a region that stops being declared
+// leaves the key set and the cap keeps meaning something.
+//
+// A name that duplicates an explicit key is skipped, not re-added: the
+// explicit tier must stay authoritative for the tie-break, and demoting a
+// configured region because a repeater also declares it would invert the whole
+// rule.
+//
+// Returns the names actually added, for the caller to log.
+func (s *regionKeySet) refreshDerived(names []string) []string {
+	if !s.enabled {
+		return nil
+	}
+	old := s.cur.Load()
+	all := make(map[string][]byte, len(old.explicit)+len(names))
+	for name := range old.explicit {
+		all[name] = old.all[name]
+	}
+	added := make([]string, 0, len(names))
+	for _, raw := range names {
+		if !regionNameAcceptable(raw) {
+			continue
+		}
+		name := "#" + raw
+		if old.explicit[name] {
+			continue
+		}
+		if _, exists := all[name]; exists {
+			continue
+		}
+		h := sha256.Sum256([]byte(name))
+		all[name] = h[:16]
+		added = append(added, name)
+	}
+	s.cur.Store(&regionKeySnapshot{all: all, explicit: old.explicit})
+	return added
 }
