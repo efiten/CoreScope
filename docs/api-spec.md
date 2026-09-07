@@ -1896,7 +1896,8 @@ not being the same as "declared nothing"), which apply here identically.
       "observedUnscopedPackets": number,               // plain-FLOOD packets forwarded this window
       "wildcardContradiction":   boolean,               // observed unscoped forwarding but '*' not declared
       "ambiguousHops":            number,                // forwarder hops this window that could not be attributed — see note below
-      "observedUnmatchedPackets": number                 // forwarded packets whose scope this instance holds no key for — see note below
+      "observedUnmatchedPackets": number,                // forwarded packets whose scope this instance holds no key for — see note below
+      "regionEvidence":           { "<region>": number } // declared regions corroborated by this repeater's own unnameable traffic — see note below
     }
   ]
 }
@@ -1945,6 +1946,23 @@ not being the same as "declared nothing"), which apply here identically.
   in this instance's own configuration and the operator can act on it. It is **not**
   evidence for or against `declaredWildcard` — unmatched traffic is scoped, so it never
   affects `wildcardContradiction`, which counts only plain unscoped floods.
+  Since M1b, part of this count is explained: packets counted in `regionEvidence` are
+  attributable to a declared region after all. A client showing this as a caveat should
+  subtract them and report only the remainder, which carries a sharper meaning — traffic
+  this repeater forwards for a region it does **not** declare and this instance cannot
+  name.
+- `regionEvidence` maps a declared region to how many of this repeater's own unmatched
+  forwarded packets derive to it. The server tests each declared region this repeater has
+  no *named* evidence for by deriving `SHA256("#region")[:16]` and HMAC-ing that
+  repeater's own unmatched packets with it — the same computation the ingestor performs at
+  ingest, with the candidate set narrowed to this repeater's declarations. A region
+  reaching **2** corroborating packets is removed from `notObserved`: `code1` is two
+  bytes, so one match happens by chance with probability 1/65536, while two on the same
+  region is (1/65536)². A region with exactly one hit therefore stays in `notObserved`
+  **and** appears here with the value 1, so a client can explain why it is still shown as
+  not observed. `notObserved` remains the single source of truth for whether a region was
+  observed; this field says only *how* that was established. The object is always present
+  and may be empty.
 - All scope names in `declaredRegions` / `notObserved` / `undeclaredObserved[].scope` are
   already normalised (no leading `#`) — the server does the `#`/no-`#` reconciliation
   described on the per-node endpoint so this response is directly comparable without a
