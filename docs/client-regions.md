@@ -119,6 +119,27 @@ stale one just because it arrived later.
 
 Retention: `retention.clientRegionsDays` bounds the table by `observed_at`; `0` disables it (Task 6).
 
+## Second consumer — derived region keys
+
+`node_declared_regions` originally had one reader: the declared side of the
+Scope Audit. With `autoRegionKeys.enabled` set (default off, see
+`config.example.json`), the ingestor reads it a second time, deriving a region
+key `SHA256("#name")[:16]` for each declared name so that traffic in those
+regions can be *named* rather than stored unmatched.
+
+Two consequences operators should know about:
+
+- **Retention now bounds nameability.** `retention.clientRegionsDays` already
+  bounded how long a declared answer stayed visible in the audit. With
+  derivation on, it also bounds how long a region stays *derivable*: once the
+  last answer naming a region is pruned, its key leaves the set on the next
+  refresh and its traffic reverts to unmatched. Regions you want named
+  permanently belong in `hashRegions`, which nothing prunes.
+- **The set is capped.** `autoRegionKeys.maxDerived` (default 256) limits the
+  derived tier; over the cap, names are kept by how many distinct repeaters
+  declare them, so a one-off local name is dropped before a region half the
+  network uses. The ingestor logs how many names were dropped on each refresh.
+
 ## Configurable values (future customizer)
 
 `retention.clientRegionsDays` is the only tunable so far; no map rendering or comparison UI is built on
