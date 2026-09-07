@@ -102,6 +102,19 @@ func seedTransmissionRoute(t *testing.T, s *PacketStore, forwarder string, seed 
 // than the fixed date the ScopeConformance unit tests above use.
 func seedTransmissionRouteAt(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed, routeType int, firstSeen string) {
 	t.Helper()
+	seedTransmissionPathAt(t, s, []string{forwarder}, seed, routeType, firstSeen)
+}
+
+// seedTransmissionPathAt seeds one transmission whose single observation
+// carries a MULTI-hop path. A one-hop seed cannot tell the two reasons a node
+// gets attributed apart — it is simultaneously path[0] and path[last] — so the
+// mid-path cases below need a path with something after the target on it.
+//
+// Hops are upper-cased for the same reason seedTransmissionRoute does it: the
+// decoder writes them that way (packetpath.DecodePathFromRawHex), and the join
+// has to cope with that rather than with a lowercase convenience fiction.
+func seedTransmissionPathAt(t *testing.T, s *PacketStore, hops []string, seed scopeSeed, routeType int, firstSeen string) {
+	t.Helper()
 	scopeSeedCounter++
 	hash := fmt.Sprintf("scopehash%d", scopeSeedCounter)
 
@@ -118,7 +131,11 @@ func seedTransmissionRouteAt(t *testing.T, s *PacketStore, forwarder string, see
 		t.Fatalf("seed transmission id: %v", err)
 	}
 
-	pathJSON := fmt.Sprintf(`["%s"]`, strings.ToUpper(forwarder))
+	quoted := make([]string, len(hops))
+	for i, h := range hops {
+		quoted[i] = `"` + strings.ToUpper(h) + `"`
+	}
+	pathJSON := "[" + strings.Join(quoted, ",") + "]"
 	if _, err := s.db.conn.Exec(
 		`INSERT INTO observations (transmission_id, path_json, timestamp) VALUES (?, ?, ?)`,
 		txID, pathJSON, time.Now().Unix(),
@@ -140,6 +157,13 @@ func seedTransmission(t *testing.T, s *PacketStore, forwarder string, seed scope
 func seedDirectTransmission(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed) {
 	t.Helper()
 	seedTransmissionRoute(t, s, forwarder, seed, RouteDirect)
+}
+
+// seedTransmissionPath is seedTransmissionPathAt at the fixed date the
+// ScopeConformance unit tests use.
+func seedTransmissionPath(t *testing.T, s *PacketStore, hops []string, seed scopeSeed, routeType int) {
+	t.Helper()
+	seedTransmissionPathAt(t, s, hops, seed, routeType, "2026-01-15T12:00:00Z")
 }
 
 func TestScopeConformanceKeepsThreeStatesDistinct(t *testing.T) {
@@ -260,6 +284,101 @@ func TestScopeConformanceRouteMixIgnoresDirectRoutes(t *testing.T) {
 	}
 	if len(got.Observed) != 0 {
 		t.Errorf("Observed = %+v, want empty — no flood packet was seeded", got.Observed)
+	}
+}
+
+// TestScopeConformanceAttributesMidPathForwarder is the case the old last-hop
+// restriction hid. On a flood route every forwarder APPENDS its own hash to the
+// end of the path (internal/packetpath/route.go), so a hop in the MIDDLE
+// forwarded the packet exactly as surely as path[last] did — being last only
+// additionally means an uplinked observer heard that transmission directly.
+//
+// Measured on the live instance 2026-09-07: BE-HHE-LAAK-EDG-01 carried 155
+// flood-family packets on its hop over 14 days and was path[last] on ZERO of
+// them, so its Scopes card was empty (whole route mix zero) while its own node
+// header listed four transported scopes from the same database. Network-wide the
+// restriction kept 14% of hop observations and left 65% of repeaters with no
+// evidence at all. See docs/specs/2026-09-07-auto-region-keys-design.md, M0.
+func TestScopeConformanceAttributesMidPathForwarder(t *testing.T) {
+	s := newScopeTestStore(t)
+	// The target forwarded first, two other nodes relayed it onward, and only
+	// the third was heard by an observer — the shape of every edge repeater.
+	seedTransmissionPath(t, s, []string{testFullPubkeyA[:4], "AAAA", "BBBB"}, scopeMatched("#be"), RouteFlood)
+
+	got, err := s.ScopeConformance(testFullPubkeyA, "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Observed) != 1 || got.Observed[0].Scope != "#be" || got.Observed[0].Packets != 1 {
+		t.Fatalf("Observed = %+v, want one #be observation — a mid-path hop on a flood route is a forwarder", got.Observed)
+	}
+	if got.Routes.Flood != 1 {
+		t.Errorf("Routes.Flood = %d, want 1", got.Routes.Flood)
+	}
+}
+
+// TestScopeConformanceIgnoresDirectRoutesMidPath is the guard that has to hold
+// after the last-hop restriction is gone. On a DIRECT route the path is consumed
+// from the FRONT, so its hops are the route's remaining plan rather than a record
+// of who transmitted — attributing any of them, last or middle, would credit
+// forwarding that never happened. The route-type filter is now the only thing
+// preventing that, so it is pinned explicitly here and not left implied.
+//
+// Live confirmation: the 52 transmissions where that repeater IS path[last] are
+// all route_type 2 — packets addressed toward it, not forwarded by it.
+func TestScopeConformanceIgnoresDirectRoutesMidPath(t *testing.T) {
+	s := newScopeTestStore(t)
+	seedTransmissionPath(t, s, []string{"AAAA", testFullPubkeyA[:4], "BBBB"}, scopeMatched("#be"), RouteDirect)
+	seedTransmissionPath(t, s, []string{"AAAA", "BBBB", testFullPubkeyA[:4]}, scopeMatched("#be"), RouteTransportDirect)
+
+	got, err := s.ScopeConformance(testFullPubkeyA, "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Observed) != 0 {
+		t.Errorf("Observed = %+v, want empty — a DIRECT route's path hops are a plan, not forwarding evidence", got.Observed)
+	}
+	if got.Routes != (RouteTypeMix{}) {
+		t.Errorf("Routes = %+v, want all zero", got.Routes)
+	}
+}
+
+// TestScopeConformanceCountsOneTransmissionOnce pins that widening the join to
+// every hop cannot double-count. A path can legitimately carry the same hop
+// twice (a routing loop, or two nodes colliding on the same truncated prefix),
+// and a transmission is one packet however many of its hops match. EXISTS gives
+// this for free — which is precisely why the query must keep using EXISTS rather
+// than joining json_each into the outer SELECT.
+func TestScopeConformanceCountsOneTransmissionOnce(t *testing.T) {
+	s := newScopeTestStore(t)
+	seedTransmissionPath(t, s, []string{testFullPubkeyA[:4], "AAAA", testFullPubkeyA[:4]}, scopeMatched("#be"), RouteFlood)
+
+	got, err := s.ScopeConformance(testFullPubkeyA, "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Observed) != 1 || got.Observed[0].Packets != 1 {
+		t.Fatalf("Observed = %+v, want exactly one packet counted once", got.Observed)
+	}
+	if got.Routes.Flood != 1 {
+		t.Errorf("Routes.Flood = %d, want 1 — one transmission, however many of its hops match", got.Routes.Flood)
+	}
+}
+
+// TestScopeConformanceIgnoresShortMidPathHop keeps minForwarderHopHexLen
+// applying to middle hops too. A 1-byte hop collides across a real fleet far too
+// often to attribute, and now that every hop is a candidate there are ~7x as many
+// chances to get it wrong.
+func TestScopeConformanceIgnoresShortMidPathHop(t *testing.T) {
+	s := newScopeTestStore(t)
+	seedTransmissionPath(t, s, []string{testFullPubkeyA[:2], "AAAA", "BBBB"}, scopeMatched("#be"), RouteFlood)
+
+	got, err := s.ScopeConformance(testFullPubkeyA, "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Observed) != 0 || got.Routes != (RouteTypeMix{}) {
+		t.Errorf("Observed = %+v, Routes = %+v, want nothing — a 1-byte hop is too collision-prone to attribute", got.Observed, got.Routes)
 	}
 }
 
@@ -794,6 +913,75 @@ func TestScopeAuditForwardingAmbiguousHopCreditsNeitherTarget(t *testing.T) {
 		if agg.ambiguousHops != 1 {
 			t.Errorf("%s: ambiguousHops = %d, want 1", pk, agg.ambiguousHops)
 		}
+	}
+}
+
+// TestScopeAuditForwardingAttributesMidPathHop is the fleet-wide half of the
+// mid-path attribution fix. The audit runs a different query from
+// ScopeConformance — one full-window scan instead of one EXISTS per pubkey — so
+// the two share the rule but not the code, and both need pinning.
+//
+// This is the case behind the audit's 65% blind spot: a declared target that
+// forwards steadily but is never the hop an observer hears directly had every
+// region it declares reported as notObserved.
+func TestScopeAuditForwardingAttributesMidPathHop(t *testing.T) {
+	s := newScopeTestStore(t)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionPathAt(t, s, []string{testFullPubkeyA[:4], "AAAA", "BBBB"}, scopeMatched("#be"), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil || agg.scopes["be"] == nil || agg.scopes["be"].Packets != 1 {
+		t.Fatalf("want the mid-path hop attributed to its sole matching target, got %+v", got)
+	}
+	if agg.ambiguousHops != 0 {
+		t.Errorf("ambiguousHops = %d, want 0 — one target matches this hop", agg.ambiguousHops)
+	}
+}
+
+// TestScopeAuditForwardingIgnoresDirectRoutes pins the route-type filter on the
+// audit's own query. With the last-hop restriction gone it is the only guard
+// against crediting a DIRECT route's remaining path plan as forwarding — and a
+// DIRECT packet's hops are frequently the declared targets this audit judges.
+func TestScopeAuditForwardingIgnoresDirectRoutes(t *testing.T) {
+	s := newScopeTestStore(t)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionPathAt(t, s, []string{"AAAA", testFullPubkeyA[:4], "BBBB"}, scopeMatched("#be"), RouteDirect, recent)
+	seedTransmissionPathAt(t, s, []string{"AAAA", "BBBB", testFullPubkeyA[:4]}, scopeMatched("#be"), RouteTransportDirect, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agg := got[testFullPubkeyA]; agg != nil && (len(agg.scopes) != 0 || agg.unscopedPackets != 0 || agg.ambiguousHops != 0) {
+		t.Errorf("agg = %+v, want no attribution from DIRECT routes", agg)
+	}
+}
+
+// TestScopeAuditForwardingCountsOneTransmissionOncePerTarget pins that the
+// existing "<target>|<txID>" de-duplication also absorbs the same target
+// matching several hops of ONE path — which could not happen while only
+// path[last] was read, and now can (a routing loop, or two hops colliding on the
+// same truncated prefix). Without it a looping packet would inflate a target's
+// packet count and quietly make a quiet region look busy.
+func TestScopeAuditForwardingCountsOneTransmissionOncePerTarget(t *testing.T) {
+	s := newScopeTestStore(t)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionPathAt(t, s, []string{testFullPubkeyA[:4], "AAAA", testFullPubkeyA[:4]}, scopeMatched("#be"), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil || agg.scopes["be"] == nil {
+		t.Fatalf("want #be attributed, got %+v", got)
+	}
+	if agg.scopes["be"].Packets != 1 {
+		t.Errorf("Packets = %d, want 1 — one transmission, matched on two of its hops", agg.scopes["be"].Packets)
 	}
 }
 

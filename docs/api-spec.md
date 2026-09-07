@@ -802,9 +802,15 @@ forwarding anything is a valid question, not an error.
   key for), not an error, and must not be folded into `unscoped`.
 - `unscoped` counts packets that carried no scope at all. `unmatched` and `unscoped` are
   always reported as separate top-level counts.
-- `routes.direct` / `routes.transportDirect` are always `0` by construction: a DIRECT-family
-  route's last path hop is the route's far end, never the transmitter, so this node can never
-  be attributed as the forwarder of one.
+- "this repeater's own forwarded traffic" means transmissions carrying this pubkey as **any**
+  path hop of a FLOOD-family route, not only as the final hop. On those routes each forwarder
+  appends its own hash, so every hop transmitted the packet; the final hop is only the one an
+  uplinked observer heard directly, and counting just that one reports nothing at all for a
+  repeater with no observer in RF range.
+- `routes.direct` / `routes.transportDirect` are always `0` by construction: DIRECT-family
+  routes are excluded outright, because they consume hops from the front, making their path
+  the route's remaining plan rather than a record of who transmitted — so none of their hops
+  is evidence that this node forwarded anything.
 
 **Notes — `declared` distinguishes "never asked" from "asked and declined everything":**
 - `window` bounds `observed` only; `declared` is always the latest reading regardless of
