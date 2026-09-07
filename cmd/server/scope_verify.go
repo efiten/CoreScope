@@ -7,6 +7,13 @@ import (
 	"strings"
 )
 
+// scopeVerifyMaxPacketsPerTarget bounds the per-target evidence list. AGENTS.md
+// rule 0 forbids unbounded structures, and the corroboration threshold is 2 —
+// past a few hundred packets more evidence changes no verdict, it only costs
+// memory. scopeAuditTargetAgg.unmatchedPackets keeps counting past this: the
+// count is the honest total, the list is the working set.
+const scopeVerifyMaxPacketsPerTarget = 512
+
 // scopeHMACInputs pulls the three values needed to test a region hypothesis
 // against one packet: the payload type and raw payload bytes the sender HMACed,
 // and the resulting two-byte code it put on the wire.

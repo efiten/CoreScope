@@ -436,6 +436,15 @@ type scopeAuditTargetAgg struct {
 	// of them may be a region this instance cannot name rather than one the
 	// repeater is not forwarding.
 	unmatchedPackets int64
+	// unmatchedTxIDs are the transmissions behind unmatchedPackets, kept so
+	// declared-region verification can test this target's own declarations
+	// against this target's own unnameable traffic (scope_verify.go). The same
+	// (target, txID) de-duplication that guards unmatchedPackets guards this,
+	// so one packet reaching a target by two hops cannot corroborate twice.
+	//
+	// Bounded by scopeVerifyMaxPacketsPerTarget, which unmatchedPackets is NOT:
+	// the count stays the honest total, this is the working set.
+	unmatchedTxIDs []int64
 }
 
 // scopeAuditPrefixIndex builds, for every even hex length from
@@ -583,6 +592,9 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 				// finding on this row may be a gap in this instance's
 				// hashRegions rather than in the repeater's forwarding.
 				agg.unmatchedPackets++
+				if len(agg.unmatchedTxIDs) < scopeVerifyMaxPacketsPerTarget {
+					agg.unmatchedTxIDs = append(agg.unmatchedTxIDs, txID)
+				}
 				continue
 			}
 			name := normScope(scopeName.String)

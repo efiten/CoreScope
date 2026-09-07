@@ -1045,6 +1045,35 @@ func TestScopeAuditForwardingCountsUnmatchedOnMidPathHop(t *testing.T) {
 	}
 }
 
+// TestScopeAuditForwardingRecordsUnmatchedTxIDs: the counter M1 added says how
+// many, verification needs to know which. The IDs must be de-duplicated the
+// same way the counter is — a target appearing twice in one path contributed
+// one packet, and counting it twice would let a single packet reach the
+// two-corroboration threshold on its own.
+func TestScopeAuditForwardingRecordsUnmatchedTxIDs(t *testing.T) {
+	s := newScopeTestStore(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionPathAt(t, s, []string{hop, "AAAA", hop}, scopeUnmatched(), RouteFlood, recent)
+	seedTransmissionPathAt(t, s, []string{"BBBB", hop}, scopeUnmatched(), RouteFlood, recent)
+	seedTransmissionPathAt(t, s, []string{hop}, scopeMatched("#be"), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil {
+		t.Fatalf("want an agg, got none (result = %+v)", got)
+	}
+	if len(agg.unmatchedTxIDs) != 2 {
+		t.Errorf("unmatchedTxIDs = %v, want 2 distinct ids — the twice-hopped packet counts once, and the matched packet not at all", agg.unmatchedTxIDs)
+	}
+	if agg.unmatchedPackets != int64(len(agg.unmatchedTxIDs)) {
+		t.Errorf("unmatchedPackets = %d but %d ids recorded — the count and the ids must not drift", agg.unmatchedPackets, len(agg.unmatchedTxIDs))
+	}
+}
+
 // --- GET /api/scope-audit handler tests ---
 
 // setupScopeAuditServer extends setupNodeScopesServer's schema with a
