@@ -20,6 +20,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/meshcore-analyzer/packetpath"
 	"github.com/meshcore-analyzer/prunequeue"
+	"golang.org/x/sync/singleflight"
 )
 
 // memBreakdownNote is the static accounting caveat attached to the opt-in
@@ -65,11 +66,14 @@ type Server struct {
 	scopeStatsCache    map[string]*ScopeStatsResponse
 	scopeStatsCachedAt map[string]time.Time
 
-	// Cached /api/scope-audit response — per-window, recomputed at most once
-	// every 30s, mirroring scopeStats above. See scopes.go.
+	// Cached /api/scope-audit response — per-window, with a singleflight so a
+	// cold key costs one scan no matter how many requests arrive on it. See
+	// scopeAuditTTLFor for why the 7d window's TTL is not the 30s the others
+	// use, and scopes.go for the scan itself.
 	scopeAuditMu       sync.Mutex
 	scopeAuditCache    map[string]*ScopeAuditResponse
 	scopeAuditCachedAt map[string]time.Time
+	scopeAuditSF       singleflight.Group
 
 	// Router reference for OpenAPI spec generation
 	router *mux.Router
@@ -3529,8 +3533,6 @@ func (s *Server) handleScopeStats(w http.ResponseWriter, r *http.Request) {
 // pass — see scopes.go's AllCurrentDeclaredRegions and ScopeAuditForwarding
 // for why that stays a single scan rather than one query per repeater.
 func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
-	const scopeAuditTTL = 30 * time.Second
-
 	window := r.URL.Query().Get("window")
 	if window == "" {
 		window = "24h"
@@ -3541,20 +3543,92 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.scopeAuditMu.Lock()
-	if s.scopeAuditCache != nil {
-		if cached, ok := s.scopeAuditCache[window]; ok && time.Since(s.scopeAuditCachedAt[window]) < scopeAuditTTL {
-			s.scopeAuditMu.Unlock()
-			writeJSON(w, cached)
-			return
-		}
-	}
-	s.scopeAuditMu.Unlock()
+	sinceISO := time.Now().Add(-lookback).UTC().Format(time.RFC3339)
 
-	declared, err := s.db.AllCurrentDeclaredRegions()
+	if cached, ok := s.scopeAuditCached(window); ok {
+		writeJSON(w, cached)
+		return
+	}
+
+	// singleflight: the compute below runs outside the cache mutex, so without
+	// this every request arriving on a cold window ran its own full scan
+	// concurrently. On the 7d window that scan is seconds of work over millions
+	// of hop rows, which is exactly the shape that makes a thundering herd
+	// expensive rather than merely wasteful. Same treatment /api/observers and
+	// /api/nodes/{pubkey}/reach already have.
+	v, err, _ := s.scopeAuditSF.Do(window, func() (interface{}, error) {
+		// The waiters that arrive while a scan is in flight are served by that
+		// scan's result; this second look is for the caller that acquires the
+		// group right after a winner stored one.
+		if cached, ok := s.scopeAuditCached(window); ok {
+			return cached, nil
+		}
+		resp, cErr := s.computeScopeAudit(window, sinceISO)
+		if cErr != nil {
+			return nil, cErr
+		}
+		s.scopeAuditStore(window, resp)
+		return resp, nil
+	})
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	writeJSON(w, v.(*ScopeAuditResponse))
+}
+
+// scopeAuditTTLFor is how long one window's computed audit stays fresh.
+//
+// 7d is not 30s because it does not cost what the others cost. Measured on the
+// live-shaped staging database on 2026-09-07: 16.7s cold for 7d against 4.0s
+// for 24h and 0.15s for 1h, and the 7d scan reads 3,470,188 hop rows. At a 30s
+// TTL a single reader with that window open keeps the instance recomputing more
+// than half the time, for an aggregate that moves at the pace of a week of
+// traffic. Five minutes of staleness on a seven-day window is not a fact the
+// reader can act on differently.
+func scopeAuditTTLFor(window string) time.Duration {
+	if window == "7d" {
+		return 5 * time.Minute
+	}
+	return 30 * time.Second
+}
+
+// scopeAuditCached returns the cached response for a window while it is within
+// that window's TTL.
+func (s *Server) scopeAuditCached(window string) (*ScopeAuditResponse, bool) {
+	s.scopeAuditMu.Lock()
+	defer s.scopeAuditMu.Unlock()
+	if s.scopeAuditCache == nil {
+		return nil, false
+	}
+	cached, ok := s.scopeAuditCache[window]
+	if !ok || time.Since(s.scopeAuditCachedAt[window]) >= scopeAuditTTLFor(window) {
+		return nil, false
+	}
+	return cached, true
+}
+
+// scopeAuditStore publishes a freshly computed response for a window.
+func (s *Server) scopeAuditStore(window string, resp *ScopeAuditResponse) {
+	s.scopeAuditMu.Lock()
+	defer s.scopeAuditMu.Unlock()
+	if s.scopeAuditCache == nil {
+		s.scopeAuditCache = make(map[string]*ScopeAuditResponse)
+		s.scopeAuditCachedAt = make(map[string]time.Time)
+	}
+	s.scopeAuditCache[window] = resp
+	s.scopeAuditCachedAt[window] = time.Now()
+}
+
+// computeScopeAudit builds one window's audit response: the declared lists, the
+// forwarding evidence attributed to them, and the declared-region verification
+// that settles which unnameable traffic corroborates a declaration. Split out
+// of the handler so the cache and its singleflight wrap a plain function
+// instead of a request.
+func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse, error) {
+	declared, err := s.db.AllCurrentDeclaredRegions()
+	if err != nil {
+		return nil, err
 	}
 
 	targets := make([]string, 0, len(declared))
@@ -3562,13 +3636,11 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 		targets = append(targets, strings.ToLower(d.Target))
 	}
 
-	sinceISO := time.Now().Add(-lookback).UTC().Format(time.RFC3339)
 	forwarding := map[string]*scopeAuditTargetAgg{}
 	if s.store != nil {
 		forwarding, err = s.store.ScopeAuditForwarding(sinceISO, targets)
 		if err != nil {
-			writeError(w, 500, err.Error())
-			return
+			return nil, err
 		}
 	}
 
@@ -3724,16 +3796,7 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 		return an < bn
 	})
 
-	s.scopeAuditMu.Lock()
-	if s.scopeAuditCache == nil {
-		s.scopeAuditCache = make(map[string]*ScopeAuditResponse)
-		s.scopeAuditCachedAt = make(map[string]time.Time)
-	}
-	s.scopeAuditCache[window] = resp
-	s.scopeAuditCachedAt[window] = time.Now()
-	s.scopeAuditMu.Unlock()
-
-	writeJSON(w, resp)
+	return resp, nil
 }
 
 // handlePruneGeoFilter identifies (dry_run=true, default) or enqueues (confirm=true)

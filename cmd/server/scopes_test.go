@@ -1147,6 +1147,44 @@ func getScopeAudit(t *testing.T, router *mux.Router, query string) ScopeAuditRes
 	return got
 }
 
+// TestScopeAuditTTLForSevenDayWindow pins the per-window TTL. The 7d window
+// costs a different order of magnitude than the others (16.7s against 4.0s and
+// 0.15s, measured on the live-shaped staging database on 2026-09-07), so it is
+// deliberately not on the 30s the other two share. A future edit that collapses
+// this back to one constant should have to delete a test that says why.
+func TestScopeAuditTTLForSevenDayWindow(t *testing.T) {
+	if got := scopeAuditTTLFor("7d"); got != 5*time.Minute {
+		t.Errorf("scopeAuditTTLFor(7d) = %s, want 5m", got)
+	}
+	for _, w := range []string{"1h", "24h", ""} {
+		if got := scopeAuditTTLFor(w); got != 30*time.Second {
+			t.Errorf("scopeAuditTTLFor(%q) = %s, want 30s", w, got)
+		}
+	}
+}
+
+// TestHandleScopeAuditServesSecondRequestFromCache pins the cache path itself,
+// which the singleflight rewrite moved out of the handler and into
+// scopeAuditCached/scopeAuditStore. A declared row inserted between two
+// requests inside the TTL must NOT appear in the second response: if it does,
+// the response was recomputed and the cache is not being consulted.
+func TestHandleScopeAuditServesSecondRequestFromCache(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	insertDeclared(t, srv, testFullPubkeyA, now, "be", 0)
+
+	first := getScopeAudit(t, router, "")
+	if len(first.Repeaters) != 1 {
+		t.Fatalf("first call repeaters = %d, want 1", len(first.Repeaters))
+	}
+
+	insertDeclared(t, srv, testFullPubkeyB, now, "be", 0)
+	second := getScopeAudit(t, router, "")
+	if len(second.Repeaters) != 1 {
+		t.Errorf("second call repeaters = %d, want 1 — the row added after the first call proves the cache was bypassed", len(second.Repeaters))
+	}
+}
+
 // TestHandleScopeAuditNormalisesHashPrefix pins trap 1: transmissions.scope_name
 // keeps the '#' (hashRegions config), regions_csv arrives from the firmware
 // with it already stripped. Declared "be-van" and observed "#be-van" must be
