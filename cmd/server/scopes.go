@@ -842,6 +842,19 @@ type ScopeAuditRow struct {
 	// floods.
 	ObservedUnmatchedPackets int64 `json:"observedUnmatchedPackets"`
 
+	// ObservedUnmatchedSampled is how many of those packets verification could
+	// actually look at: the per-target list is capped at
+	// scopeVerifyMaxPacketsPerTarget and the window sample at
+	// scopeVerifyMaxWindowPackets, while ObservedUnmatchedPackets keeps
+	// counting past both.
+	//
+	// It exists because a client cannot otherwise subtract the two fields
+	// honestly. RegionEvidence can only ever count packets inside this sample,
+	// so on a row where this is smaller than ObservedUnmatchedPackets the
+	// difference between them is an upper bound on the unexplained traffic, not
+	// a figure. Equal values mean the subtraction is exact.
+	ObservedUnmatchedSampled int64 `json:"observedUnmatchedSampled"`
+
 	// RegionEvidence maps a declared region to how many of this repeater's own
 	// unmatched forwarded packets derive to it — see scope_verify.go. A region
 	// reaching scopeVerifyMinCorroboration is removed from NotObserved, so this

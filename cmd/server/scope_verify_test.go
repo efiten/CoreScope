@@ -109,7 +109,7 @@ func TestUnmatchedTransmissionsInWindow(t *testing.T) {
 	seedTransmissionRouteAt(t, s, "E3D3", scopeUnmatched(), RouteFlood, old)
 
 	since := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
-	got, err := s.unmatchedTransmissionsInWindow(since)
+	got, _, err := s.unmatchedTransmissionsInWindow(since)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,6 +209,116 @@ func TestScopeVerifierUnknownTxIDIsHarmless(t *testing.T) {
 // packets, which is what makes the feature affordable (AGENTS.md rule 0).
 func BenchmarkScopeVerifierAudit(b *testing.B) {
 	const packets, names, targets = 400, 124, 205
+	rows := make([]unmatchedTransmissionRow, 0, packets)
+	txIDs := make([]int64, 0, packets)
+	for i := 0; i < packets; i++ {
+		rows = append(rows, unmatchedTransmissionRow{txID: int64(i + 1), rawHex: realTransportFloodPacket})
+		txIDs = append(txIDs, int64(i+1))
+	}
+	declared := make([]string, 0, names)
+	for i := 0; i < names; i++ {
+		declared = append(declared, fmt.Sprintf("r%04d", i))
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		v := newScopeVerifier(rows)
+		for t := 0; t < targets; t++ {
+			v.evidence(txIDs, declared)
+		}
+	}
+}
+
+// TestUnmatchedTransmissionsInWindowIsBounded pins the LIMIT and what it keeps.
+//
+// The "~400 packets in a 7d window" this feature was sized against holds only
+// for an instance whose hashRegions covers most of what its repeaters forward.
+// The ingestor writes scope_name = ” for EVERY transport-scoped packet it
+// cannot name, so a stock instance with no hashRegions at all has every scoped
+// packet in this result set, and the verifier's work is (distinct declared
+// names x rows). Unbounded on the axis that grows fastest is exactly what
+// AGENTS.md rule 0 forbids.
+//
+// Newest-first is not arbitrary: a partial answer built from the most recent
+// traffic matches what the window claims to describe, and a repeater still
+// forwarding a region is far likelier to have done so recently.
+func TestUnmatchedTransmissionsInWindowIsBounded(t *testing.T) {
+	s := newScopeTestStore(t)
+	base := time.Now().UTC().Add(-2 * time.Hour)
+	total := scopeVerifyMaxWindowPackets + 25
+	for i := 0; i < total; i++ {
+		at := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		seedTransmissionRouteAt(t, s, "E3D3", scopeUnmatched(), RouteFlood, at)
+	}
+
+	since := time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339)
+	got, truncated, err := s.unmatchedTransmissionsInWindow(since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != scopeVerifyMaxWindowPackets {
+		t.Fatalf("got %d rows, want the cap of %d", len(got), scopeVerifyMaxWindowPackets)
+	}
+	if !truncated {
+		t.Error("truncated = false, want true — the caller has to be able to say the evidence is partial")
+	}
+
+	// The 25 oldest rows are the ones that must have been dropped: seeded ids
+	// ascend with first_seen, so every kept id must be above that boundary.
+	for _, r := range got {
+		if r.txID <= 25 {
+			t.Fatalf("kept txID %d, want only the %d newest rows", r.txID, scopeVerifyMaxWindowPackets)
+		}
+	}
+}
+
+// TestUnmatchedTransmissionsInWindowReportsNoTruncationUnderCap: the flag has to
+// distinguish "this is everything" from "this is a sample", or the caller
+// cannot tell an exact answer from a partial one.
+func TestUnmatchedTransmissionsInWindowReportsNoTruncationUnderCap(t *testing.T) {
+	s := newScopeTestStore(t)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, s, "E3D3", scopeUnmatched(), RouteFlood, recent)
+
+	since := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	got, truncated, err := s.unmatchedTransmissionsInWindow(since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || truncated {
+		t.Fatalf("got %d rows truncated=%v, want 1 and false", len(got), truncated)
+	}
+}
+
+// TestCapVerifyRegions bounds the other axis. A repeater's declared list
+// arrives over MQTT from a companion app: handleClientRegions validates the
+// target and each entry, but nothing limits how MANY entries a client may
+// report, and every distinct name costs one pass over every unmatched packet.
+// The longest genuine list on this network declares 21 regions.
+func TestCapVerifyRegions(t *testing.T) {
+	short := []string{"be", "nl", "eu"}
+	if got := capVerifyRegions(short); len(got) != 3 {
+		t.Errorf("len = %d, want 3 — a normal list must pass through untouched", len(got))
+	}
+	long := make([]string, scopeVerifyMaxRegionsPerTarget+10)
+	for i := range long {
+		long[i] = fmt.Sprintf("r%03d", i)
+	}
+	got := capVerifyRegions(long)
+	if len(got) != scopeVerifyMaxRegionsPerTarget {
+		t.Fatalf("len = %d, want the cap of %d", len(got), scopeVerifyMaxRegionsPerTarget)
+	}
+	if got[0] != long[0] {
+		t.Errorf("got[0] = %q, want %q — the cap keeps the first entries, it does not reorder", got[0], long[0])
+	}
+}
+
+// BenchmarkScopeVerifierStress runs the shape the cap allows, not the shape
+// today's network produces. BenchmarkScopeVerifierAudit models 400 packets;
+// this one models a full sample, which is what an instance with few configured
+// region keys actually hands the verifier.
+func BenchmarkScopeVerifierStress(b *testing.B) {
+	const names, targets = 124, 205
+	packets := scopeVerifyMaxWindowPackets
 	rows := make([]unmatchedTransmissionRow, 0, packets)
 	txIDs := make([]int64, 0, packets)
 	for i := 0; i < packets; i++ {

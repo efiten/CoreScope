@@ -1491,6 +1491,29 @@ func TestHandleScopeAuditVerifiesDeclaredRegion(t *testing.T) {
 	}
 }
 
+// TestHandleScopeAuditReportsTheVerificationSampleSize pins the field a client
+// needs to subtract RegionEvidence from ObservedUnmatchedPackets honestly.
+// RegionEvidence can only ever count packets inside the sample, so a client
+// that subtracts it from an uncapped total overstates what is unexplained. The
+// two are equal here, which is the case that says "this subtraction is exact".
+func TestHandleScopeAuditReportsTheVerificationSampleSize(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "fm-112", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedUnmatchedRawAt(t, srv.store, pk[:4], realTransportFloodPacket, RouteTransportFlood, recent)
+	seedUnmatchedRawAt(t, srv.store, pk[:4], realTransportFloodPacket, RouteTransportFlood, recent)
+
+	row := getScopeAudit(t, router, "").Repeaters[0]
+	if row.ObservedUnmatchedPackets != 2 {
+		t.Fatalf("observedUnmatchedPackets = %d, want 2", row.ObservedUnmatchedPackets)
+	}
+	if row.ObservedUnmatchedSampled != row.ObservedUnmatchedPackets {
+		t.Errorf("observedUnmatchedSampled = %d, want %d — nothing was capped away at this size, and a client can only tell from this field",
+			row.ObservedUnmatchedSampled, row.ObservedUnmatchedPackets)
+	}
+}
+
 // TestHandleScopeAuditDoesNotVerifyOnOnePacket: a single match is 1-in-65536
 // and must leave the region in notObserved, with its count still reported so a
 // client can say "one hit, not enough".

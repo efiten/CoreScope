@@ -3656,10 +3656,17 @@ func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse
 	// the extra query errors.
 	var verifier *scopeVerifier
 	if s.store != nil {
-		unmatchedRows, uErr := s.store.unmatchedTransmissionsInWindow(sinceISO)
+		unmatchedRows, truncated, uErr := s.store.unmatchedTransmissionsInWindow(sinceISO)
 		if uErr != nil {
 			log.Printf("[scope-audit] declared-region verification unavailable: %v", uErr)
 		} else {
+			if truncated {
+				// Said out loud rather than absorbed: past the cap a region can
+				// hold evidence this refresh did not look at, so a grey chip
+				// means "not corroborated in this sample", not "not forwarded".
+				log.Printf("[scope-audit] window %s holds more than %d unnameable packets; verification used the most recent %d and may under-report evidence",
+					window, scopeVerifyMaxWindowPackets, scopeVerifyMaxWindowPackets)
+			}
 			verifier = newScopeVerifier(unmatchedRows)
 		}
 	}
@@ -3714,7 +3721,11 @@ func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse
 		regionEvidence := map[string]int{}
 		verifiedSet := map[string]bool{}
 		if verifier != nil && agg != nil && len(unnamed) > 0 {
-			regionEvidence = verifier.evidence(agg.unmatchedTxIDs, unnamed)
+			// capVerifyRegions bounds the per-target half of the verifier's
+			// work. The declared list arrives from a companion app and its
+			// LENGTH is not validated anywhere on the way in, while each
+			// distinct name costs a full pass over the packet set.
+			regionEvidence = verifier.evidence(agg.unmatchedTxIDs, capVerifyRegions(unnamed))
 			for _, rgn := range verifier.verified(regionEvidence) {
 				verifiedSet[rgn] = true
 			}
@@ -3740,11 +3751,14 @@ func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse
 			}
 		}
 
-		var unscopedPackets, ambiguousHops, unmatchedPackets int64
+		var unscopedPackets, ambiguousHops, unmatchedPackets, unmatchedSampled int64
 		if agg != nil {
 			unscopedPackets = agg.unscopedPackets
 			ambiguousHops = agg.ambiguousHops
 			unmatchedPackets = agg.unmatchedPackets
+			// What verification could actually see, against what was counted.
+			// The list is capped; the count is not.
+			unmatchedSampled = int64(len(agg.unmatchedTxIDs))
 		}
 
 		resp.Repeaters = append(resp.Repeaters, ScopeAuditRow{
@@ -3762,6 +3776,7 @@ func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse
 			WildcardContradiction:    unscopedPackets > 0 && !declaredWildcard,
 			AmbiguousHops:            ambiguousHops,
 			ObservedUnmatchedPackets: unmatchedPackets,
+			ObservedUnmatchedSampled: unmatchedSampled,
 			RegionEvidence:           regionEvidence,
 		})
 	}

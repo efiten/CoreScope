@@ -16,6 +16,45 @@ import (
 // count is the honest total, the list is the working set.
 const scopeVerifyMaxPacketsPerTarget = 512
 
+// scopeVerifyMaxWindowPackets bounds the OTHER axis: how many unnameable
+// packets one refresh will hold and derive over.
+//
+// The "~400 packets in a 7 day window" this feature was sized against is a
+// property of THIS instance's configuration, not of the feature. The ingestor
+// stores an EMPTY scope_name for every transport-scoped packet no configured
+// key names (scopeNameForDB) — spelled out in words for the reason the query
+// below gives — so the fewer hashRegions an instance has, the more
+// rows land here — and an instance with none at all puts every scoped packet
+// in this set. That is the stock state, and it is the state this feature was
+// built to help.
+//
+// The cost is one HMAC per distinct region name per packet, measured at ~0.7µs
+// (BenchmarkScopeVerifierAudit: 124 names over 400 packets in 36ms). At this
+// cap and 124 distinct declared names that is ~500k HMACs, roughly 0.35s of
+// worst case on an endpoint that already costs seconds and caches for minutes.
+// Ten times this cap would not: it would be seconds of HMAC on every refresh.
+const scopeVerifyMaxWindowPackets = 4096
+
+// scopeVerifyMaxRegionsPerTarget bounds how many of one repeater's declared
+// names are put to the verifier. Every distinct name costs a full pass over
+// the packet set, and the list is client-supplied: handleClientRegions
+// (cmd/ingestor/client_regions.go) validates the target pubkey and each entry's
+// shape, but nothing limits how many entries one companion may report. The
+// longest genuine list on this network declares 21 regions, and the firmware
+// exports a short label set by construction.
+const scopeVerifyMaxRegionsPerTarget = 32
+
+// capVerifyRegions applies scopeVerifyMaxRegionsPerTarget, keeping the first
+// entries in the order the caller supplied. It does not sort or rank: a
+// declared list has no priority order to respect, and reordering here would
+// make which regions get verified depend on something the reader cannot see.
+func capVerifyRegions(regions []string) []string {
+	if len(regions) <= scopeVerifyMaxRegionsPerTarget {
+		return regions
+	}
+	return regions[:scopeVerifyMaxRegionsPerTarget]
+}
+
 // scopeHMACInputs pulls the three values needed to test a region hypothesis
 // against one packet: the payload type and raw payload bytes the sender HMACed,
 // and the resulting two-byte code it put on the wire.
@@ -128,15 +167,23 @@ type unmatchedTransmissionRow struct {
 // Selection only: a row whose raw_hex cannot be walked is still returned, and
 // dropped by newScopeVerifier. Filtering that in SQL is not possible and
 // filtering it here would hide how many candidates the window actually held.
-func (s *PacketStore) unmatchedTransmissionsInWindow(sinceISO string) ([]unmatchedTransmissionRow, error) {
+// The second return value reports that the window held more than
+// scopeVerifyMaxWindowPackets rows and the answer is a sample of the most
+// recent ones. Newest-first because a partial answer drawn from the most recent
+// traffic is the one that matches what the window claims to describe: a
+// repeater still forwarding a region is likelier to have done so recently, and
+// verification only ever needs two corroborating packets.
+func (s *PacketStore) unmatchedTransmissionsInWindow(sinceISO string) ([]unmatchedTransmissionRow, bool, error) {
 	rows, err := s.db.conn.Query(`
 		SELECT t.id, t.raw_hex
 		FROM transmissions t
 		WHERE t.first_seen >= ?
 		  AND t.scope_name = ''
-		  AND `+scopeConformanceForwarderRouteTypesSQL, sinceISO)
+		  AND `+scopeConformanceForwarderRouteTypesSQL+`
+		ORDER BY t.first_seen DESC
+		LIMIT ?`, sinceISO, scopeVerifyMaxWindowPackets)
 	if err != nil {
-		return nil, fmt.Errorf("unmatched transmissions scan: %w", err)
+		return nil, false, fmt.Errorf("unmatched transmissions scan: %w", err)
 	}
 	defer rows.Close()
 
@@ -144,14 +191,14 @@ func (s *PacketStore) unmatchedTransmissionsInWindow(sinceISO string) ([]unmatch
 	for rows.Next() {
 		var r unmatchedTransmissionRow
 		if err := rows.Scan(&r.txID, &r.rawHex); err != nil {
-			return nil, fmt.Errorf("unmatched transmissions scan row: %w", err)
+			return nil, false, fmt.Errorf("unmatched transmissions scan row: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("unmatched transmissions rows: %w", err)
+		return nil, false, fmt.Errorf("unmatched transmissions rows: %w", err)
 	}
-	return out, nil
+	return out, len(out) == scopeVerifyMaxWindowPackets, nil
 }
 
 // scopeVerifyMinCorroboration is how many of a repeater's own unmatched packets
