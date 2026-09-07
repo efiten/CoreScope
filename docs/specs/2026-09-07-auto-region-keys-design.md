@@ -1,7 +1,9 @@
 # Auto-Derived Region Keys & Scope-Audit Honesty — Design Spec
 
 **Date:** 2026-09-07
-**Status:** Approved (design); implementation not started
+**Status:** Approved (design); **amended 2026-09-07** — a second, independent cause
+of `notObserved` was measured after approval (see *Second cause* below); it adds M0
+and re-orders the milestones. Implementation not started.
 
 ---
 
@@ -10,6 +12,13 @@
 The Scope Audit reports "declared but not observed" for regions this instance is
 structurally incapable of observing, presenting a configuration gap as a finding
 about someone else's repeater.
+
+There are **two independent reasons** an instance can be structurally incapable of
+observing a region, and they were found in that order rather than together: it may
+hold no key that can name the region, or it may discard the evidence before
+nameability is ever consulted. Both are below; the second one gates the first.
+
+### First cause — a region with no key cannot be named
 
 A transport-scoped packet's region is identified by HMAC-ing the payload with
 `SHA256("#name")[:16]` for every configured region and comparing the derived
@@ -21,7 +30,7 @@ rows outright (`cmd/server/scopes.go:530`), so the region never reaches
 `agg.scopes` and `handleScopeAudit` lists it under `notObserved`
 (`cmd/server/routes.go:3611`).
 
-### Evidence
+### Evidence — first cause
 
 Verified against the live instance (analyzer.on8ar.eu) on 2026-09-07.
 
@@ -54,6 +63,100 @@ that never appeared under any name in the whole window. That 42% is an upper
 bound — a configured but genuinely idle region counts toward it — but `behss` and
 `fm-112` are hash-verified, not inferred.
 
+It is **also not a lower bound**, which was not visible when this was written: an
+entry counted there can be unattributable as well as unnameable. See *Which cause
+dominates* below, where the same measurement is re-taken with that confound
+separated out.
+
+### Second cause — forwarding is attributed to the last path hop only
+
+`scopeAuditForwarderScanQuery` credits a transmission to exactly one node, the
+last hop of its path (`cmd/server/scopes.go:447`), as does the per-node
+`scopeConformanceQuery` (`cmd/server/scopes.go:113`). On a flood-family route
+every forwarder APPENDS its own hash to the END of the path
+(`internal/packetpath/route.go:20`), so `path[last]` does not mean "forwarded
+this packet" — it means "was the transmission an uplinked observer heard
+directly". Every earlier hop forwarded the same packet and is thrown away.
+
+The last-hop rule is genuinely required for DIRECT routes (2, 3), which consume
+the next hop from the FRONT, leaving `path[last]` as the route's far end rather
+than the transmitter. But both queries already restrict to `route_type IN (0, 1)`
+via `scopeConformanceForwarderRouteTypesSQL`, where that hazard cannot arise — so
+inside these two queries the restriction discards evidence and buys nothing.
+
+Consequence: a repeater is invisible to the audit unless an uplinked observer sits
+within direct RF range of it. Regions it forwards read `notObserved` no matter how
+many keys this instance holds, so the first cause's fix cannot reach them.
+
+### Evidence — second cause
+
+Verified against the live instance on 2026-09-07, 24h window, via
+`/api/scope-audit`, `/api/scope-stats`, `/api/nodes`, `/api/nodes/{pk}/scopes` and
+`/api/packets`.
+
+Found on repeater `cf7903ce…7e12` (BE-HHE-LAAK-EDG-01). `/api/nodes/{pk}/scopes`
+returns `observed: []` with **the entire route mix zero** for 1h, 24h *and* 7d —
+not just no named scope, but no attributed transmission of any kind — while the
+same page's node header reports `transported_scopes:
+["#be","#be-vli","#eu","#fm-112"]` and `relay_count_24h: 306`. Two panels, one
+page, one database, opposite answers.
+
+Its own traffic over 14 days (373 rows, `/api/packets?node=`):
+
+| | |
+|---|---|
+| flood-family packets carrying `CF79` in the path | 155 |
+| of those, `CF79` as `path[last]` | **0** |
+| `CF79` at path position 0 | 103 |
+| scope names on those packets | 126 × `#be`, 7 × `#fm-112`, 1 × `#eu`, 1 unmatched |
+| rows where `CF79` *is* `path[last]` | 52 — all `route_type = 2` (DIRECT), correctly excluded |
+
+It is an edge node: its strongest neighbour BE-ZOD-MOSKEE-DIS hears it 1397 times
+against 1 the other way, so its relays are forwarded onward at least once before
+any uplinked observer logs them. `transported_scopes` sees all of it because
+`byPathHop` indexes *every* hop (`cmd/server/repeater_enrich_bulk.go:166`); the
+two scope queries see none of it. The 52 DIRECT rows are the useful control — they
+confirm the last-hop rule is still load-bearing for route types 2 and 3.
+
+Not one node, the network:
+
+- Flood-family sample, 1000 packets over 1.5h: mean path length **7.08** hops
+  (counting only hops ≥ `minForwarderHopHexLen`), so the last-hop rule keeps
+  **394 of 2789** hop observations — **14%**. **85%** of the nodes seen forwarding
+  in that window never appear as a last hop at all.
+- `/api/scope-audit`, 24h, 205 repeaters: **133 (65%)** have zero attributable
+  evidence of any kind — no named scope, no undeclared scope, no unscoped packets
+  — so every region they declare reads "declared, not observed". Of those 133,
+  **110** have `relay_count_24h > 0` and **55** already carry a non-empty
+  `transported_scopes`, attributed by full 4-hex key rather than by the
+  collision-prone 1-byte prefix bucket. The evidence is in the same database.
+- `ambiguousHops` is **0** on all 205 rows. The prefix-collision machinery
+  `ScopeAuditForwarding` documents at length has never been fed enough hops to
+  fire once.
+
+### Which cause dominates
+
+The same 642 `notObserved` entries (24h), split by whether the named region
+appeared under that name anywhere in the window — `/api/scope-stats` named 17
+distinct regions in it:
+
+| | entries | |
+|---|---|---|
+| names a region this instance never named in the window | 287 | 45% — first cause, M2's target |
+| names a region that *is* named in this window | 355 | 55% — nameability is not the blocker |
+| sits on one of the 133 zero-evidence repeaters | 389 | 61% |
+| …of those, naming a region that *is* nameable | 238 | 37% of all entries — second cause alone |
+
+The two causes overlap and neither subsumes the other; the 42%/7d figure above
+reproduces as 45%/24h here.
+
+This is what orders the milestones, and the ordering is not about size. With the
+last-hop rule in place M2 cannot be **measured**: deriving a key for `#behka`
+would name the traffic in `transmissions.scope_name`, and the declaring repeater's
+audit row would still say `notObserved`, because its hops were discarded before
+nameability was consulted. For 65% of repeaters M2's effect on the audit would be
+exactly zero, indistinguishable from M2 not working.
+
 ### Why collisions are benign
 
 `code1` is an HMAC over the packet payload, so a collision between two region
@@ -75,8 +178,12 @@ the first of those is today's baseline; the others are what the cap buys.
 
 ## Scope
 
-M1 and M2 below. M3 is explicitly gated on measurements taken during M2. M4 is
+M0, M1 and M2 below. M3 is explicitly gated on measurements taken during M2. M4 is
 tracked, not built.
+
+M0 was added by the 2026-09-07 amendment and comes first: it is a `cmd/server/`
+change of two SQL predicates, and until it lands neither M1's counter nor M2's
+effect can be observed on the audit at all.
 
 Out of scope: regions in use but never declared over RF. Neither the config fix
 nor this design can name those — both lean on the declared side.
@@ -84,6 +191,52 @@ nor this design can name those — both lean on the declared side.
 ---
 
 ## Architecture
+
+### 0. Forwarder attribution on flood routes
+
+Drop the `je.key = json_array_length(o.path_json) - 1` join condition from both
+`scopeConformanceQuery` (`cmd/server/scopes.go:113`) and
+`scopeAuditForwarderScanQuery` (`cmd/server/scopes.go:447`). Everything else in
+both queries stays exactly as it is: `route_type IN (0, 1)`, the
+`LENGTH(je.value) >= minForwarderHopHexLen` floor, the explicit `json_valid` guard
+against one malformed row erroring the whole query, and the prefix match against
+the caller's pubkey.
+
+"Forwarded" then means what `transported_scopes` has always meant — appeared as a
+path hop on a flood-family transmission — and the node page stops contradicting
+itself. De-duplication is unaffected: `ScopeConformance` counts each transmission
+once via `EXISTS`, and `ScopeAuditForwarding` already de-dupes on
+`<target>|<txID>`, which now additionally absorbs the same target appearing twice
+in one path (a routing loop, or a prefix collision within a single path).
+
+Three consequences to carry deliberately rather than discover later:
+
+- **Evidence quality stops being uniform.** `path[last]` is corroborated by an
+  observer's own RF reception; a middle hop is attested only by the path field of a
+  packet somebody else forwarded onward. This is already the standard `byPathHop`
+  applies for `transported_scopes` and `relay_count_24h`, so no new class of trust
+  is introduced — but the UI should be able to say which kind of evidence a row
+  rests on instead of blending them silently. Cheapest honest form: carry a
+  `directHops` count beside the total per (target, scope) and render it as a
+  qualifier on the existing row, not as a second table.
+- **`ambiguousHops` will start firing.** It is zero everywhere today; at ~7× the
+  hops it will resolve real collisions, which is exactly what that machinery is
+  for, but the "possibly ambiguous" chip will appear on rows that currently look
+  clean. That is more honest, not less — and it is also the measurement M3 was
+  gated on, so M3's gate becomes answerable for the first time.
+- **Per-hop collision exposure is unchanged** — same 4-hex floor, same prefix
+  match; only the number of matched hops grows. `observations.resolved_path`
+  carries full pubkeys for ~90% of hops on the flood rows that have it, so a later
+  refinement can attribute those exactly and fall back to the prefix match for the
+  rest. Deliberately out of scope for M0: a strictly better attribution layered on
+  top of a correct one, not part of making it correct.
+
+Cost: the SQL keeps its shape. `json_each` already expands the entire array, and
+the removed predicate was a filter on that expansion rather than an index lookup.
+The audit's Go attribution loop grows with hop count (mean 7.08 on this network)
+against the in-memory prefix index, which is what `scopeAuditPrefixIndex` exists
+for. `ScopeConformance`'s `EXISTS` can only get cheaper — it may short-circuit on
+the first matching hop instead of computing an array length per observation.
 
 ### 1. `regionKeySet` — the key registry
 
@@ -199,9 +352,36 @@ deployment where the two binaries do not share a `config.json`.
 
 ## Milestones
 
+### M0 — Forwarder attribution (gates M1's counter and M2's measurement)
+
+`cmd/server/` plus one frontend tooltip. The smallest change in this document and
+the one with the largest effect on what the audit reports.
+
+- remove the last-hop join condition from both queries (Architecture 0)
+- update the doc comments that currently present the last-hop rule as deliberate:
+  `RouteTypeMix` (`cmd/server/scopes.go:35`), `scopeConformanceQuery`,
+  `scopeAuditForwarderScanQuery`. `RouteTypeMix`'s "direct/transportDirect are
+  always zero by construction" stays **true** (the route filter is untouched), but
+  the reason it gives is stated in terms of `path[last]` and must be restated in
+  terms of the route filter
+- same restatement for `routesHtml`'s tooltip (`public/node-scopes.js:132`), which
+  repeats the `path[last]` reasoning to the reader
+- Tests (`cmd/server/scopes_test.go`): a flood transmission whose path carries the
+  target in the **middle** is now attributed; a DIRECT transmission whose
+  `path[last]` **is** the target is still not attributed — the existing guarantee,
+  and after M0 the only thing standing between the audit and misattribution, so it
+  gets an explicit test rather than relying on the route filter being obvious; a
+  2-hex hop is still ignored; a target appearing twice in one path counts once
+- afterwards, **re-measure** the first-cause share and record the new number here.
+  M2's sizing depends on what remains once attribution is fixed, not on the 45%
+  measured through the last-hop rule
+
 ### M1 — Scope-audit honesty
 
 `cmd/server/` and `public/` only. Ships value on its own and reviews independently.
+Sequenced after M0: the `unmatchedPackets` counter below counts unmatched rows
+*among the rows attribution admits*, so before M0 it would read zero for the same
+65% of repeaters and invite the same wrong conclusion in a new field.
 
 - `scopeAuditTargetAgg.unmatchedPackets`, counted where the `continue` is today
 - `ScopeAuditRow.ObservedUnmatchedPackets`, documented in `docs/api-spec.md`
@@ -264,7 +444,10 @@ Tracked, not built here.
 
 Independent of this work, the immediate remedy for the live instance is to merge
 the declared region names into `hashRegions`, restart the ingestor, and run
-`ingestor scope-repair` (dry run first). `scope-repair` applies only
+`ingestor scope-repair` (dry run first). Note what that remedy does **not** do:
+it names traffic, and the audit still attributes none of it to the 133 repeaters
+it cannot see, so the `notObserved` list will shrink far less than the key count
+suggests until M0 lands. `scope-repair` applies only
 `"" → name` and `name → ""` where several keys now match; any other transition is
 reported as `UNEXPECTED` and left unwritten. `-apply` requires stopping the
 ingestor first: every UPDATE runs in one transaction and `busy_timeout` is 5s, so
