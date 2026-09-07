@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -450,5 +451,35 @@ func TestRefreshFromStoreHonoursTheCap(t *testing.T) {
 	}
 	if _, ok := snap.all["#wide"]; !ok {
 		t.Errorf("keys = %v, want the twice-declared name kept, not a one-off", keyNames(snap))
+	}
+}
+
+// BenchmarkScopeMatch sweeps key-set size because the cost is linear in it and
+// cannot be reduced: code1 is an HMAC over the packet payload, so there is no
+// payload-independent lookup key to index on. The sweep is the evidence for
+// choosing maxDerived, not a single before/after number - the explicit tier's
+// size is operator config and varies per deployment.
+func BenchmarkScopeMatch(b *testing.B) {
+	payload := make([]byte, 51) // a typical GRP_TXT payload
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	for _, n := range []int{16, 58, 180, 314} {
+		b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) {
+			all := make(map[string][]byte, n)
+			explicit := make(map[string]bool, n)
+			for i := 0; i < n; i++ {
+				name := fmt.Sprintf("#r%04d", i)
+				sum := sha256.Sum256([]byte(name))
+				all[name] = sum[:16]
+				explicit[name] = true
+			}
+			snap := &regionKeySnapshot{all: all, explicit: explicit}
+			code := codeFor("#r0000", 5, payload)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = snap.match(5, payload, code)
+			}
+		})
 	}
 }
