@@ -858,7 +858,7 @@ func TestMatchScope(t *testing.T) {
 	// Key = SHA256("#test")[:16] = 9cd8fcf22a47333b591d96a2b848b73f
 	testKey, _ := hex.DecodeString("9cd8fcf22a47333b591d96a2b848b73f")
 	testKeys := map[string][]byte{"#test": testKey}
-	if got := matchScope(testKeys, 5, []byte("hello"), "2AB5"); got != "#test" {
+	if got := matchScopeName(testKeys, 5, []byte("hello"), "2AB5"); got != "#test" {
 		t.Errorf("#test vector: matchScope = %q, want #test", got)
 	}
 
@@ -866,17 +866,17 @@ func TestMatchScope(t *testing.T) {
 	// Key = SHA256("#belgium")[:16] = 7085b78ed010599094f8c8e7d1aa0e27
 	belgiumKey, _ := hex.DecodeString("7085b78ed010599094f8c8e7d1aa0e27")
 	belgiumKeys := map[string][]byte{"#belgium": belgiumKey}
-	if got := matchScope(belgiumKeys, 5, []byte("hello"), "4A75"); got != "#belgium" {
+	if got := matchScopeName(belgiumKeys, 5, []byte("hello"), "4A75"); got != "#belgium" {
 		t.Errorf("#belgium vector: matchScope = %q, want #belgium", got)
 	}
 
 	// Code1=0000 (unscoped transport) → no region matched
-	if got := matchScope(belgiumKeys, 5, []byte("hello"), "0000"); got != "" {
+	if got := matchScopeName(belgiumKeys, 5, []byte("hello"), "0000"); got != "" {
 		t.Errorf("unscoped: matchScope = %q, want empty", got)
 	}
 
 	// Code1 present but matches no configured region → empty string
-	if got := matchScope(belgiumKeys, 5, []byte("hello"), "BEEF"); got != "" {
+	if got := matchScopeName(belgiumKeys, 5, []byte("hello"), "BEEF"); got != "" {
 		t.Errorf("no match: matchScope = %q, want empty", got)
 	}
 
@@ -893,10 +893,10 @@ func TestMatchScope(t *testing.T) {
 	// ever derives "0000", and ranging over an empty map never executes the
 	// loop body — so those two guards are unobservable defense-in-depth, not
 	// missing coverage.)
-	if got := matchScope(belgiumKeys, 5, []byte{}, "76AC"); got != "" {
+	if got := matchScopeName(belgiumKeys, 5, []byte{}, "76AC"); got != "" {
 		t.Errorf("empty payload: matchScope = %q, want empty", got)
 	}
-	if got := matchScope(map[string][]byte{}, 5, []byte("hello"), "4A75"); got != "" {
+	if got := matchScopeName(map[string][]byte{}, 5, []byte("hello"), "4A75"); got != "" {
 		t.Errorf("empty regionKeys: matchScope = %q, want empty", got)
 	}
 }
@@ -922,7 +922,7 @@ func TestMatchScopeAmbiguous(t *testing.T) {
 	}
 
 	for i := 0; i < 20; i++ {
-		if got := matchScope(keys, 5, []byte("hello"), "2AB5"); got != "" {
+		if got := matchScopeName(keys, 5, []byte("hello"), "2AB5"); got != "" {
 			t.Fatalf("iteration %d: matchScope = %q, want empty (ambiguous match)", i, got)
 		}
 	}
@@ -943,7 +943,7 @@ func TestBuildPacketDataScopeMatching(t *testing.T) {
 	}
 
 	msg := &MQTTPacketMessage{Raw: rawHex}
-	pktData := BuildPacketData(msg, decoded, "obs1", "region1", regionKeys)
+	pktData := BuildPacketData(msg, decoded, "obs1", "region1", regionSetFromKeys(regionKeys))
 	if pktData.ScopeName != "#test" {
 		t.Errorf("ScopeName = %q, want #test", pktData.ScopeName)
 	}
@@ -1112,7 +1112,7 @@ func TestHandleMessageObserverIATAWhitelist(t *testing.T) {
 func TestBuildPacketDataScopeMatchingNoMatch(t *testing.T) {
 	// Code1=2AB5 is the precomputed code for region "#test" (payload="hello",
 	// payloadType=5). Build a region-key map for a DIFFERENT region so
-	// matchScope() finds no match and returns "".
+	// matchScopeName() finds no match and returns "".
 	const rawHex = "142AB500000068656C6C6F"
 	otherKey, _ := hex.DecodeString("aabbccddeeff00112233445566778899")
 	regionKeys := map[string][]byte{"#other": otherKey}
@@ -1122,7 +1122,7 @@ func TestBuildPacketDataScopeMatchingNoMatch(t *testing.T) {
 		t.Fatalf("DecodePacket: %v", err)
 	}
 	msg := &MQTTPacketMessage{Raw: rawHex}
-	pktData := BuildPacketData(msg, decoded, "obs1", "region1", regionKeys)
+	pktData := BuildPacketData(msg, decoded, "obs1", "region1", regionSetFromKeys(regionKeys))
 
 	if !pktData.IsTransportScoped {
 		t.Fatalf("precondition: IsTransportScoped should be true (Code1 != 0000)")
@@ -1166,12 +1166,12 @@ func TestHandleMessageAdvert_EmptyScopeSkipsDefaultScopeUpdate(t *testing.T) {
 		t.Fatalf("seed node: %v", err)
 	}
 
-	// Empty regionKeys → matchScope() returns "" for any Code1 → ScopeName "".
+	// Empty regionKeys → matchScopeName() returns "" for any Code1 → ScopeName "".
 	msg := &mockMessage{
 		topic:   "meshcore/SJC/obs1/packets",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, map[string][]byte{}, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var got sql.NullString
 	if err := store.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey).Scan(&got); err != nil {
@@ -1192,7 +1192,7 @@ func TestHandleMessageAdvert_MatchedScopeUpdatesDefaultScope(t *testing.T) {
 	source := MQTTSource{Name: "test"}
 
 	// Same ADVERT bytes; this time we compute the matching region key for
-	// the (payloadType=4, payload=<advert bytes>) tuple so matchScope() will
+	// the (payloadType=4, payload=<advert bytes>) tuple so matchScopeName() will
 	// return "#de".
 	const advertBytes = "46D62DE27D4C5194D7821FC5A34A45565DCC2537B300B9AB6275255CEFB65D840CE5C169C94C9AED39E8BCB6CB6EB0335497A198B33A1A610CD3B03D8DCFC160900E5244280323EE0B44CACAB8F02B5B38B91CFA18BD067B0B5E63E94CFC85F758A8530B9240933402E0E6B8F84D5252322D52"
 	const pubkey = "46d62de27d4c5194d7821fc5a34a45565dcc2537b300b9ab6275255cefb65d84"
@@ -1223,7 +1223,7 @@ func TestHandleMessageAdvert_MatchedScopeUpdatesDefaultScope(t *testing.T) {
 		topic:   "meshcore/SJC/obs1/packets",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, map[string][]byte{"#de": regionKey}, &Config{})
+	handleMessage(store, "test", source, msg, nil, regionSetFromKeys(map[string][]byte{"#de": regionKey}), &Config{})
 
 	var got sql.NullString
 	if err := store.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey).Scan(&got); err != nil {

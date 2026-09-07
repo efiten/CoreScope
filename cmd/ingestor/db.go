@@ -1607,9 +1607,12 @@ func (s *Store) BackfillPathJSONAsync() {
 // MQTT packet inserts and any concurrent backfill goroutines — serialize through
 // the single connection pool. busy_timeout(5000) handles transient cross-process
 // contention with the read-only server process. No additional locking is needed.
-func (s *Store) BackfillDefaultScopeAsync(regionKeys map[string][]byte) {
-	// No region keys configured — all scope_name values will be NULL, nothing to backfill.
-	if len(regionKeys) == 0 {
+func (s *Store) BackfillDefaultScopeAsync(regionSet *regionKeySet) {
+	// No region keys in force — all scope_name values will be NULL, nothing to
+	// backfill. Read once here rather than per row: the backfill is a long
+	// loop, and a refresh landing halfway through would otherwise change the
+	// key set under it.
+	if len(regionSet.snapshot().all) == 0 {
 		return
 	}
 	s.backfillWg.Add(1)
@@ -2130,7 +2133,7 @@ type MQTTPacketMessage struct {
 // into the past. Packet ordering is owned by the server clock; client
 // clocks are untrusted. msg.Timestamp still flows into observer.last_seen
 // via UpsertObserverAt — that's #1233's MAX/MIN guarded path and is fine.
-func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID, region string, regionKeys map[string][]byte) *PacketData {
+func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID, region string, regionSet *regionKeySet) *PacketData {
 	pathJSON := "[]"
 	// For TRACE packets, path_json must be the payload-decoded route hops
 	// (decoded.Path.Hops), NOT the raw_hex header bytes which are SNR values.
@@ -2183,7 +2186,9 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		pd.Code2 = decoded.TransportCodes.Code2
 		if decoded.TransportCodes.Code1 != "0000" {
 			pd.IsTransportScoped = true
-			pd.ScopeName = matchScope(regionKeys, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+			m := regionSet.snapshot().match(byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+			recordScopeMatch(m)
+			pd.ScopeName = m.Name
 		}
 	}
 

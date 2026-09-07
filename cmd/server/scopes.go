@@ -25,13 +25,19 @@ type ScopeObservation struct {
 }
 
 // RouteTypeMix is the route-type breakdown of packets this node was
-// observed FORWARDING — i.e. packets on which this pubkey was the last hop
-// of a FLOOD-family route (RouteTransportFlood, RouteFlood). It does NOT
-// mean "packets in which this node appears anywhere in the path": a DIRECT
-// or TRANSPORT_DIRECT packet's last path hop is the route's far end, never
-// the transmitter, so crediting it here would attribute forwarding this node
-// never did. Direct and TransportDirect are therefore always zero by
-// construction — the forwarder join can never match those route types.
+// observed FORWARDING — i.e. packets carrying this pubkey as any path hop of
+// a FLOOD-family route (RouteTransportFlood, RouteFlood). On those routes
+// every forwarder APPENDS its own hash to the end of the path
+// (internal/packetpath/route.go), so each hop is a node that transmitted the
+// packet; the last hop is merely the one an uplinked observer heard directly.
+//
+// It does NOT mean "packets in which this node appears anywhere in the path",
+// because DIRECT and TRANSPORT_DIRECT routes are excluded entirely: those
+// consume hops from the FRONT, so their path is the route's remaining plan
+// rather than a record of who transmitted, and crediting any of their hops
+// would attribute forwarding this node never did. Direct and TransportDirect
+// are therefore always zero by construction — the route-type filter
+// (scopeConformanceForwarderRouteTypesSQL) can never match them.
 type RouteTypeMix struct {
 	TransportFlood  int64 `json:"transportFlood"`
 	Flood           int64 `json:"flood"`
@@ -61,11 +67,17 @@ type ScopeConformance struct {
 }
 
 // scopeConformanceForwarderRouteTypesSQL restricts the forwarder join to the
-// only route types whose path[last] is the packet's actual transmitter:
-// RouteTransportFlood (0) and RouteFlood (1). A DIRECT route consumes hops
-// from the front, so its path[last] is the route's far end rather than the
-// forwarder — including RouteDirect (2) / RouteTransportDirect (3) here
-// would misattribute a scope to a node that never forwarded the packet.
+// only route types whose path hops are a record of who transmitted the packet:
+// RouteTransportFlood (0) and RouteFlood (1), where every forwarder appends
+// its own hash. A DIRECT route consumes hops from the front, so its path is
+// the route's remaining plan and its path[last] is the far end rather than a
+// forwarder — including RouteDirect (2) / RouteTransportDirect (3) here would
+// misattribute a scope to a node that never forwarded the packet.
+//
+// Since the attribution below reads EVERY hop rather than only path[last],
+// this filter is the sole guard against that misattribution. It is pinned by
+// TestScopeConformanceIgnoresDirectRoutesMidPath and
+// TestScopeAuditForwardingIgnoresDirectRoutes; do not widen it.
 const scopeConformanceForwarderRouteTypesSQL = "t.route_type IN (0, 1)"
 
 // minForwarderHopHexLen is the shortest path_json hop ScopeConformance will
@@ -76,10 +88,20 @@ const scopeConformanceForwarderRouteTypesSQL = "t.route_type IN (0, 1)"
 // attributing none.
 const minForwarderHopHexLen = 4
 
-// scopeConformanceQuery finds every transmission this pubkey forwarded
-// (path[last] on a FLOOD-family route matches the pubkey), bounded by the
-// since window so the scan stays an index range on first_seen rather than a
-// full table scan.
+// scopeConformanceQuery finds every transmission this pubkey forwarded (any
+// path hop on a FLOOD-family route matches the pubkey), bounded by the since
+// window so the scan stays an index range on first_seen rather than a full
+// table scan.
+//
+// It reads every hop rather than only path[last] because on a flood route
+// every hop appended itself after forwarding. Attributing only path[last]
+// answered a narrower question — "which of this node's forwards did an
+// uplinked observer hear directly" — and for a node with no observer in RF
+// range the answer is nothing at all: measured on the live instance, that
+// restriction kept 14% of hop observations network-wide and left 65% of
+// declared repeaters with no evidence of any kind, while the same nodes'
+// transported_scopes (byPathHop, every hop) listed scopes from the same
+// database. See docs/specs/2026-09-07-auto-region-keys-design.md, M0.
 //
 // Two case/length mismatches make this join easy to get silently wrong
 // instead of erroring:
@@ -110,7 +132,7 @@ var scopeConformanceQuery = `
 	  AND EXISTS (
 	      SELECT 1
 	      FROM observations o
-	      JOIN json_each(o.path_json) je ON je.key = json_array_length(o.path_json) - 1
+	      JOIN json_each(o.path_json) je
 	      WHERE o.transmission_id = t.id
 	        AND o.path_json IS NOT NULL
 	        AND json_valid(o.path_json)
@@ -401,6 +423,28 @@ type scopeAuditTargetAgg struct {
 	// declared target — see ScopeAuditForwarding's doc comment for why
 	// those hops are attributed to neither candidate instead of both.
 	ambiguousHops int64
+	// unmatchedPackets counts packets this target was observed forwarding
+	// that carried a transport scope no configured region key matched
+	// (transmissions.scope_name = ""). Deliberately NOT folded into
+	// unscopedPackets: those two are opposites. Unscoped means the packet
+	// carried no scope at all (scope_name SQL NULL) and is what '*' governs;
+	// unmatched means it IS scoped and this instance simply holds no key for
+	// that region, so '*' says nothing about it. See scopeNameForDB in the
+	// ingestor for the encoding.
+	//
+	// A non-zero value is a caveat on this target's notObserved entries: any
+	// of them may be a region this instance cannot name rather than one the
+	// repeater is not forwarding.
+	unmatchedPackets int64
+	// unmatchedTxIDs are the transmissions behind unmatchedPackets, kept so
+	// declared-region verification can test this target's own declarations
+	// against this target's own unnameable traffic (scope_verify.go). The same
+	// (target, txID) de-duplication that guards unmatchedPackets guards this,
+	// so one packet reaching a target by two hops cannot corroborate twice.
+	//
+	// Bounded by scopeVerifyMaxPacketsPerTarget, which unmatchedPackets is NOT:
+	// the count stays the honest total, this is the working set.
+	unmatchedTxIDs []int64
 }
 
 // scopeAuditPrefixIndex builds, for every even hex length from
@@ -432,6 +476,14 @@ func scopeAuditPrefixIndex(targets []string) map[int]map[string][]string {
 // call per pubkey — fine for one node, but 37+ repeater-sized loop of them
 // would each re-scan the same first_seen index range), this scans the
 // FLOOD-family window exactly once and returns every forwarder hop found.
+//
+// "Every forwarder hop" means every hop of the path, not only path[last] —
+// see scopeConformanceQuery's doc comment for why, and note that this query
+// returns one ROW PER HOP, so a single transmission now yields as many rows as
+// it has hops (mean 7.08 on the live network). ScopeAuditForwarding's
+// "<target>|<txID>" de-duplication is what keeps that from counting a
+// transmission twice for one target, and it is now load-bearing rather than
+// belt-and-braces: one path can carry the same target on several hops.
 // It applies the SAME three conditions scopeConformanceQuery does —
 // minForwarderHopHexLen, scopeConformanceForwarderRouteTypesSQL, and the
 // explicit json_valid guard against a single malformed path_json row
@@ -441,10 +493,10 @@ func scopeAuditPrefixIndex(targets []string) map[int]map[string][]string {
 // scopeAuditPrefixIndex, so the SQL cost stays O(rows in window) regardless
 // of len(targets).
 var scopeAuditForwarderScanQuery = `
-	SELECT t.id, je.value, t.scope_name, t.first_seen
+	SELECT t.id, je.value
 	FROM transmissions t
 	JOIN observations o ON o.transmission_id = t.id
-	JOIN json_each(o.path_json) je ON je.key = json_array_length(o.path_json) - 1
+	JOIN json_each(o.path_json) je
 	WHERE t.first_seen >= ?
 	  AND ` + scopeConformanceForwarderRouteTypesSQL + `
 	  AND o.path_json IS NOT NULL
@@ -452,6 +504,74 @@ var scopeAuditForwarderScanQuery = `
 	  AND json_array_length(o.path_json) > 0
 	  AND LENGTH(je.value) >= ` + fmt.Sprint(minForwarderHopHexLen) + `
 `
+
+// scopeAuditWindowMetaQuery reads the two per-TRANSMISSION facts the hop scan
+// used to carry on every hop row: the scope name and the timestamp. It applies
+// the identical window and route-type filter, so it covers every transmission
+// the hop scan can produce, and both run inside one read transaction so the
+// two see the same snapshot.
+//
+// Splitting these out is why the hop scan carries two columns instead of four.
+// Measured on the live-shaped staging database on 2026-09-07, a 7d window
+// yields 3,470,188 hop rows against 79,652 transmissions: 43 hop rows per
+// transmission, each of which was re-reading the same scope_name and
+// first_seen. SQLite spends 2.7s of the 16.7s that window cost; the rest was
+// the Go side scanning columns it already knew.
+//
+// Every SQL-side attempt to shrink the hop scan itself measured worse on that
+// same database and was rejected: a first-4-hex prefix filter against the
+// declared targets takes 20.9s (and needs lower() on both sides, because 80%
+// of stored hops are uppercase), GROUP BY t.id, hop takes 38.0s, and
+// SELECT DISTINCT t.id, path_json takes 17.7s. The 3.47M rows are inherent:
+// 1,368,761 observations carrying a path, ~2.5 usable hops each.
+var scopeAuditWindowMetaQuery = `
+	SELECT t.id, t.scope_name, t.first_seen
+	FROM transmissions t
+	WHERE t.first_seen >= ?
+	  AND ` + scopeConformanceForwarderRouteTypesSQL + `
+`
+
+// scopeAuditTxMeta is one transmission's contribution to the aggregate, held
+// once per transmission rather than once per hop.
+type scopeAuditTxMeta struct {
+	scopeName sql.NullString
+	firstSeen string
+}
+
+// scopeAuditWindowMeta loads scopeAuditWindowMetaQuery into a map keyed by
+// transmission id. Runs on the caller's transaction so it shares the hop
+// scan's snapshot.
+func scopeAuditWindowMeta(tx *sql.Tx, sinceISO string) (map[int64]scopeAuditTxMeta, error) {
+	rows, err := tx.Query(scopeAuditWindowMetaQuery, sinceISO)
+	if err != nil {
+		return nil, fmt.Errorf("scope audit window meta: %w", err)
+	}
+	defer rows.Close()
+
+	meta := map[int64]scopeAuditTxMeta{}
+	for rows.Next() {
+		var id int64
+		var m scopeAuditTxMeta
+		if err := rows.Scan(&id, &m.scopeName, &m.firstSeen); err != nil {
+			return nil, fmt.Errorf("scope audit window meta scan: %w", err)
+		}
+		meta[id] = m
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scope audit window meta rows: %w", err)
+	}
+	return meta, nil
+}
+
+// scopeAuditSeenKey identifies one (target, transmission) pair for the
+// de-duplication below. A struct key rather than the string it used to be
+// built into: the hop scan reaches millions of rows on a 7d window, and every
+// candidate hop was allocating a fresh "<target>|<txID>" string to ask a
+// question that a comparable struct answers without allocating.
+type scopeAuditSeenKey struct {
+	target string
+	txID   int64
+}
 
 // ScopeAuditForwarding runs scopeAuditForwarderScanQuery once for the whole
 // window and attributes every forwarder hop it finds to targets, by the same
@@ -470,14 +590,35 @@ var scopeAuditForwarderScanQuery = `
 // ambiguousHops field and ScopeAuditRow.AmbiguousHops.
 //
 // Each (target, transmission) pair is counted at most once even if seen via
-// multiple observations, for both the attributed and the ambiguous count —
-// the same de-duplication scopeConformanceQuery gets for free from EXISTS,
-// done explicitly here since this scan is not correlated per target.
+// multiple observations OR via several hops of one path (a routing loop, or two
+// hops colliding on the same truncated prefix), for both the attributed and the
+// ambiguous count — the same de-duplication scopeConformanceQuery gets for free
+// from EXISTS, done explicitly here since this scan is not correlated per
+// target. Since the scan reads every hop rather than only path[last], this is
+// the only thing keeping one transmission from counting several times for the
+// same target; TestScopeAuditForwardingCountsOneTransmissionOncePerTarget pins
+// it.
 func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (map[string]*scopeAuditTargetAgg, error) {
 	byLen := scopeAuditPrefixIndex(targets)
 	result := make(map[string]*scopeAuditTargetAgg, len(targets))
 
-	rows, err := s.db.conn.Query(scopeAuditForwarderScanQuery, sinceISO)
+	// One read transaction for both queries. The hop scan and the per-
+	// transmission metadata are two passes over the same window, and a
+	// transmission arriving between them would otherwise appear in the hop scan
+	// with no metadata to attribute it by — rare, but the fix is a shared
+	// snapshot rather than a rule about what to do with the leftovers.
+	tx, err := s.db.conn.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("scope audit forwarder scan begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	meta, err := scopeAuditWindowMeta(tx, sinceISO)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.Query(scopeAuditForwarderScanQuery, sinceISO)
 	if err != nil {
 		return nil, fmt.Errorf("scope audit forwarder scan: %w", err)
 	}
@@ -492,21 +633,43 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 		return agg
 	}
 
-	seen := make(map[string]bool) // "<target>|<txID>" already counted (attributed or ambiguous)
+	seen := make(map[scopeAuditSeenKey]bool) // (target, txID) already counted (attributed or ambiguous)
+
+	// hopBuf lower-cases the hop in place instead of through strings.ToLower.
+	// 80% of the hops in this database are stored uppercase (1,026,814 of
+	// 1,284,897 in a 24h window, measured 2026-09-07) because
+	// packetpath.DecodePathFromRawHex writes them that way, and the great
+	// majority of them match no declared target at all — so the allocation
+	// ToLower makes is paid millions of times to answer "no". byLen's keys are
+	// lowercase, and a map index expression on string(bytes) does not allocate.
+	var hopBuf [64]byte
 	for rows.Next() {
 		var txID int64
-		var hop string
-		var scopeName sql.NullString
-		var firstSeen string
-		if err := rows.Scan(&txID, &hop, &scopeName, &firstSeen); err != nil {
+		var hopRaw sql.RawBytes
+		if err := rows.Scan(&txID, &hopRaw); err != nil {
 			return nil, fmt.Errorf("scope audit forwarder scan scan: %w", err)
 		}
-		hop = strings.ToLower(hop)
-		candidates := byLen[len(hop)][hop]
+		n := len(hopRaw)
+		if n > len(hopBuf) {
+			// Longer than a full pubkey: cannot be any target's prefix. The
+			// SQL floor guards the short end, this guards the long one.
+			continue
+		}
+		for i := 0; i < n; i++ {
+			c := hopRaw[i]
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			hopBuf[i] = c
+		}
+		candidates := byLen[n][string(hopBuf[:n])]
+		if len(candidates) == 0 {
+			continue
+		}
 
 		if len(candidates) > 1 {
 			for _, target := range candidates {
-				key := target + "|" + strconv.FormatInt(txID, 10)
+				key := scopeAuditSeenKey{target: target, txID: txID}
 				if seen[key] {
 					continue
 				}
@@ -515,8 +678,16 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 			}
 			continue
 		}
+		txMeta, ok := meta[txID]
+		if !ok {
+			// Impossible while both queries share one snapshot and one WHERE
+			// clause; treated as "nothing to attribute" rather than silently
+			// counted as unscoped, which is what a zero-valued meta would do.
+			continue
+		}
+		scopeName, firstSeen := txMeta.scopeName, txMeta.firstSeen
 		for _, target := range candidates {
-			key := target + "|" + strconv.FormatInt(txID, 10)
+			key := scopeAuditSeenKey{target: target, txID: txID}
 			if seen[key] {
 				continue
 			}
@@ -528,7 +699,17 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 				continue
 			}
 			if scopeName.String == "" {
-				continue // unmatched — not part of the declared/observed comparison
+				// Unmatched: transport-scoped, but no configured region key
+				// matched code1. Still not part of the declared/observed
+				// comparison — it names no region, so it can never satisfy a
+				// declaration — but it is the evidence that a notObserved
+				// finding on this row may be a gap in this instance's
+				// hashRegions rather than in the repeater's forwarding.
+				agg.unmatchedPackets++
+				if len(agg.unmatchedTxIDs) < scopeVerifyMaxPacketsPerTarget {
+					agg.unmatchedTxIDs = append(agg.unmatchedTxIDs, txID)
+				}
+				continue
 			}
 			name := normScope(scopeName.String)
 			so, ok := agg.scopes[name]
@@ -645,6 +826,34 @@ type ScopeAuditRow struct {
 	// UndeclaredObserved entry is unaffected by it (ambiguous hops are never
 	// attributed to a scope at all).
 	AmbiguousHops int64 `json:"ambiguousHops"`
+
+	// ObservedUnmatchedPackets counts packets this repeater was observed
+	// forwarding whose transport scope matched no region key this instance
+	// holds. Like AmbiguousHops it is a caveat rather than a finding, but the
+	// two have different causes and different fixes: AmbiguousHops is a
+	// pubkey-prefix collision between two repeaters and nobody's fault,
+	// ObservedUnmatchedPackets is a missing entry in this instance's own
+	// hashRegions and the reader can act on it. A non-zero value means any
+	// NotObserved entry on this row may name a region this instance cannot
+	// name rather than one the repeater is not forwarding.
+	//
+	// It says nothing about DeclaredWildcard: unmatched traffic IS scoped, so
+	// it never feeds WildcardContradiction, which counts only plain unscoped
+	// floods.
+	ObservedUnmatchedPackets int64 `json:"observedUnmatchedPackets"`
+
+	// RegionEvidence maps a declared region to how many of this repeater's own
+	// unmatched forwarded packets derive to it — see scope_verify.go. A region
+	// reaching scopeVerifyMinCorroboration is removed from NotObserved, so this
+	// field is NOT what decides the chip's colour; NotObserved remains the sole
+	// source of that. This exists so a client can say HOW a region was
+	// established, and can explain a region that got exactly one hit and
+	// therefore stayed in NotObserved.
+	//
+	// Absent regions simply had no matching traffic. Never nil in the response
+	// — an empty object and a missing key mean the same thing, and an empty map
+	// is the cheaper thing for a client to iterate.
+	RegionEvidence map[string]int `json:"regionEvidence"`
 }
 
 // ScopeAuditResponse is the payload for GET /api/scope-audit. Only

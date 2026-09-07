@@ -802,9 +802,15 @@ forwarding anything is a valid question, not an error.
   key for), not an error, and must not be folded into `unscoped`.
 - `unscoped` counts packets that carried no scope at all. `unmatched` and `unscoped` are
   always reported as separate top-level counts.
-- `routes.direct` / `routes.transportDirect` are always `0` by construction: a DIRECT-family
-  route's last path hop is the route's far end, never the transmitter, so this node can never
-  be attributed as the forwarder of one.
+- "this repeater's own forwarded traffic" means transmissions carrying this pubkey as **any**
+  path hop of a FLOOD-family route, not only as the final hop. On those routes each forwarder
+  appends its own hash, so every hop transmitted the packet; the final hop is only the one an
+  uplinked observer heard directly, and counting just that one reports nothing at all for a
+  repeater with no observer in RF range.
+- `routes.direct` / `routes.transportDirect` are always `0` by construction: DIRECT-family
+  routes are excluded outright, because they consume hops from the front, making their path
+  the route's remaining plan rather than a record of who transmitted — so none of their hops
+  is evidence that this node forwarded anything.
 
 **Notes — `declared` distinguishes "never asked" from "asked and declined everything":**
 - `window` bounds `observed` only; `declared` is always the latest reading regardless of
@@ -1889,7 +1895,9 @@ not being the same as "declared nothing"), which apply here identically.
       ],
       "observedUnscopedPackets": number,               // plain-FLOOD packets forwarded this window
       "wildcardContradiction":   boolean,               // observed unscoped forwarding but '*' not declared
-      "ambiguousHops":           number                 // forwarder hops this window that could not be attributed — see note below
+      "ambiguousHops":            number,                // forwarder hops this window that could not be attributed — see note below
+      "observedUnmatchedPackets": number,                // forwarded packets whose scope this instance holds no key for — see note below
+      "regionEvidence":           { "<region>": number } // declared regions corroborated by this repeater's own unnameable traffic — see note below
     }
   ]
 }
@@ -1927,6 +1935,34 @@ not being the same as "declared nothing"), which apply here identically.
   `ambiguousHops` carries weaker evidence than one with zero: any entry in that row's
   `notObserved` could be explained by a prefix collision rather than a genuine absence of
   forwarding, and a client should present it as a caveat rather than a confirmed finding.
+- `observedUnmatchedPackets` counts packets this repeater was observed forwarding whose
+  transport scope matched no region key this instance has configured (`hashRegions`), so
+  the ingestor stored them with an empty `scope_name`. Those packets name no region and
+  therefore cannot satisfy a declared one, which means **a repeater forwarding a region
+  this instance cannot name is reported exactly like one forwarding nothing**. A non-zero
+  value is a caveat on this row's `notObserved`, in the same spirit as `ambiguousHops` but
+  with a different cause and a different fix: `ambiguousHops` is a pubkey-prefix collision
+  between two repeaters and nobody's fault, `observedUnmatchedPackets` is a missing entry
+  in this instance's own configuration and the operator can act on it. It is **not**
+  evidence for or against `declaredWildcard` — unmatched traffic is scoped, so it never
+  affects `wildcardContradiction`, which counts only plain unscoped floods.
+  Since M1b, part of this count is explained: packets counted in `regionEvidence` are
+  attributable to a declared region after all. A client showing this as a caveat should
+  subtract them and report only the remainder, which carries a sharper meaning — traffic
+  this repeater forwards for a region it does **not** declare and this instance cannot
+  name.
+- `regionEvidence` maps a declared region to how many of this repeater's own unmatched
+  forwarded packets derive to it. The server tests each declared region this repeater has
+  no *named* evidence for by deriving `SHA256("#region")[:16]` and HMAC-ing that
+  repeater's own unmatched packets with it — the same computation the ingestor performs at
+  ingest, with the candidate set narrowed to this repeater's declarations. A region
+  reaching **2** corroborating packets is removed from `notObserved`: `code1` is two
+  bytes, so one match happens by chance with probability 1/65536, while two on the same
+  region is (1/65536)². A region with exactly one hit therefore stays in `notObserved`
+  **and** appears here with the value 1, so a client can explain why it is still shown as
+  not observed. `notObserved` remains the single source of truth for whether a region was
+  observed; this field says only *how* that was established. The object is always present
+  and may be empty.
 - All scope names in `declaredRegions` / `notObserved` / `undeclaredObserved[].scope` are
   already normalised (no leading `#`) — the server does the `#`/no-`#` reconciliation
   described on the per-node endpoint so this response is directly comparable without a

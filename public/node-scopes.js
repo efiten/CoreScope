@@ -130,7 +130,7 @@
   }
 
   function routesHtml(routes) {
-    return '<div class="ns-routes" title="Route-type breakdown of packets this node was observed FORWARDING (last hop of a FLOOD-family route). direct/transportDirect are always 0 by construction — a DIRECT route\'s last path hop is the route\'s far end, never the transmitter, so this node can never be attributed as the forwarder of one.">' +
+    return '<div class="ns-routes" title="Route-type breakdown of packets this node was observed FORWARDING — carrying it as any path hop of a FLOOD-family route, where each forwarder appends its own hash, so every hop transmitted the packet. direct/transportDirect are always 0 by construction: DIRECT routes are excluded outright, because they consume hops from the front, so their path is the route\'s remaining plan rather than a record of who transmitted.">' +
       'Route mix (forwarded): transportFlood <b>' + routes.transportFlood + '</b> &middot; flood <b>' + routes.flood + '</b> &middot; direct <b>' + routes.direct + '</b> &middot; transportDirect <b>' + routes.transportDirect + '</b>' +
       '</div>';
   }
