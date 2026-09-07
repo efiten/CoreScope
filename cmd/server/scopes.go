@@ -493,7 +493,7 @@ func scopeAuditPrefixIndex(targets []string) map[int]map[string][]string {
 // scopeAuditPrefixIndex, so the SQL cost stays O(rows in window) regardless
 // of len(targets).
 var scopeAuditForwarderScanQuery = `
-	SELECT t.id, je.value, t.scope_name, t.first_seen
+	SELECT t.id, je.value
 	FROM transmissions t
 	JOIN observations o ON o.transmission_id = t.id
 	JOIN json_each(o.path_json) je
@@ -504,6 +504,74 @@ var scopeAuditForwarderScanQuery = `
 	  AND json_array_length(o.path_json) > 0
 	  AND LENGTH(je.value) >= ` + fmt.Sprint(minForwarderHopHexLen) + `
 `
+
+// scopeAuditWindowMetaQuery reads the two per-TRANSMISSION facts the hop scan
+// used to carry on every hop row: the scope name and the timestamp. It applies
+// the identical window and route-type filter, so it covers every transmission
+// the hop scan can produce, and both run inside one read transaction so the
+// two see the same snapshot.
+//
+// Splitting these out is why the hop scan carries two columns instead of four.
+// Measured on the live-shaped staging database on 2026-09-07, a 7d window
+// yields 3,470,188 hop rows against 79,652 transmissions: 43 hop rows per
+// transmission, each of which was re-reading the same scope_name and
+// first_seen. SQLite spends 2.7s of the 16.7s that window cost; the rest was
+// the Go side scanning columns it already knew.
+//
+// Every SQL-side attempt to shrink the hop scan itself measured worse on that
+// same database and was rejected: a first-4-hex prefix filter against the
+// declared targets takes 20.9s (and needs lower() on both sides, because 80%
+// of stored hops are uppercase), GROUP BY t.id, hop takes 38.0s, and
+// SELECT DISTINCT t.id, path_json takes 17.7s. The 3.47M rows are inherent:
+// 1,368,761 observations carrying a path, ~2.5 usable hops each.
+var scopeAuditWindowMetaQuery = `
+	SELECT t.id, t.scope_name, t.first_seen
+	FROM transmissions t
+	WHERE t.first_seen >= ?
+	  AND ` + scopeConformanceForwarderRouteTypesSQL + `
+`
+
+// scopeAuditTxMeta is one transmission's contribution to the aggregate, held
+// once per transmission rather than once per hop.
+type scopeAuditTxMeta struct {
+	scopeName sql.NullString
+	firstSeen string
+}
+
+// scopeAuditWindowMeta loads scopeAuditWindowMetaQuery into a map keyed by
+// transmission id. Runs on the caller's transaction so it shares the hop
+// scan's snapshot.
+func scopeAuditWindowMeta(tx *sql.Tx, sinceISO string) (map[int64]scopeAuditTxMeta, error) {
+	rows, err := tx.Query(scopeAuditWindowMetaQuery, sinceISO)
+	if err != nil {
+		return nil, fmt.Errorf("scope audit window meta: %w", err)
+	}
+	defer rows.Close()
+
+	meta := map[int64]scopeAuditTxMeta{}
+	for rows.Next() {
+		var id int64
+		var m scopeAuditTxMeta
+		if err := rows.Scan(&id, &m.scopeName, &m.firstSeen); err != nil {
+			return nil, fmt.Errorf("scope audit window meta scan: %w", err)
+		}
+		meta[id] = m
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scope audit window meta rows: %w", err)
+	}
+	return meta, nil
+}
+
+// scopeAuditSeenKey identifies one (target, transmission) pair for the
+// de-duplication below. A struct key rather than the string it used to be
+// built into: the hop scan reaches millions of rows on a 7d window, and every
+// candidate hop was allocating a fresh "<target>|<txID>" string to ask a
+// question that a comparable struct answers without allocating.
+type scopeAuditSeenKey struct {
+	target string
+	txID   int64
+}
 
 // ScopeAuditForwarding runs scopeAuditForwarderScanQuery once for the whole
 // window and attributes every forwarder hop it finds to targets, by the same
@@ -534,7 +602,23 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 	byLen := scopeAuditPrefixIndex(targets)
 	result := make(map[string]*scopeAuditTargetAgg, len(targets))
 
-	rows, err := s.db.conn.Query(scopeAuditForwarderScanQuery, sinceISO)
+	// One read transaction for both queries. The hop scan and the per-
+	// transmission metadata are two passes over the same window, and a
+	// transmission arriving between them would otherwise appear in the hop scan
+	// with no metadata to attribute it by — rare, but the fix is a shared
+	// snapshot rather than a rule about what to do with the leftovers.
+	tx, err := s.db.conn.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("scope audit forwarder scan begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	meta, err := scopeAuditWindowMeta(tx, sinceISO)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.Query(scopeAuditForwarderScanQuery, sinceISO)
 	if err != nil {
 		return nil, fmt.Errorf("scope audit forwarder scan: %w", err)
 	}
@@ -549,21 +633,43 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 		return agg
 	}
 
-	seen := make(map[string]bool) // "<target>|<txID>" already counted (attributed or ambiguous)
+	seen := make(map[scopeAuditSeenKey]bool) // (target, txID) already counted (attributed or ambiguous)
+
+	// hopBuf lower-cases the hop in place instead of through strings.ToLower.
+	// 80% of the hops in this database are stored uppercase (1,026,814 of
+	// 1,284,897 in a 24h window, measured 2026-09-07) because
+	// packetpath.DecodePathFromRawHex writes them that way, and the great
+	// majority of them match no declared target at all — so the allocation
+	// ToLower makes is paid millions of times to answer "no". byLen's keys are
+	// lowercase, and a map index expression on string(bytes) does not allocate.
+	var hopBuf [64]byte
 	for rows.Next() {
 		var txID int64
-		var hop string
-		var scopeName sql.NullString
-		var firstSeen string
-		if err := rows.Scan(&txID, &hop, &scopeName, &firstSeen); err != nil {
+		var hopRaw sql.RawBytes
+		if err := rows.Scan(&txID, &hopRaw); err != nil {
 			return nil, fmt.Errorf("scope audit forwarder scan scan: %w", err)
 		}
-		hop = strings.ToLower(hop)
-		candidates := byLen[len(hop)][hop]
+		n := len(hopRaw)
+		if n > len(hopBuf) {
+			// Longer than a full pubkey: cannot be any target's prefix. The
+			// SQL floor guards the short end, this guards the long one.
+			continue
+		}
+		for i := 0; i < n; i++ {
+			c := hopRaw[i]
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			hopBuf[i] = c
+		}
+		candidates := byLen[n][string(hopBuf[:n])]
+		if len(candidates) == 0 {
+			continue
+		}
 
 		if len(candidates) > 1 {
 			for _, target := range candidates {
-				key := target + "|" + strconv.FormatInt(txID, 10)
+				key := scopeAuditSeenKey{target: target, txID: txID}
 				if seen[key] {
 					continue
 				}
@@ -572,8 +678,16 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 			}
 			continue
 		}
+		txMeta, ok := meta[txID]
+		if !ok {
+			// Impossible while both queries share one snapshot and one WHERE
+			// clause; treated as "nothing to attribute" rather than silently
+			// counted as unscoped, which is what a zero-valued meta would do.
+			continue
+		}
+		scopeName, firstSeen := txMeta.scopeName, txMeta.firstSeen
 		for _, target := range candidates {
-			key := target + "|" + strconv.FormatInt(txID, 10)
+			key := scopeAuditSeenKey{target: target, txID: txID}
 			if seen[key] {
 				continue
 			}

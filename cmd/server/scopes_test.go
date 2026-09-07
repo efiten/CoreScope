@@ -985,6 +985,38 @@ func TestScopeAuditForwardingCountsOneTransmissionOncePerTarget(t *testing.T) {
 	}
 }
 
+// TestScopeAuditForwardingAttributesLongerHopByItsOwnLength pins the
+// length-indexed half of scopeAuditPrefixIndex, which every other test in this
+// file leaves untested: they all seed 4-char hops, so a lookup that ignored hop
+// length entirely would still pass them.
+//
+// pkOther shares the first 4 hex chars with testFullPubkeyA and diverges after
+// that, so an 8-char hop has exactly one candidate while a 4-char hop would
+// have two. Attribution must therefore key on the hop's OWN length: at 8 chars
+// this is an unambiguous attribution, not an ambiguousHops row.
+func TestScopeAuditForwardingAttributesLongerHopByItsOwnLength(t *testing.T) {
+	s := newScopeTestStore(t)
+	pkOther := testFullPubkeyA[:4] + strings.Repeat("33", 30)
+	hop := testFullPubkeyA[:8]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionPathAt(t, s, []string{hop, "AAAA"}, scopeMatched("#be"), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA, pkOther})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil || agg.scopes["be"] == nil || agg.scopes["be"].Packets != 1 {
+		t.Fatalf("want the 8-char hop attributed to its sole matching target, got %+v", got)
+	}
+	if agg.ambiguousHops != 0 {
+		t.Errorf("ambiguousHops = %d, want 0 — the two targets diverge before hop length 8", agg.ambiguousHops)
+	}
+	if other := got[pkOther]; other != nil && (len(other.scopes) != 0 || other.ambiguousHops != 0) {
+		t.Errorf("pkOther = %+v, want no attribution and no ambiguity — the hop is not its prefix", other)
+	}
+}
+
 // TestScopeAuditForwardingCountsUnmatchedPackets: a transport-scoped packet
 // whose code1 matched no configured region key is stored with scope_name = ""
 // (scopeNameForDB's "transport-scoped but unnameable" state). It is not a
