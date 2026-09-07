@@ -208,9 +208,14 @@ const (
 
 // scopeMatch is the result of naming one packet's region scope.
 type scopeMatch struct {
-	Name       string // empty when unresolved - the caller stores that as the unmatched state
-	Reason     scopeReason
-	Candidates []string // every matching name, populated only when more than one matched
+	Name   string // empty when unresolved - the caller stores that as the unmatched state
+	Reason scopeReason
+	// Candidates is every name whose derived code equals the packet's code1.
+	// It is always populated, so a caller that needs the match COUNT (scope-repair
+	// does, to tell "the key set changed" from "several keys now collide") can read
+	// it from the same result that carries the verdict, instead of re-running the
+	// match and risking a second, divergent decision rule.
+	Candidates []string
 }
 
 // match names the region scope of a transport-scoped packet, resolving a
@@ -234,9 +239,9 @@ func (s *regionKeySnapshot) match(payloadType byte, payloadRaw []byte, code1 str
 	matched := matchingRegions(s.all, payloadType, payloadRaw, code1)
 	switch len(matched) {
 	case 0:
-		return scopeMatch{Reason: scopeReasonNone}
+		return scopeMatch{Reason: scopeReasonNone, Candidates: matched}
 	case 1:
-		return scopeMatch{Name: matched[0], Reason: scopeReasonUnique}
+		return scopeMatch{Name: matched[0], Reason: scopeReasonUnique, Candidates: matched}
 	}
 
 	var explicitMatches []string

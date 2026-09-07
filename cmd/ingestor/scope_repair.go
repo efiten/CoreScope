@@ -60,10 +60,19 @@ type scopeDerivation struct {
 
 // rederiveScope runs the same decode + match path handleMessage uses at
 // ingest (BuildPacketData): DecodePacket for the header/transport codes and
-// payload bytes, then matchingRegions against payloadType+payloadRaw+code1
-// — the same helper matchScope itself uses. channelKeys is nil and
-// validateSignatures is false because region matching depends on neither —
-// only on the undecrypted payload bytes.
+// payload bytes, then regionKeySnapshot.match against
+// payloadType+payloadRaw+code1. channelKeys is nil and validateSignatures is
+// false because region matching depends on neither — only on the undecrypted
+// payload bytes.
+//
+// It calls match rather than matchingRegions directly, and that is the whole
+// point: match carries the explicit-over-derived tie-break, so a row the
+// ingestor named because an operator-configured key beat a derived one
+// re-derives to the same name here. Deriving from matchingRegions alone made
+// that row read as "two matches, no name", which is the correction branch
+// below, and `-apply` then wrote the empty string over a correct region name.
+// Pinned by TestScopeRepairKeepsExplicitOverDerivedNames. Repair must reach the
+// verdict ingest reached or it is not a repair.
 func rederiveScope(rawHex string, snap *regionKeySnapshot) (scopeDerivation, error) {
 	decoded, err := DecodePacket(rawHex, nil, false)
 	if err != nil {
@@ -72,12 +81,8 @@ func rederiveScope(rawHex string, snap *regionKeySnapshot) (scopeDerivation, err
 	if decoded.TransportCodes == nil || decoded.TransportCodes.Code1 == "0000" {
 		return scopeDerivation{State: scopeState{Valid: false}}, nil
 	}
-	matched := matchingRegions(snap.all, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
-	name := ""
-	if len(matched) == 1 {
-		name = matched[0]
-	}
-	return scopeDerivation{State: scopeState{Valid: true, Name: name}, MatchCount: len(matched)}, nil
+	m := snap.match(byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+	return scopeDerivation{State: scopeState{Valid: true, Name: m.Name}, MatchCount: len(m.Candidates)}, nil
 }
 
 // scopeRepairUnexpected is a row whose re-derived state differs from the

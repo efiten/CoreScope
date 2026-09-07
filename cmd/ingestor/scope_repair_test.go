@@ -339,3 +339,68 @@ func TestScopeRepairKeepsDerivedNames(t *testing.T) {
 		t.Errorf("MatchCount = %d, want 1", got.MatchCount)
 	}
 }
+
+// findCollidingPayload searches for a payload whose code1 is identical under
+// two region names. code1 is two bytes, so one turns up after ~65k tries and
+// the search costs a fraction of a second. Returns the payload and the shared
+// code.
+//
+// A hand-picked constant cannot stand in here: the collision has to be real,
+// because the whole point of the case below is what the two code paths do when
+// matchingRegions returns two names for one packet.
+func findCollidingPayload(t *testing.T, nameA, nameB string, payloadType byte) ([]byte, string) {
+	t.Helper()
+	payload := make([]byte, 4)
+	for i := 0; i < 1<<22; i++ {
+		payload[0] = byte(i)
+		payload[1] = byte(i >> 8)
+		payload[2] = byte(i >> 16)
+		payload[3] = byte(i >> 24)
+		if a, b := codeFor(nameA, payloadType, payload), codeFor(nameB, payloadType, payload); a == b {
+			return append([]byte(nil), payload...), a
+		}
+	}
+	t.Fatalf("no code1 collision between %s and %s in 2^22 payloads", nameA, nameB)
+	return nil, ""
+}
+
+// TestScopeRepairKeepsExplicitOverDerivedNames is the second half of the guard
+// TestScopeRepairKeepsDerivedNames starts. That one covers a row named by a
+// derived key; this one covers a row named because an EXPLICIT key beat a
+// derived one on the same packet — regionKeySnapshot.match's tier 2.
+//
+// Repair has to reach the same verdict as ingest or it is not a repair. If it
+// re-derives such a row as "two matches, no name", the row lands in the
+// "named -> unmatched" correction branch and `scope-repair -apply` overwrites a
+// correct region name with the empty string. That is data loss from a
+// maintenance tool, which is exactly what this tool must never do.
+func TestScopeRepairKeepsExplicitOverDerivedNames(t *testing.T) {
+	const explicitName, derivedName = "#be", "#zz"
+	payload, code1 := findCollidingPayload(t, explicitName, derivedName, 5)
+	rawHex := "14" + code1 + "0000" + "41" + "E3D3" + strings.ToUpper(hex.EncodeToString(payload))
+
+	cfg := &Config{
+		HashRegions:    []string{explicitName},
+		AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true},
+	}
+	set := newRegionKeySet(cfg)
+	set.refreshDerived([]string{strings.TrimPrefix(derivedName, "#")})
+
+	snap := set.snapshot()
+	// Precondition: the packet really does match both keys, so this test is
+	// exercising the tie-break rather than a single match.
+	if n := len(matchingRegions(snap.all, 5, payload, code1)); n != 2 {
+		t.Fatalf("matchingRegions returned %d names, want 2 — the collision fixture is wrong", n)
+	}
+	if got := snap.match(5, payload, code1); got.Name != explicitName {
+		t.Fatalf("ingest names this packet %q, want %q — precondition for the comparison below", got.Name, explicitName)
+	}
+
+	got, err := rederiveScope(rawHex, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State.Name != explicitName {
+		t.Errorf("repair derives %q, ingest derives %q — repair must apply the same tie-break, or -apply erases the name", got.State.Name, explicitName)
+	}
+}
