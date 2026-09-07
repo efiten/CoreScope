@@ -12,7 +12,19 @@
 
 **Depends on M0** (`### M0 — Forwarder attribution`, added to the spec in `b610d461`). Both queries currently credit a transmission to `path[last]` only, but on a flood route every forwarder appends its hash to the END of the path (`internal/packetpath/route.go:20`), so `path[last]` means "heard directly by an uplinked observer", not "forwarded it". Measured live: 133 of 205 repeaters have zero attributable evidence. The `unmatchedPackets` counter below counts unmatched rows **among the rows attribution admits**, so before M0 it reads zero for that same 65% — inviting exactly the wrong conclusion in a brand-new field. Do not start Tasks 1, 2 or 5 until M0 has landed.
 
-**Status:** Task 3 (the frontend caveat) is **done** — commit `79f38ef1`. It was safe to land ahead of M0 and ahead of the server field because the chip renders the empty string when `observedUnmatchedPackets` is absent, which is asserted. Tasks 1, 2, 4 and 5 remain.
+**Status: code complete, verification partly deferred.** M0 landed as `d93b4463`, which unblocked the rest.
+
+| Task | Commit | State |
+|---|---|---|
+| 1 — counter in `ScopeAuditForwarding` | `70e6bcd5` | done |
+| 2 — `ObservedUnmatchedPackets` on the API row | `ca464b59` | done |
+| 3 — caveat chip | `79f38ef1` | done (landed first; inert until the field existed) |
+| 4 — `docs/api-spec.md` | `93a0c385` | done |
+| 5 — verification | — | automated part done; steps 3–5 **deferred to deploy** |
+
+Automated verification passed on all four suites: `cmd/server` full (ok, 94.8s), `test-frontend-helpers.js` (686), `test-packet-filter.js` (99), `test-aging.js` (18).
+
+Steps 3, 4 and 5 of Task 5 cannot run in this working copy: `test-fixtures/e2e-fixture.db` predates the whole feature — it has no `node_declared_regions` table and no `scope_name` column — and the live instance runs the pre-M0 code. They run against staging or live after deploy, per the operator's decision. Do not mark this plan complete until they have.
 
 ---
 
@@ -42,7 +54,7 @@ Measured on the live instance 2026-09-07: of 613 `notObserved` entries across 20
 - Modify: `cmd/server/scopes.go` (`scopeAuditTargetAgg` ~line 388, `ScopeAuditForwarding` ~line 530)
 - Test: `cmd/server/scopes_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/server/scopes_test.go`, after `TestScopeAuditForwardingAmbiguousHopCreditsNeitherTarget`:
 
@@ -82,12 +94,12 @@ func TestScopeAuditForwardingCountsUnmatchedPackets(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/server && go test ./... -run TestScopeAuditForwardingCountsUnmatchedPackets -v`
 Expected: FAIL to compile — `agg.unmatchedPackets undefined (type *scopeAuditTargetAgg has no field or method unmatchedPackets)`
 
-- [ ] **Step 3: Add the field**
+- [x] **Step 3: Add the field**
 
 In `cmd/server/scopes.go`, in `scopeAuditTargetAgg`, add after `unscopedPackets`:
 
@@ -102,7 +114,7 @@ In `cmd/server/scopes.go`, in `scopeAuditTargetAgg`, add after `unscopedPackets`
 	unmatchedPackets int64
 ```
 
-- [ ] **Step 4: Count it**
+- [x] **Step 4: Count it**
 
 In `ScopeAuditForwarding`, replace the bare skip:
 
@@ -126,12 +138,12 @@ with:
 			}
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cd cmd/server && go test ./...`
 Expected: PASS, including the pre-existing `TestScopeAuditForwardingAttributesUnambiguousHop` and `TestScopeAuditForwardingAmbiguousHopCreditsNeitherTarget`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cmd/server/scopes.go cmd/server/scopes_test.go
@@ -147,7 +159,7 @@ git commit -m "feat(scope-audit): count the unmatched packets ScopeAuditForwardi
 - Modify: `cmd/server/routes.go` (`handleScopeAudit`, the `unscopedPackets, ambiguousHops` block and the `ScopeAuditRow` literal)
 - Test: `cmd/server/scopes_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/server/scopes_test.go`, after `TestHandleScopeAuditSurfacesAmbiguousHops`:
 
@@ -182,12 +194,12 @@ func TestHandleScopeAuditSurfacesUnmatchedPackets(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/server && go test ./... -run TestHandleScopeAuditSurfacesUnmatchedPackets -v`
 Expected: FAIL to compile — `row.ObservedUnmatchedPackets undefined`
 
-- [ ] **Step 3: Add the field to `ScopeAuditRow`**
+- [x] **Step 3: Add the field to `ScopeAuditRow`**
 
 In `cmd/server/scopes.go`, add after the `AmbiguousHops` field:
 
@@ -202,7 +214,7 @@ In `cmd/server/scopes.go`, add after the `AmbiguousHops` field:
 	ObservedUnmatchedPackets int64 `json:"observedUnmatchedPackets"`
 ```
 
-- [ ] **Step 4: Populate it in the handler**
+- [x] **Step 4: Populate it in the handler**
 
 In `cmd/server/routes.go`, in `handleScopeAudit`, change:
 
@@ -231,12 +243,12 @@ and add to the `ScopeAuditRow` literal, after `AmbiguousHops: ambiguousHops,`:
 			ObservedUnmatchedPackets: unmatchedPackets,
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cd cmd/server && go test ./...`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cmd/server/scopes.go cmd/server/routes.go cmd/server/scopes_test.go
@@ -368,7 +380,7 @@ git commit -m "feat(scope-audit): say when a not-observed region is one we canno
 **Files:**
 - Modify: `docs/api-spec.md` (payload block ~line 1890, Notes list ~line 1921)
 
-- [ ] **Step 1: Add the field to the payload block**
+- [x] **Step 1: Add the field to the payload block**
 
 In the `GET /api/scope-audit` response block, after the `ambiguousHops` line, add a comma to that line and append:
 
@@ -377,7 +389,7 @@ In the `GET /api/scope-audit` response block, after the `ambiguousHops` line, ad
       "observedUnmatchedPackets": number                  // forwarded packets this window whose scope this instance holds no key for — see note below
 ```
 
-- [ ] **Step 2: Add the note**
+- [x] **Step 2: Add the note**
 
 In the same section's **Notes:** list, directly after the `ambiguousHops` bullet:
 
@@ -395,12 +407,12 @@ In the same section's **Notes:** list, directly after the `ambiguousHops` bullet
   `wildcardContradiction`.
 ```
 
-- [ ] **Step 3: Verify no other doc contradicts it**
+- [x] **Step 3: Verify no other doc contradicts it**
 
 Run: `grep -rn "not part of the declared/observed comparison" docs/ cmd/`
 Expected: only the updated comment in `cmd/server/scopes.go`; no stale doc claiming unmatched rows are discarded.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/api-spec.md
@@ -411,12 +423,12 @@ git commit -m "docs(api): document observedUnmatchedPackets on GET /api/scope-au
 
 ### Task 5: Verify end to end
 
-- [ ] **Step 1: Full Go suite**
+- [x] **Step 1: Full Go suite**
 
 Run: `cd cmd/server && go test ./...` then `cd ../ingestor && go test ./...`
 Expected: PASS in both. The ingestor is untouched by this plan; run it to prove that.
 
-- [ ] **Step 2: Full frontend suite**
+- [x] **Step 2: Full frontend suite**
 
 Run: `node test-packet-filter.js && node test-aging.js && node test-frontend-helpers.js`
 Expected: PASS
