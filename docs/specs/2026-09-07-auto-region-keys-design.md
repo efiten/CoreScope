@@ -228,6 +228,16 @@ Three consequences to carry deliberately rather than discover later:
   rests on instead of blending them silently. Cheapest honest form: carry a
   `directHops` count beside the total per (target, scope) and render it as a
   qualifier on the existing row, not as a second table.
+  **Not built** (noted 2026-09-07, after code review pointed out that the omission
+  was nowhere recorded). M0 shipped without it, so the audit does blend the two
+  kinds of evidence silently today, and nothing in the response distinguishes them.
+  Whether that omission was deliberate at the time is not recorded anywhere; it is
+  written down here now so the next reader does not have to guess. The case for
+  building it is unchanged by anything measured since. The case against is that it
+  adds a third number to a column already carrying two caveat chips, and the
+  double-caveat measurement (2 rows with `ambiguousHops`, 63 with the unexplained
+  chip, none with both) is the evidence that column has room for exactly one more
+  qualifier and no more.
 - **`ambiguousHops` will start firing.** It is zero everywhere today; at ~7× the
   hops it will resolve real collisions, which is exactly what that machinery is
   for, but the "possibly ambiguous" chip will appear on rows that currently look
@@ -428,6 +438,32 @@ the one with the largest effect on what the audit reports.
 - afterwards, **re-measure** the first-cause share and record the new number here.
   M2's sizing depends on what remains once attribution is fixed, not on the 45%
   measured through the last-hop rule
+
+#### The re-measurement this checklist asked for, taken on live 2026-09-07
+
+Same instance, same 7d window, after M0 and after the explicit key set went from 58
+to 159:
+
+| | before M0 | after |
+|---|---|---|
+| repeaters with no attributable evidence at all | 133 of 205 (65%) | **30 of 206 (15%)** |
+| `notObserved` entries | 613 | **520** |
+| of those, a region never observed under any name network-wide | 260 (42%) | **253 (49%)** |
+| distinct region names in that group | — | **105** |
+
+Read it in that order. Attribution was the larger of the two causes and it is now
+mostly gone: four fifths of the repeaters that had zero evidence have some. What it
+did **not** do is shrink the second cause, which barely moved in absolute terms (260
+to 253) and therefore grew as a share, from 42% to 49%.
+
+What that second number is now made of has changed, though, and this is the part that
+matters for M2's sizing. Before the config fix those 260 were dominated by regions
+this instance held no key for. With 123 of the 124 declared names now configured, a
+declared region that still never appears under any name is far more likely to be a
+region the repeater genuinely is not forwarding. This measurement cannot separate the
+two on its own — it counts names, not causes — so it bounds M2's remaining value
+rather than pricing it: **at most 105 distinct names, and probably far fewer, are
+still invisible for want of a key.**
 
 #### What widening attribution costs, measured on staging 2026-09-07
 

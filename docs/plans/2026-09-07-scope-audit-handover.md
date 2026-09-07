@@ -200,6 +200,21 @@ newly named, 402 corrected to unmatched). Live was not touched.
 
 ## Known gaps, honestly stated
 
+**Two code reviews on 2026-09-07 evening found two criticals, both fixed** (`dfb17914`,
+`adeb5ccd`). The first: commit `ac8ff6d3` had replaced `cmd/ingestor/config_test.go`
+instead of appending to it, deleting 549 lines and 24 unrelated config tests while the
+suite stayed green. The second: `scope-repair -apply` erased correct region names,
+because `rederiveScope` never got the explicit-over-derived tie-break the ingest path
+uses, so a row named through that tier re-derived as "two matches, no name" and landed
+in the one branch the tool writes. Both reviewers found both, independently.
+
+Two further fixes followed from the same reviews: the declared-region verification was
+unbounded on both of its axes (`fd68d1b7`) and the unexplained-traffic chip subtracted
+evidence the server had refused to count (`6b62c2a7`).
+
+**`directHops` was specified and never built**, and until 2026-09-07 that was recorded
+nowhere. The spec's M0 section now says so explicitly.
+
 **M1b and M2 have never been tested together.** Each is covered on its own. With M2 enabled,
 packets that were unmatched get named at ingest, so M1b's verifier has fewer candidates and
 the chip goes green by name rather than by verification. That is coherent — the region lands
