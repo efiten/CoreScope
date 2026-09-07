@@ -12,6 +12,14 @@
 
 **Depends on M0 and M1**, both landed (`d93b4463`, and `70e6bcd5`/`ca464b59`/`79f38ef1`/`93a0c385`). M0 is what makes a mid-path repeater attributable at all; M1 is what counts its unmatched traffic. This plan turns that count into an answer.
 
+**Status: code complete, verification partly deferred.** All eight tasks are committed
+(`64e3ac60`, `3e27b112`, `409258c7`, `e5cee74f`, `28e310f8`, `985067f8`, `a813346d`,
+`a87ce8e8`, `37b0473a`). Automated verification passes: `cmd/server` full suite ok in
+119.9s, 692 frontend assertions, 99 packet-filter, 18 aging, `gofmt -l` and `go vet`
+clean. Task 8 Step 5 — confirming against the real `e3d3f4d7` row — is **deferred to
+deploy**, for the same reason as M1: `test-fixtures/e2e-fixture.db` predates the feature
+and has neither `node_declared_regions` nor `scope_name`.
+
 **Independent of M2** (`docs/plans/2026-09-07-auto-derived-region-keys.md`), which is entirely `cmd/ingestor/`. No shared files. Per the spec amendment, M2 no longer fixes the audit — this does.
 
 ---
@@ -60,7 +68,7 @@ No payload decoding: `decodePayload` attempts decryption and signature validatio
 - Create: `cmd/server/scope_verify.go`
 - Create: `cmd/server/scope_verify_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `cmd/server/scope_verify_test.go`:
 
@@ -165,12 +173,12 @@ func TestRegionCodeIsCaseSensitive(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/server && go test ./... -run 'TestScopeHMACInputs|TestRegionCode' -v`
 Expected: FAIL to compile — `undefined: scopeHMACInputs`, `undefined: regionCode`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Create `cmd/server/scope_verify.go`:
 
@@ -262,12 +270,12 @@ func regionCode(name string, payloadType byte, payload []byte) string {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd cmd/server && go test ./... -run 'TestScopeHMACInputs|TestRegionCode' -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cmd/server/scope_verify.go cmd/server/scope_verify_test.go
@@ -284,7 +292,7 @@ M1 counts them. Verification needs to know *which*.
 - Modify: `cmd/server/scopes.go` (`scopeAuditTargetAgg`, `ScopeAuditForwarding`)
 - Test: `cmd/server/scopes_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/server/scopes_test.go`, after `TestScopeAuditForwardingCountsUnmatchedOnMidPathHop`:
 
@@ -319,12 +327,12 @@ func TestScopeAuditForwardingRecordsUnmatchedTxIDs(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/server && go test ./... -run TestScopeAuditForwardingRecordsUnmatchedTxIDs -v`
 Expected: FAIL to compile — `agg.unmatchedTxIDs undefined`
 
-- [ ] **Step 3: Add the field**
+- [x] **Step 3: Add the field**
 
 In `cmd/server/scopes.go`, in `scopeAuditTargetAgg`, immediately after `unmatchedPackets`:
 
@@ -338,7 +346,7 @@ In `cmd/server/scopes.go`, in `scopeAuditTargetAgg`, immediately after `unmatche
 	unmatchedTxIDs []int64
 ```
 
-- [ ] **Step 4: Record them**
+- [x] **Step 4: Record them**
 
 In `ScopeAuditForwarding`, extend the unmatched branch added by M1:
 
@@ -358,7 +366,7 @@ In `ScopeAuditForwarding`, extend the unmatched branch added by M1:
 			}
 ```
 
-- [ ] **Step 5: Add the bound**
+- [x] **Step 5: Add the bound**
 
 In `cmd/server/scope_verify.go`:
 
@@ -371,14 +379,14 @@ In `cmd/server/scope_verify.go`:
 const scopeVerifyMaxPacketsPerTarget = 512
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `cd cmd/server && go test ./... -run 'TestScopeAuditForwarding' -v`
 Expected: PASS, including M1's two unmatched tests.
 
 Note the deliberate asymmetry the new test pins: `unmatchedPackets` counts every unmatched packet, `unmatchedTxIDs` stops at 512. The test uses 2, so they agree there; a comment in the field doc explains the divergence above the cap.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add cmd/server/scopes.go cmd/server/scopes_test.go cmd/server/scope_verify.go
@@ -393,7 +401,7 @@ git commit -m "feat(scope-audit): record which transmissions were unmatched, per
 - Modify: `cmd/server/scope_verify.go`
 - Test: `cmd/server/scope_verify_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/server/scope_verify_test.go`:
 
@@ -426,12 +434,12 @@ func TestUnmatchedTransmissionsInWindow(t *testing.T) {
 
 Add `"time"` to the test file's imports.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/server && go test ./... -run TestUnmatchedTransmissionsInWindow -v`
 Expected: FAIL to compile — `s.unmatchedTransmissionsInWindow undefined`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Append to `cmd/server/scope_verify.go`:
 
@@ -487,12 +495,12 @@ func (s *PacketStore) unmatchedTransmissionsInWindow(sinceISO string) ([]unmatch
 
 Add `"fmt"` to the file's imports.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd cmd/server && go test ./... -run TestUnmatchedTransmissionsInWindow -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cmd/server/scope_verify.go cmd/server/scope_verify_test.go
@@ -507,7 +515,7 @@ git commit -m "feat(scope-audit): narrow query for the window's unmatched transm
 - Modify: `cmd/server/scope_verify.go`
 - Test: `cmd/server/scope_verify_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/server/scope_verify_test.go`:
 
@@ -592,12 +600,12 @@ func TestScopeVerifierUnknownTxIDIsHarmless(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/server && go test ./... -run TestScopeVerifier -v`
 Expected: FAIL to compile — `undefined: newScopeVerifier`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Append to `cmd/server/scope_verify.go`:
 
@@ -712,12 +720,12 @@ func (v *scopeVerifier) verified(evidence map[string]int) []string {
 
 Add `"sort"` to the file's imports.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cd cmd/server && go test ./... -run TestScopeVerifier -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cmd/server/scope_verify.go cmd/server/scope_verify_test.go
@@ -733,7 +741,7 @@ git commit -m "feat(scope-audit): memoised declared-region verification with a 2
 - Modify: `cmd/server/routes.go` (`handleScopeAudit`)
 - Test: `cmd/server/scopes_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `cmd/server/scopes_test.go`, after `TestHandleScopeAuditSurfacesUnmatchedPackets`:
 
@@ -840,12 +848,12 @@ func seedUnmatchedRawAt(t *testing.T, s *PacketStore, forwarder, rawHex string, 
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cmd/server && go test ./... -run 'TestHandleScopeAuditVerifies|TestHandleScopeAuditDoesNotVerify' -v`
 Expected: FAIL to compile — `row.RegionEvidence undefined`
 
-- [ ] **Step 3: Add the field**
+- [x] **Step 3: Add the field**
 
 In `cmd/server/scopes.go`, after `ObservedUnmatchedPackets`:
 
@@ -864,7 +872,7 @@ In `cmd/server/scopes.go`, after `ObservedUnmatchedPackets`:
 	RegionEvidence map[string]int `json:"regionEvidence"`
 ```
 
-- [ ] **Step 4: Run verification in the handler**
+- [x] **Step 4: Run verification in the handler**
 
 In `cmd/server/routes.go`, in `handleScopeAudit`, immediately after the `forwarding, err = s.store.ScopeAuditForwarding(...)` block:
 
@@ -935,12 +943,12 @@ and add to the `ScopeAuditRow` literal:
 			RegionEvidence:           regionEvidence,
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cd cmd/server && gofmt -w routes.go scopes.go && go test ./... -run 'TestHandleScopeAudit' -v`
 Expected: PASS, including M1's `TestHandleScopeAuditSurfacesUnmatchedPackets` and the sorting tests — a verified region leaving `notObserved` changes a row's rank, so confirm the sort tests still hold rather than assuming.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cmd/server/scopes.go cmd/server/routes.go cmd/server/scopes_test.go
@@ -956,7 +964,7 @@ git commit -m "feat(scope-audit): verify declared regions against a repeater's o
 - Modify: `public/scope-audit.css`
 - Test: `test-frontend-helpers.js`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test-frontend-helpers.js`, inside the existing `mergedScopeChips` block (before its closing `}`):
 
@@ -987,12 +995,12 @@ Append to `test-frontend-helpers.js`, inside the existing `mergedScopeChips` blo
   });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `node test-frontend-helpers.js`
 Expected: FAIL — the `sa-chip-verified` assertions, since `mergedScopeChips` ignores `regionEvidence`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `public/scope-audit.js`, replace `mergedScopeChips`'s body:
 
@@ -1031,7 +1039,7 @@ In `public/scope-audit.js`, replace `mergedScopeChips`'s body:
   }
 ```
 
-- [ ] **Step 4: Style the marker**
+- [x] **Step 4: Style the marker**
 
 In `public/scope-audit.css`, after `.sa-chip-unmatched`:
 
@@ -1042,7 +1050,7 @@ In `public/scope-audit.css`, after `.sa-chip-unmatched`:
 .sa-chip-verified { text-decoration: underline dotted; text-underline-offset: 2px; }
 ```
 
-- [ ] **Step 5: Narrow the row caveat**
+- [x] **Step 5: Narrow the row caveat**
 
 `unmatchedCaveat` currently fires whenever a row has any unmatched traffic. After verification, most of that traffic is explained, and a caveat that fires when the question has been answered is noise. Replace its guard:
 
@@ -1068,7 +1076,7 @@ In `public/scope-audit.css`, after `.sa-chip-unmatched`:
   }
 ```
 
-- [ ] **Step 6: Update the caveat's existing tests**
+- [x] **Step 6: Update the caveat's existing tests**
 
 Three M1 assertions in the `unmatchedCaveat` block assert the old wording. Replace them exactly:
 
@@ -1126,12 +1134,12 @@ Then add:
   });
 ```
 
-- [ ] **Step 7: Run tests to verify they pass**
+- [x] **Step 7: Run tests to verify they pass**
 
 Run: `node test-frontend-helpers.js`
 Expected: PASS, all assertions.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add public/scope-audit.js public/scope-audit.css test-frontend-helpers.js
@@ -1145,7 +1153,7 @@ git commit -m "feat(scope-audit): mark verified regions and narrow the caveat to
 **Files:**
 - Modify: `docs/api-spec.md`
 
-- [ ] **Step 1: Add the field to the payload block**
+- [x] **Step 1: Add the field to the payload block**
 
 In the `GET /api/scope-audit` response block, after the `observedUnmatchedPackets` line (add a comma to it):
 
@@ -1154,7 +1162,7 @@ In the `GET /api/scope-audit` response block, after the `observedUnmatchedPacket
       "regionEvidence":           { "<region>": number } // declared regions corroborated by this repeater's own unnameable traffic — see note below
 ```
 
-- [ ] **Step 2: Add the note**
+- [x] **Step 2: Add the note**
 
 After the `observedUnmatchedPackets` bullet:
 
@@ -1173,7 +1181,7 @@ After the `observedUnmatchedPackets` bullet:
   be empty.
 ```
 
-- [ ] **Step 3: Amend the `observedUnmatchedPackets` note**
+- [x] **Step 3: Amend the `observedUnmatchedPackets` note**
 
 That note predates verification. Append to it:
 
@@ -1185,7 +1193,7 @@ That note predates verification. Append to it:
   name.
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/api-spec.md
@@ -1196,7 +1204,7 @@ git commit -m "docs(api): document regionEvidence on GET /api/scope-audit"
 
 ### Task 8: Benchmark and verify
 
-- [ ] **Step 1: Write the benchmark**
+- [x] **Step 1: Write the benchmark**
 
 Append to `cmd/server/scope_verify_test.go`:
 
@@ -1231,19 +1239,19 @@ func BenchmarkScopeVerifierAudit(b *testing.B) {
 
 Add `"fmt"` to the test file's imports.
 
-- [ ] **Step 2: Run it and record the number**
+- [x] **Step 2: Run it and record the number**
 
 Run: `cd cmd/server && go test -bench BenchmarkScopeVerifierAudit -benchtime=5x -run '^$' ./...`
 Expected: one figure. Paste the real output into the commit message.
 
 The budget: the audit is cached for 30s, so anything under ~1s per refresh is comfortable and under ~100ms is invisible. If the measured figure exceeds 1s, stop — either the memo is not working (check `hmacCount` in a debugger) or `scopeVerifyMaxPacketsPerTarget` needs lowering. Do not ship a number you have not looked at.
 
-- [ ] **Step 3: Full suites**
+- [x] **Step 3: Full suites**
 
 Run: `cd cmd/server && go test ./...` then `cd ../ingestor && go test ./...` then, from the repo root, `node test-packet-filter.js && node test-aging.js && node test-frontend-helpers.js`
 Expected: PASS everywhere. The ingestor is untouched by this plan; run it to prove that.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add cmd/server/scope_verify_test.go
