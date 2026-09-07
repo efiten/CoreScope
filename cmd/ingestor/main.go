@@ -108,8 +108,13 @@ func main() {
 		log.Printf("No channel keys loaded — GRP_TXT packets will not be decrypted")
 	}
 
-	regionKeys := loadRegionKeys(cfg)
-	store.BackfillDefaultScopeAsync(regionKeys)
+	regionSet := newRegionKeySet(cfg)
+	if cfg.AutoRegionKeysEnabled() {
+		regionSet.refreshFromStore(store)
+	} else {
+		log.Printf("[regions] autoRegionKeys disabled — only the %d configured hashRegions key(s) are in force", len(regionSet.snapshot().all))
+	}
+	store.BackfillDefaultScopeAsync(regionSet)
 	store.BackfillTransportCodesAsync()
 
 	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
@@ -188,7 +193,7 @@ func main() {
 			markReceiptForTag(tag, time.Now())
 			status.MarkPacket(time.Now())
 			ingestBuffer.Submit(func() {
-				handleMessage(store, tag, src, m, channelKeys, regionKeys, cfg)
+				handleMessage(store, tag, src, m, channelKeys, regionSet, cfg)
 			})
 		})
 
@@ -449,6 +454,22 @@ func main() {
 		}
 	}
 
+	// Derived region keys refresh on their own ticker rather than the daily
+	// retention one: declared-region answers arrive continuously (a companion
+	// app driving past a repeater), and waiting up to 24h to name a
+	// newly-discovered region would defeat the point of deriving them at all.
+	if cfg.AutoRegionKeysEnabled() {
+		interval := time.Duration(cfg.AutoRegionKeysRefreshMinutes()) * time.Minute
+		regionRefreshTicker := time.NewTicker(interval)
+		go func() {
+			for range regionRefreshTicker.C {
+				regionSet.refreshFromStore(store)
+				logScopeMatchCounters()
+			}
+		}()
+		log.Printf("[regions] auto-derived region keys enabled: refreshing every %v, cap %d", interval, cfg.AutoRegionKeysMaxDerived())
+	}
+
 	// Hourly WAL checkpoint to prevent unbounded WAL growth.
 	// TRUNCATE resets the WAL file to zero bytes when all frames are flushed;
 	// if the server's read connection holds frames, remaining pages stay in the
@@ -683,7 +704,7 @@ func buildForceReconnectFn(client mqtt.Client, tag string) func() {
 	}
 }
 
-func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionKeys map[string][]byte, cfg *Config) {
+func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config) {
 	// Liveness watchdog (#1212): record receipt before any processing so a
 	// slow handler still counts as "source is alive". Cheap atomic store.
 	markLivenessForTag(tag, time.Now())
@@ -729,7 +750,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		switch parts[3] {
 		case "packets":
 			if cfg.ClientRxCoverageEnabled() {
-				handleClientPacket(store, cfg, tag, parts[2], msg, channelKeys, regionKeys)
+				handleClientPacket(store, cfg, tag, parts[2], msg, channelKeys, regionSet)
 			}
 		case "rf":
 			if cfg.ClientRfSamplesEnabled() {
@@ -970,7 +991,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 				log.Printf("MQTT [%s] foreign advert: node=%s name=%s lat=%.4f lon=%.4f observer=%s",
 					tag, truncPK, sanitizeLogString(decoded.Payload.Name), lat, lon, sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)))
 			}
-			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionKeys)
+			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
 			pktData.Foreign = foreign
 			isNew, err := store.InsertTransmission(pktData)
 			if err != nil {
@@ -1005,7 +1026,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		} else {
 			// Non-ADVERT packets: store normally (routing/channel messages from
 			// in-area observers are relevant regardless of relay hop origin).
-			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionKeys)
+			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
 			if _, err := store.InsertTransmission(pktData); err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
 			}
@@ -1659,37 +1680,17 @@ func loadRegionKeys(cfg *Config) map[string][]byte {
 	return keys
 }
 
-// matchScope names the region scope of a transport-scoped packet. It performs
-// one HMAC-SHA256 per configured region (expected len(regionKeys) ≤ 50;
-// beyond that, consider a pre-indexed lookup table), HMACing the payload with
-// each region key and looking for the one whose derived 2-byte code matches
-// code1. Two bytes is only 65536 values, so with enough configured regions,
-// unrelated keys collide by pure chance often enough to matter (#1609): with
-// 58 keys, ~78k transport-scoped packets measured ~34 coincidental matches in
-// production. Returning the first match found named the wrong region on
-// those packets.
+// matchScope was removed in M2 (docs/plans/2026-09-07-auto-derived-region-keys.md).
+// Naming a packet's region now goes through regionKeySnapshot.match in
+// region_keys.go, which keeps #1609's abstain-on-ambiguity rule but adds a
+// principled tie-break: an operator-configured hashRegions key beats one
+// derived from a declared-region answer.
 //
-// Fix: collect every matching key instead of returning at the first. Exactly
-// one match names that region, as before; more than one match is ambiguous —
-// we cannot know which region the sender meant, so this returns the same ""
-// used when nothing matches at all (scopeNameForDB's third state: transport-
-// scoped but unnameable). Collecting all matches before deciding also removes
-// the dependency on regionKeys' (map) iteration order: the old code's result
-// for a colliding packet depended on which key Go's randomised map order
-// visited first, so the same packet could be labelled differently across
-// runs. That nondeterminism is a consequence of returning early, not of the
-// map itself, so it goes away once every key is checked before deciding.
-func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) string {
-	matched := matchingRegions(regionKeys, payloadType, payloadRaw, code1)
-	if len(matched) > 1 {
-		log.Printf("matchScope: ambiguous code1=%s matched %d region keys %v; returning unmatched", code1, len(matched), matched)
-		return ""
-	}
-	if len(matched) == 1 {
-		return matched[0]
-	}
-	return ""
-}
+// Its doc comment also suggested a "pre-indexed lookup table" beyond ~50
+// regions. That is not achievable and the idea should not come back: code1 is
+// an HMAC over the packet payload, so there is no payload-independent key to
+// index on. The cost is inherently one HMAC per region per transport-scoped
+// packet, which is exactly why autoRegionKeys.maxDerived exists.
 
 // matchingRegions returns the name of every configured region whose derived
 // 2-byte code equals code1, in no particular order. matchScope uses the

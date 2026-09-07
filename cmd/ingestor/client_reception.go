@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"regexp"
 	"strings"
@@ -23,7 +24,7 @@ var clientPubkeyRe = regexp.MustCompile(`^[0-9a-f]{2,64}$`)
 // companion reports WHERE it directly heard a node, so we write a
 // client_receptions row and never touch the observers/observations tables.
 // rxPubkey is the companion pubkey from the topic (ACL-bound by the broker).
-func handleClientPacket(store *Store, cfg *Config, tag, rxPubkey string, msg map[string]interface{}, channelKeys map[string]string, regionKeys map[string][]byte) {
+func handleClientPacket(store *Store, cfg *Config, tag, rxPubkey string, msg map[string]interface{}, channelKeys map[string]string, regionSet *regionKeySet) {
 	// The companion identity IS the (ACL-bound) topic pubkey. Reject non-hex
 	// topic segments so a no-ACL broker can't pollute the coverage tables, and
 	// never fall back to a payload-supplied id (that would defeat the ACL trust
@@ -93,7 +94,7 @@ func handleClientPacket(store *Store, cfg *Config, tag, rxPubkey string, msg map
 		// collapse them and ON CONFLICT DO NOTHING would silently drop all but
 		// the first.
 		rxAtMillis := rxTime.Format(rxTimeMillisLayout)
-		if obs := buildClientRxObservation(direction, rxPubkey, rawHex, rxAtMillis, ingestedAt, decoded, regionKeys, snrPtr, rssiPtr, lat, lon, accPtr); obs != nil {
+		if obs := buildClientRxObservation(direction, rxPubkey, rawHex, rxAtMillis, ingestedAt, decoded, regionSet, snrPtr, rssiPtr, lat, lon, accPtr); obs != nil {
 			if _, err := store.InsertClientRxObservation(obs); err != nil {
 				log.Printf("MQTT [%s] client observation insert: %v", tag, err)
 			}
@@ -422,7 +423,7 @@ type ClientRxObservation struct {
 // signal — per-flood row multiplicity meant to measure forwarder
 // amplification of traffic actually heard over the air.
 func buildClientRxObservation(
-	direction, rxPubkey, rawHex, rxAt, ingestedAt string, decoded *DecodedPacket, regionKeys map[string][]byte,
+	direction, rxPubkey, rawHex, rxAt, ingestedAt string, decoded *DecodedPacket, regionSet *regionKeySet,
 	snr *float64, rssi *int, lat, lon float64, posAccM *float64,
 ) *ClientRxObservation {
 	if !strings.EqualFold(direction, "rx") {
@@ -447,7 +448,9 @@ func buildClientRxObservation(
 		obs.Code1 = &decoded.TransportCodes.Code1
 		obs.Code2 = &decoded.TransportCodes.Code2
 		if decoded.TransportCodes.Code1 != "0000" {
-			sn := matchScope(regionKeys, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+			m := regionSet.snapshot().match(byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+			recordScopeMatch(m)
+			sn := m.Name
 			obs.ScopeName = &sn
 		}
 	}
@@ -566,4 +569,65 @@ func (s *Store) CurrentDeclaredRegions(target string) (*ClientDeclaredRegions, e
 	}
 	o.Truncated = truncated == 1
 	return &o, nil
+}
+
+// DeclaredRegionStats returns every region name currently declared anywhere on
+// the network, with the two facts the derived-tier cap ranks on: how many
+// distinct repeaters declare it, and the most recent observed_at among them.
+//
+// Only the LATEST answer per target counts - the same rule
+// CurrentDeclaredRegions follows, by observed_at and never ingested_at, so a
+// drive buffered offline cannot resurrect a region a repeater has since
+// dropped. The window function is covered by idx_ndr_target(target,
+// observed_at).
+//
+// CSV splitting and aggregation happen in Go rather than SQL: regions_csv is
+// written with strings.Join, and unpicking it in SQLite would need a recursive
+// CTE for no gain at this row count (~200 targets).
+func (s *Store) DeclaredRegionStats() ([]declaredRegionStat, error) {
+	rows, err := s.db.Query(`
+		WITH ranked AS (
+			SELECT target, observed_at, regions_csv,
+				ROW_NUMBER() OVER (PARTITION BY target ORDER BY observed_at DESC) AS rn
+			FROM node_declared_regions
+		)
+		SELECT target, observed_at, regions_csv FROM ranked WHERE rn = 1
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("declared region stats: %w", err)
+	}
+	defer rows.Close()
+
+	agg := map[string]*declaredRegionStat{}
+	for rows.Next() {
+		var target, observedAt, csv string
+		if err := rows.Scan(&target, &observedAt, &csv); err != nil {
+			return nil, fmt.Errorf("declared region stats scan: %w", err)
+		}
+		seenHere := map[string]bool{} // one target counts once per name
+		for _, name := range splitDeclaredRegionsCSV(csv) {
+			if name == "*" || seenHere[name] {
+				continue // '*' is the wildcard, not a region name
+			}
+			seenHere[name] = true
+			st, ok := agg[name]
+			if !ok {
+				st = &declaredRegionStat{Name: name}
+				agg[name] = st
+			}
+			st.Declarers++
+			if observedAt > st.LastSeen {
+				st.LastSeen = observedAt
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("declared region stats rows: %w", err)
+	}
+
+	out := make([]declaredRegionStat, 0, len(agg))
+	for _, st := range agg {
+		out = append(out, *st)
+	}
+	return out, nil
 }

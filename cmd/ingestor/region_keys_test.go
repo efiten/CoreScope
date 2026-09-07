@@ -311,3 +311,144 @@ func TestScopeMatchTwoDerivedKeysStayAmbiguous(t *testing.T) {
 		t.Errorf("got %+v, want an empty name with reason %q", got, scopeReasonAmbiguous)
 	}
 }
+
+// regionSetFromKeys wraps a raw key map as a *regionKeySet with every key
+// treated as explicit. Tests written before M2's two-tier type keep working
+// unchanged this way, and "all keys explicit" is precisely what a hashRegions
+// map meant back then - so the #1609 ambiguity semantics they assert are
+// preserved exactly: two explicit candidates still abstain.
+func regionSetFromKeys(keys map[string][]byte) *regionKeySet {
+	names := make(map[string]bool, len(keys))
+	all := make(map[string][]byte, len(keys))
+	for n, k := range keys {
+		names[n] = true
+		all[n] = k
+	}
+	s := &regionKeySet{}
+	s.cur.Store(&regionKeySnapshot{all: all, explicit: names})
+	return s
+}
+
+// matchScopeName reproduces the removed matchScope's signature over the new
+// type, so the tests written against it keep asserting the behaviour they were
+// written for rather than being rewritten alongside the change they guard.
+func matchScopeName(keys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) string {
+	return regionSetFromKeys(keys).snapshot().match(payloadType, payloadRaw, code1).Name
+}
+
+func TestDeclaredRegionStatsAggregatesLatestAnswerPerTarget(t *testing.T) {
+	store := newTestStore(t)
+	// Two answers from the same target: only the newer one counts, exactly as
+	// CurrentDeclaredRegions orders (by observed_at, never ingested_at - a
+	// drive buffered offline can arrive days late).
+	insertDeclaredRegionsRow(t, store, "aa"+strings.Repeat("11", 31), "2026-09-01T00:00:00Z", "be,old")
+	insertDeclaredRegionsRow(t, store, "aa"+strings.Repeat("11", 31), "2026-09-07T00:00:00Z", "be,new")
+	insertDeclaredRegionsRow(t, store, "bb"+strings.Repeat("22", 31), "2026-09-05T00:00:00Z", "be")
+
+	stats, err := store.DeclaredRegionStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]declaredRegionStat{}
+	for _, s := range stats {
+		byName[s.Name] = s
+	}
+	if got := byName["be"].Declarers; got != 2 {
+		t.Errorf("be declarers = %d, want 2", got)
+	}
+	if got := byName["be"].LastSeen; got != "2026-09-07T00:00:00Z" {
+		t.Errorf("be lastSeen = %q, want the greatest observed_at", got)
+	}
+	if _, ok := byName["old"]; ok {
+		t.Error("want the superseded answer's region gone - only the latest answer per target counts")
+	}
+	if got := byName["new"].Declarers; got != 1 {
+		t.Errorf("new declarers = %d, want 1", got)
+	}
+}
+
+func TestDeclaredRegionStatsIgnoresWildcard(t *testing.T) {
+	// '*' is the wildcard, not a region name. Deriving a key for it would add
+	// a permanent no-op entry to the cap on nearly every deployment.
+	store := newTestStore(t)
+	insertDeclaredRegionsRow(t, store, "cc"+strings.Repeat("33", 31), "2026-09-07T00:00:00Z", "*,be")
+	stats, err := store.DeclaredRegionStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range stats {
+		if s.Name == "*" {
+			t.Error("want '*' excluded - it is the wildcard, not a region")
+		}
+	}
+	if len(stats) != 1 {
+		t.Errorf("stats = %+v, want just be", stats)
+	}
+}
+
+// insertDeclaredRegionsRow seeds one node_declared_regions answer.
+func insertDeclaredRegionsRow(t *testing.T, s *Store, target, observedAt, regionsCSV string) {
+	t.Helper()
+	_, err := s.db.Exec(
+		`INSERT INTO node_declared_regions (target, rx_pubkey, observed_at, ingested_at, regions_csv, truncated)
+		 VALUES (?, 'rx', ?, ?, ?, 0)`,
+		target, observedAt, observedAt, regionsCSV)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRefreshFromStoreIsNoOpWhenDisabled(t *testing.T) {
+	store := newTestStore(t)
+	insertDeclaredRegionsRow(t, store, "aa"+strings.Repeat("11", 31), "2026-09-07T00:00:00Z", "behss")
+
+	cfg := &Config{HashRegions: []string{"#be"}} // autoRegionKeys absent
+	set := newRegionKeySet(cfg)
+	before := len(set.snapshot().all)
+	set.refreshFromStore(store)
+
+	if got := len(set.snapshot().all); got != before {
+		t.Errorf("key count %d -> %d with autoRegionKeys off, want unchanged", before, got)
+	}
+	if _, ok := set.snapshot().all["#behss"]; ok {
+		t.Error("a declared name became a key with the feature disabled - this is the safety property the default-off promise rests on")
+	}
+}
+
+func TestRefreshFromStoreDerivesWhenEnabled(t *testing.T) {
+	store := newTestStore(t)
+	insertDeclaredRegionsRow(t, store, "aa"+strings.Repeat("11", 31), "2026-09-07T00:00:00Z", "behss,fm-112")
+
+	cfg := &Config{HashRegions: []string{"#be"}, AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true}}
+	set := newRegionKeySet(cfg)
+	set.refreshFromStore(store)
+
+	snap := set.snapshot()
+	for _, want := range []string{"#be", "#behss", "#fm-112"} {
+		if _, ok := snap.all[want]; !ok {
+			t.Errorf("want %s in force, got %v", want, keyNames(snap))
+		}
+	}
+	if !snap.isExplicit("#be") || snap.isExplicit("#behss") {
+		t.Error("tiers crossed: #be must stay explicit, #behss must be derived")
+	}
+}
+
+func TestRefreshFromStoreHonoursTheCap(t *testing.T) {
+	store := newTestStore(t)
+	// Three names, one declared twice so the ranking is not a coin flip.
+	insertDeclaredRegionsRow(t, store, "aa"+strings.Repeat("11", 31), "2026-09-07T00:00:00Z", "wide,narrow1")
+	insertDeclaredRegionsRow(t, store, "bb"+strings.Repeat("22", 31), "2026-09-07T00:00:00Z", "wide,narrow2")
+
+	cfg := &Config{AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true, MaxDerived: 1}}
+	set := newRegionKeySet(cfg)
+	set.refreshFromStore(store)
+
+	snap := set.snapshot()
+	if len(snap.all) != 1 {
+		t.Fatalf("keys = %v, want exactly 1 under maxDerived=1", keyNames(snap))
+	}
+	if _, ok := snap.all["#wide"]; !ok {
+		t.Errorf("keys = %v, want the twice-declared name kept, not a one-off", keyNames(snap))
+	}
+}

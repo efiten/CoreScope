@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"log"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -137,7 +138,21 @@ func newRegionKeySet(cfg *Config) *regionKeySet {
 	return s
 }
 
-func (s *regionKeySet) snapshot() *regionKeySnapshot { return s.cur.Load() }
+// emptyRegionKeySnapshot backs the nil case below. Shared and never mutated:
+// refreshDerived always builds a fresh map rather than writing into one.
+var emptyRegionKeySnapshot = &regionKeySnapshot{all: map[string][]byte{}, explicit: map[string]bool{}}
+
+// snapshot is nil-safe on purpose. A nil *regionKeySet means "no region keys",
+// which is exactly what a nil map[string][]byte meant before M2 — the shape
+// several call sites and a good many tests still pass. Panicking there would
+// turn an absent key set into a crash on the ingest path, which is a far worse
+// failure than naming nothing.
+func (s *regionKeySet) snapshot() *regionKeySnapshot {
+	if s == nil {
+		return emptyRegionKeySnapshot
+	}
+	return s.cur.Load()
+}
 
 // refreshDerived rebuilds the derived tier from names (already ranked and
 // capped by the caller) and swaps in a new snapshot. It REPLACES the derived
@@ -234,4 +249,71 @@ func (s *regionKeySnapshot) match(payloadType byte, payloadRaw []byte, code1 str
 		return scopeMatch{Name: explicitMatches[0], Reason: scopeReasonExplicitOverDerived, Candidates: matched}
 	}
 	return scopeMatch{Reason: scopeReasonAmbiguous, Candidates: matched}
+}
+
+// scopeMatchCounters tallies how each transport-scoped packet's region was
+// decided. It exists to answer one question before more machinery is built:
+// how often does an ambiguous collision actually happen? The spec gates the
+// path-evidence tie-break (tier 3) on this number.
+var scopeMatchCounters struct {
+	unique              atomic.Int64
+	explicitOverDerived atomic.Int64
+	ambiguous           atomic.Int64
+	none                atomic.Int64
+}
+
+// recordScopeMatch tallies one decision and logs the interesting ones. Unique
+// and none are the overwhelming majority and are counted silently; the other
+// two are rare by construction and worth a line each.
+func recordScopeMatch(m scopeMatch) {
+	switch m.Reason {
+	case scopeReasonUnique:
+		scopeMatchCounters.unique.Add(1)
+	case scopeReasonNone:
+		scopeMatchCounters.none.Add(1)
+	case scopeReasonExplicitOverDerived:
+		scopeMatchCounters.explicitOverDerived.Add(1)
+		log.Printf("[regions] collision resolved to explicit %s over derived candidates %v", m.Name, m.Candidates)
+	case scopeReasonAmbiguous:
+		scopeMatchCounters.ambiguous.Add(1)
+		log.Printf("[regions] ambiguous collision between %v; storing unmatched", m.Candidates)
+	}
+}
+
+// logScopeMatchCounters prints the running tally. Called from the refresh
+// ticker so the numbers arrive on the same cadence as the key-set changes that
+// move them.
+func logScopeMatchCounters() {
+	log.Printf("[regions] scope matches: unique=%d explicit-over-derived=%d ambiguous=%d none=%d",
+		scopeMatchCounters.unique.Load(), scopeMatchCounters.explicitOverDerived.Load(),
+		scopeMatchCounters.ambiguous.Load(), scopeMatchCounters.none.Load())
+}
+
+// refreshFromStore reads the declared region names, ranks and caps them, and
+// swaps in a new snapshot. Shared by startup and the ticker so both apply
+// identical rules.
+//
+// A DB error is logged and the CURRENT snapshot is kept. That matters: an
+// empty key set would silently unname all traffic, which looks exactly like
+// the bug this feature exists to fix.
+func (s *regionKeySet) refreshFromStore(store *Store) {
+	if s == nil || !s.enabled {
+		return
+	}
+	stats, err := store.DeclaredRegionStats()
+	if err != nil {
+		log.Printf("[regions] derived-key refresh failed, keeping %d existing key(s): %v", len(s.snapshot().all), err)
+		return
+	}
+	ranked := rankDeclaredRegions(stats, s.max)
+	added := s.refreshDerived(ranked)
+	snap := s.snapshot()
+	log.Printf("[regions] derived-key refresh: %d name(s) declared, %d kept after filter+cap(%d), %d total key(s) in force",
+		len(stats), len(ranked), s.max, len(snap.all))
+	if len(added) > 0 {
+		log.Printf("[regions] derived keys now active: %v", added)
+	}
+	if len(stats) > s.max {
+		log.Printf("[regions] NOTE: %d declared name(s) exceeded maxDerived=%d and were dropped, least-declared first", len(stats)-s.max, s.max)
+	}
 }
