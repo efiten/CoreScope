@@ -580,7 +580,7 @@ expectation.
 
 #### What the first run on staging measured (2026-09-07)
 
-#### The gate reading, taken on live over 8 hours (2026-09-07 21:18 to 2026-09-08 05:18)
+#### The gate reading, measured over three windows (2026-09-07 21:18 to 2026-09-08 18:03)
 
 ```
 [regions] scope matches: unique=30874 explicit-over-derived=0 ambiguous=110 none=11
@@ -601,21 +601,42 @@ every one of them against `#be`: `#nl-li-nth` (35), `#behla` (33), `#beanr` (27)
 because `code1` is an HMAC over the payload: a payload that collides collides every
 time it is seen, and a flooded packet is seen by a great many observers.
 
-**The counter counts decisions, not packets.** Over those same 8 hours the database
-took 5,351 transport-scoped transmissions from 94,402 observations and stored 49 of
-them unnamed. At ~5.8 decisions per transmission the 110 events are on the order of 19
-distinct transmissions in 8 hours, so roughly **400 a week** against the ~10 a week
-estimated above. The estimate was about 40x low, and the reason sits in the same
-numbers: it assumed 0.037 transport-scoped packets/s where the measured rate is ~1.1/s.
+**The counter counts decisions, not packets.** Over the first window the database took
+5,351 transport-scoped transmissions from 94,402 observations and stored 49 of them
+unnamed, so roughly 5.8 counted decisions stand behind each transmission.
 
-**What that does to the gate.** The volume is far above the estimate and still small in
-absolute terms: ~400 packets a week against ~112,000 scoped transmissions, 0.35%. Each
-one is stored unnamed, which the audit now explains rather than misrepresents (M1's
-caveat chip and M1b's verification both shipped after this section was written). So M3
-stays unbuilt, on a measured basis rather than an estimated one, and the number to
-revisit it against is 400 a week, not 10. Note also that the rate scales with the key
-count: this is what a two-byte code produces at 159 keys, and filling the derived
-tier's cap of 256 would roughly triple it.
+Three windows, read on 2026-09-08 at 18:03 UTC. Staging carries the same 159-key set
+and the same MQTT feed, so it is a second sample of the same logic rather than a
+different experiment:
+
+| window | run | decisions | ambiguous | per hour | share |
+|---|---|---|---|---|---|
+| live, from 21:18 | 8.0h | 30,995 | 110 | 13.8 | 0.355% |
+| live, from 05:36 | 12.2h | 40,756 | 77 | 6.3 | 0.189% |
+| staging, from 20:22 | 21.5h | 75,784 | 187 | 8.7 | 0.247% |
+| **pooled** | **41.7h** | **147,535** | **374** | **9.0** | **0.253%** |
+
+The first window alone read 13.8/h and would have put this at ~400 transmissions a
+week; the longer runs are lower, and the spread is the daily traffic cycle rather than
+a difference between the instances (decisions per hour agree to within 15% across all
+three: 3,859, 3,325, 3,518). Pooled, the honest figure is **roughly 260 affected
+transmissions a week**, and any window taken on its own supports somewhere between 180
+and 400.
+
+Note what was and was not wrong in the estimate above. Its **share** was close: 0.27%
+estimated against 0.253% measured. Its **volume** was off by a factor of ~25, because it
+assumed 0.037 transport-scoped packets/s where the measured rate is ~1.1/s. A share is
+easy to reason about from key count and code width; a weekly count needs the traffic
+rate, and that was the part nobody had measured.
+
+**What that does to the gate.** Far above the ~10 a week the estimate implied, and still
+small in absolute terms: ~260 transmissions a week against ~112,000 scoped ones. Each is
+stored unnamed, which the audit now explains rather than misrepresents (M1's caveat chip
+and M1b's verification both shipped after this section was written). So M3 stays
+unbuilt, on a measurement rather than an estimate, and the number to revisit it against
+is ~260 a week, not 10. The rate also scales with the key count: this is what a two-byte
+code produces at 159 keys, and filling the derived tier's cap of 256 would roughly
+triple it.
 
 What the same run did settle is the size of the derived tier on this network, and it
 is not what the estimate above assumes:
