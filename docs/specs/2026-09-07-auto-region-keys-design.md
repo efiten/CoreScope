@@ -580,18 +580,42 @@ expectation.
 
 #### What the first run on staging measured (2026-09-07)
 
-The gate is **still open, and the first tally points at closing it**. After 15
-minutes on staging:
+#### The gate reading, taken on live over 8 hours (2026-09-07 21:18 to 2026-09-08 05:18)
 
 ```
-[regions] scope matches: unique=1306 explicit-over-derived=0 ambiguous=0 none=0
+[regions] scope matches: unique=30874 explicit-over-derived=0 ambiguous=110 none=11
 ```
 
-Zero ambiguous in 1306 scoped packets. That is one ticker interval, not the day the
-gate asks for, and it is not identically zero either: the same container logged nine
-`ambiguous collision between [#lu #be]` lines in the seconds after an MQTT reconnect,
-so the rate is low rather than absent. The full reading has to come from a container
-left running, because each deploy replaces it and takes `docker logs` along.
+Three things in that line, in the order they matter.
+
+**Tier 2 never fired.** `explicit-over-derived=0`, because this instance's derived tier
+holds exactly one key (`#null`) once the declared names had been merged into
+`hashRegions` by hand. Every one of the 110 ambiguous decisions is therefore a
+collision between two OPERATOR-CONFIGURED keys: exactly the case tier 3 exists for,
+and exactly the case the estimate above assumed tier 2 would absorb. That premise does
+not hold here.
+
+**The collisions are concentrated, not scattered.** All 110 fall on four key pairs,
+every one of them against `#be`: `#nl-li-nth` (35), `#behla` (33), `#beanr` (27),
+`#nl-ze` (15). Random per-packet collision would spread across many pairs. It does not,
+because `code1` is an HMAC over the payload: a payload that collides collides every
+time it is seen, and a flooded packet is seen by a great many observers.
+
+**The counter counts decisions, not packets.** Over those same 8 hours the database
+took 5,351 transport-scoped transmissions from 94,402 observations and stored 49 of
+them unnamed. At ~5.8 decisions per transmission the 110 events are on the order of 19
+distinct transmissions in 8 hours, so roughly **400 a week** against the ~10 a week
+estimated above. The estimate was about 40x low, and the reason sits in the same
+numbers: it assumed 0.037 transport-scoped packets/s where the measured rate is ~1.1/s.
+
+**What that does to the gate.** The volume is far above the estimate and still small in
+absolute terms: ~400 packets a week against ~112,000 scoped transmissions, 0.35%. Each
+one is stored unnamed, which the audit now explains rather than misrepresents (M1's
+caveat chip and M1b's verification both shipped after this section was written). So M3
+stays unbuilt, on a measured basis rather than an estimated one, and the number to
+revisit it against is 400 a week, not 10. Note also that the rate scales with the key
+count: this is what a two-byte code produces at 159 keys, and filling the derived
+tier's cap of 256 would roughly triple it.
 
 What the same run did settle is the size of the derived tier on this network, and it
 is not what the estimate above assumes:
