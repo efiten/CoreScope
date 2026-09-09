@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/meshcore-analyzer/packetpath"
 	"github.com/meshcore-analyzer/prunequeue"
 	"golang.org/x/sync/singleflight"
 )
@@ -49,6 +48,11 @@ type Server struct {
 	statsMu       sync.Mutex
 	statsCache    *StatsResponse
 	statsCachedAt time.Time
+	// #1910: collapses concurrent rebuilds. The cache check below releases
+	// statsMu before building the response, so every request arriving while the
+	// 10s window was expired used to rebuild it in full, each running its own DB
+	// queries against a 4-connection pool.
+	statsSF singleflight.Group
 
 	// Guards s.cfg.GeoFilter — read by ingest/handler goroutines, written by PUT handler
 	cfgMu sync.RWMutex
@@ -68,8 +72,8 @@ type Server struct {
 
 	// Cached /api/scope-audit response — per-window, with a singleflight so a
 	// cold key costs one scan no matter how many requests arrive on it. See
-	// scopeAuditTTLFor for why the 7d window's TTL is not the 30s the others
-	// use, and scopes.go for the scan itself.
+	// scopeAuditTTLFor (scope_audit.go) for why the 7d window's TTL is not the
+	// 30s the others use, and the scan itself for what that window costs.
 	scopeAuditMu       sync.Mutex
 	scopeAuditCache    map[string]*ScopeAuditResponse
 	scopeAuditCachedAt map[string]time.Time
@@ -244,7 +248,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/health", s.handleHealth).Methods("GET")
 	r.HandleFunc("/api/stats", s.handleStats).Methods("GET")
 	r.HandleFunc("/api/scope-stats", s.handleScopeStats).Methods("GET")
-	r.HandleFunc("/api/scope-audit", s.handleScopeAudit).Methods("GET")
+	r.HandleFunc("/api/scope-audit", s.handleScopeAudit).Methods("GET") // #1975
 	r.HandleFunc("/api/perf", s.handlePerf).Methods("GET")
 	r.HandleFunc("/api/perf/io", s.handlePerfIO).Methods("GET")
 	r.HandleFunc("/api/perf/sqlite", s.handlePerfSqlite).Methods("GET")
@@ -269,7 +273,6 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/packets/timestamps", s.handlePacketTimestamps).Methods("GET")
 	r.HandleFunc("/api/packets/{id}", s.handlePacketDetail).Methods("GET")
 	r.HandleFunc("/api/packets", s.handlePackets).Methods("GET")
-	r.Handle("/api/packets", s.requireAPIKey(http.HandlerFunc(s.handlePostPacket))).Methods("POST")
 
 	// Decode endpoint
 	r.HandleFunc("/api/decode", s.handleDecode).Methods("POST")
@@ -701,8 +704,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	uptime := time.Since(s.startedAt).Seconds()
 
 	wsClients := 0
+	var wsDeny, wsRate, wsConnCap int64
 	if s.hub != nil {
 		wsClients = s.hub.ClientCount()
+		wsDeny, wsRate, wsConnCap = s.hub.limits.counts() // #1794; nil-safe
 	}
 
 	// Real packet store stats
@@ -774,8 +779,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			P95Ms:        round(percentile(sortedPauses, 0.95), 1),
 			P99Ms:        round(percentile(sortedPauses, 0.99), 1),
 		},
-		Cache:     cs,
-		WebSocket: WebSocketStatsResp{Clients: wsClients},
+		Cache: cs,
+		WebSocket: WebSocketStatsResp{Clients: wsClients,
+			RejectedDeny: wsDeny, RejectedRate: wsRate, RejectedConnCap: wsConnCap},
 		PacketStore: HealthPacketStoreStats{
 			Packets:     pktCount,
 			EstimatedMB: pktEstMB,
@@ -802,66 +808,86 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	s.statsMu.Unlock()
 
-	var stats *Stats
-	var err error
-	if s.store != nil {
-		stats, err = s.store.GetStoreStats()
-	} else {
-		stats, err = s.db.GetStats()
-	}
-	if err != nil {
-		writeError(w, 500, err.Error())
+	// #1910: one rebuild per expiry, not one per request. Everything below runs
+	// inside singleflight, so concurrent callers that miss the cache wait for the
+	// first one's response instead of each running the same DB queries against a
+	// 4-connection pool.
+	built, sfErr, _ := s.statsSF.Do("stats", func() (interface{}, error) {
+		// Re-check under the group: the winner may have just filled the cache.
+		s.statsMu.Lock()
+		if s.statsCache != nil && time.Since(s.statsCachedAt) < statsTTL {
+			cached := s.statsCache
+			s.statsMu.Unlock()
+			return cached, nil
+		}
+		s.statsMu.Unlock()
+
+		var stats *Stats
+		var err error
+		if s.store != nil {
+			stats, err = s.store.GetStoreStats()
+		} else {
+			stats, err = s.db.GetStats()
+		}
+		if err != nil {
+			return nil, err
+		}
+		counts := s.db.GetRoleCounts()
+
+		// Memory accounting (#832). storeDataMB is the in-store packet byte
+		// estimate (the old "trackedMB"); processRSSMB / goHeapInuseMB / goSysMB
+		// give ops the breakdown needed to reason about real RSS. All values
+		// share a single 1s-cached snapshot to amortize ReadMemStats cost.
+		var storeDataMB float64
+		if s.store != nil {
+			storeDataMB = s.store.trackedMemoryMB()
+		}
+		mem := s.getMemorySnapshot(storeDataMB)
+
+		resp := &StatsResponse{
+			TotalPackets:       stats.TotalPackets,
+			TotalTransmissions: &stats.TotalTransmissions,
+			TotalObservations:  stats.TotalObservations,
+			TotalNodes:         stats.TotalNodes,
+			TotalNodesAllTime:  stats.TotalNodesAllTime,
+			TotalObservers:     stats.TotalObservers,
+			PacketsLastHour:    stats.PacketsLastHour,
+			PacketsLast24h:     stats.PacketsLast24h,
+			Engine:             "go",
+			Version:            s.version,
+			Commit:             s.commit,
+			BuildTime:          s.buildTime,
+			Counts: RoleCounts{
+				Repeaters:  counts["repeaters"],
+				Rooms:      counts["rooms"],
+				Companions: counts["companions"],
+				Sensors:    counts["sensors"],
+			},
+			SignatureDrops:        s.db.GetSignatureDropCount(),
+			HashMigrationComplete: s.store != nil && s.store.hashMigrationComplete.Load(),
+
+			TrackedMB:     mem.StoreDataMB, // deprecated alias
+			StoreDataMB:   mem.StoreDataMB,
+			ProcessRSSMB:  mem.ProcessRSSMB,
+			GoHeapInuseMB: mem.GoHeapInuseMB,
+			GoSysMB:       mem.GoSysMB,
+
+			NeighborGraphCacheRebuildFailures: atomic.LoadUint64(&s.neighborGraphCacheRebuildFailures),
+		}
+
+		s.statsMu.Lock()
+		s.statsCache = resp
+		s.statsCachedAt = time.Now()
+		s.statsMu.Unlock()
+
+		return resp, nil
+	})
+	if sfErr != nil {
+		writeError(w, 500, sfErr.Error())
 		return
 	}
-	counts := s.db.GetRoleCounts()
 
-	// Memory accounting (#832). storeDataMB is the in-store packet byte
-	// estimate (the old "trackedMB"); processRSSMB / goHeapInuseMB / goSysMB
-	// give ops the breakdown needed to reason about real RSS. All values
-	// share a single 1s-cached snapshot to amortize ReadMemStats cost.
-	var storeDataMB float64
-	if s.store != nil {
-		storeDataMB = s.store.trackedMemoryMB()
-	}
-	mem := s.getMemorySnapshot(storeDataMB)
-
-	resp := &StatsResponse{
-		TotalPackets:       stats.TotalPackets,
-		TotalTransmissions: &stats.TotalTransmissions,
-		TotalObservations:  stats.TotalObservations,
-		TotalNodes:         stats.TotalNodes,
-		TotalNodesAllTime:  stats.TotalNodesAllTime,
-		TotalObservers:     stats.TotalObservers,
-		PacketsLastHour:    stats.PacketsLastHour,
-		PacketsLast24h:     stats.PacketsLast24h,
-		Engine:             "go",
-		Version:            s.version,
-		Commit:             s.commit,
-		BuildTime:          s.buildTime,
-		Counts: RoleCounts{
-			Repeaters:  counts["repeaters"],
-			Rooms:      counts["rooms"],
-			Companions: counts["companions"],
-			Sensors:    counts["sensors"],
-		},
-		SignatureDrops:        s.db.GetSignatureDropCount(),
-		HashMigrationComplete: s.store != nil && s.store.hashMigrationComplete.Load(),
-
-		TrackedMB:     mem.StoreDataMB, // deprecated alias
-		StoreDataMB:   mem.StoreDataMB,
-		ProcessRSSMB:  mem.ProcessRSSMB,
-		GoHeapInuseMB: mem.GoHeapInuseMB,
-		GoSysMB:       mem.GoSysMB,
-
-		NeighborGraphCacheRebuildFailures: atomic.LoadUint64(&s.neighborGraphCacheRebuildFailures),
-	}
-
-	s.statsMu.Lock()
-	s.statsCache = resp
-	s.statsCachedAt = time.Now()
-	s.statsMu.Unlock()
-
-	writeJSON(w, resp)
+	writeJSON(w, built.(*StatsResponse))
 }
 
 func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
@@ -1244,110 +1270,6 @@ func (s *Server) handleDecode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, DecodeResponse{
-		Decoded: map[string]interface{}{
-			"header":  decoded.Header,
-			"path":    decoded.Path,
-			"payload": decoded.Payload,
-		},
-	})
-}
-
-func (s *Server) handlePostPacket(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Hex      string   `json:"hex"`
-		Observer *string  `json:"observer"`
-		Snr      *float64 `json:"snr"`
-		Rssi     *float64 `json:"rssi"`
-		Region   *string  `json:"region"`
-		Hash     *string  `json:"hash"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, 400, "invalid JSON body")
-		return
-	}
-	hexStr := strings.TrimSpace(body.Hex)
-	if hexStr == "" {
-		writeError(w, 400, "hex is required")
-		return
-	}
-	decoded, err := DecodePacket(hexStr, false)
-	if err != nil {
-		writeError(w, 400, err.Error())
-		return
-	}
-
-	contentHash := ComputeContentHash(hexStr)
-	pathJSON := "[]"
-	// For TRACE packets, path_json must be the payload-decoded route hops
-	// (decoded.Path.Hops), NOT the raw_hex header bytes which are SNR values.
-	// For all other packet types, derive path from raw_hex (#886).
-	if !packetpath.PathBytesAreHops(byte(decoded.Header.PayloadType)) {
-		if len(decoded.Path.Hops) > 0 {
-			if pj, e := json.Marshal(decoded.Path.Hops); e == nil {
-				pathJSON = string(pj)
-			}
-		}
-	} else if hops, err := packetpath.DecodePathFromRawHex(hexStr); err == nil && len(hops) > 0 {
-		if pj, e := json.Marshal(hops); e == nil {
-			pathJSON = string(pj)
-		}
-	}
-	decodedJSON := PayloadJSON(&decoded.Payload)
-	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	nowEpoch := time.Now().Unix()
-
-	var snr, rssi interface{}
-	if body.Snr != nil {
-		snr = *body.Snr
-	}
-	if body.Rssi != nil {
-		rssi = *body.Rssi
-	}
-
-	// v3 schema (cmd/ingestor/db.go:251-303): transmissions no longer carries
-	// path_json (it lives on observations now), observations uses observer_idx
-	// INTEGER (FK observers.rowid) and timestamp INTEGER (unix epoch).
-	// Fix for #1196 — pre-fix code wrote v2 column names and silently
-	// swallowed the observations insert error.
-	res, dbErr := s.db.conn.Exec(`INSERT INTO transmissions (hash, raw_hex, route_type, payload_type, payload_version, decoded_json, first_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		contentHash, strings.ToUpper(hexStr), decoded.Header.RouteType, decoded.Header.PayloadType,
-		decoded.Header.PayloadVersion, decodedJSON, now)
-	if dbErr != nil {
-		writeError(w, 500, "transmission insert: "+dbErr.Error())
-		return
-	}
-	insertedID, _ := res.LastInsertId()
-
-	// Resolve observer string → observers.rowid. INSERT OR IGNORE then SELECT
-	// mirrors the ingestor's resolver (cmd/ingestor/db.go:778,799,906).
-	var observerIdx interface{}
-	if body.Observer != nil && *body.Observer != "" {
-		obsID := *body.Observer
-		if _, err := s.db.conn.Exec(
-			`INSERT OR IGNORE INTO observers (id, name, last_seen, first_seen) VALUES (?, ?, ?, ?)`,
-			obsID, obsID, now, now); err != nil {
-			writeError(w, 500, "observer upsert: "+err.Error())
-			return
-		}
-		var rowid int64
-		if err := s.db.conn.QueryRow(`SELECT rowid FROM observers WHERE id = ?`, obsID).Scan(&rowid); err != nil {
-			writeError(w, 500, "observer lookup: "+err.Error())
-			return
-		}
-		observerIdx = rowid
-	}
-
-	if _, obsErr := s.db.conn.Exec(
-		`INSERT INTO observations (transmission_id, observer_idx, snr, rssi, path_json, timestamp)
-			VALUES (?, ?, ?, ?, ?, ?)`,
-		insertedID, observerIdx, snr, rssi, pathJSON, nowEpoch); obsErr != nil {
-		writeError(w, 500, "observation insert: "+obsErr.Error())
-		return
-	}
-
-	writeJSON(w, PacketIngestResponse{
-		ID: insertedID,
 		Decoded: map[string]interface{}{
 			"header":  decoded.Header,
 			"path":    decoded.Path,
@@ -3524,294 +3446,6 @@ func (s *Server) handleScopeStats(w http.ResponseWriter, r *http.Request) {
 	s.scopeStatsMu.Unlock()
 
 	writeJSON(w, resp)
-}
-
-// handleScopeAudit serves GET /api/scope-audit?window=1h|24h|7d: the
-// network-wide answer to "which repeaters declare a region they are not
-// actually forwarding". Unlike the per-repeater /api/nodes/{pubkey}/scopes,
-// this compares every repeater that has ever declared a region list in one
-// pass — see scopes.go's AllCurrentDeclaredRegions and ScopeAuditForwarding
-// for why that stays a single scan rather than one query per repeater.
-func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
-	window := r.URL.Query().Get("window")
-	if window == "" {
-		window = "24h"
-	}
-	lookback, ok := nodeScopesWindowLookback(window)
-	if !ok {
-		writeError(w, 400, "window must be 1h, 24h, or 7d")
-		return
-	}
-
-	sinceISO := time.Now().Add(-lookback).UTC().Format(time.RFC3339)
-
-	if cached, ok := s.scopeAuditCached(window); ok {
-		writeJSON(w, cached)
-		return
-	}
-
-	// singleflight: the compute below runs outside the cache mutex, so without
-	// this every request arriving on a cold window ran its own full scan
-	// concurrently. On the 7d window that scan is seconds of work over millions
-	// of hop rows, which is exactly the shape that makes a thundering herd
-	// expensive rather than merely wasteful. Same treatment /api/observers and
-	// /api/nodes/{pubkey}/reach already have.
-	v, err, _ := s.scopeAuditSF.Do(window, func() (interface{}, error) {
-		// The waiters that arrive while a scan is in flight are served by that
-		// scan's result; this second look is for the caller that acquires the
-		// group right after a winner stored one.
-		if cached, ok := s.scopeAuditCached(window); ok {
-			return cached, nil
-		}
-		resp, cErr := s.computeScopeAudit(window, sinceISO)
-		if cErr != nil {
-			return nil, cErr
-		}
-		s.scopeAuditStore(window, resp)
-		return resp, nil
-	})
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, v.(*ScopeAuditResponse))
-}
-
-// scopeAuditTTLFor is how long one window's computed audit stays fresh.
-//
-// 7d is not 30s because it does not cost what the others cost. Measured on the
-// live-shaped staging database on 2026-09-07: 16.7s cold for 7d against 4.0s
-// for 24h and 0.15s for 1h, and the 7d scan reads 3,470,188 hop rows. At a 30s
-// TTL a single reader with that window open keeps the instance recomputing more
-// than half the time, for an aggregate that moves at the pace of a week of
-// traffic. Five minutes of staleness on a seven-day window is not a fact the
-// reader can act on differently.
-func scopeAuditTTLFor(window string) time.Duration {
-	if window == "7d" {
-		return 5 * time.Minute
-	}
-	return 30 * time.Second
-}
-
-// scopeAuditCached returns the cached response for a window while it is within
-// that window's TTL.
-func (s *Server) scopeAuditCached(window string) (*ScopeAuditResponse, bool) {
-	s.scopeAuditMu.Lock()
-	defer s.scopeAuditMu.Unlock()
-	if s.scopeAuditCache == nil {
-		return nil, false
-	}
-	cached, ok := s.scopeAuditCache[window]
-	if !ok || time.Since(s.scopeAuditCachedAt[window]) >= scopeAuditTTLFor(window) {
-		return nil, false
-	}
-	return cached, true
-}
-
-// scopeAuditStore publishes a freshly computed response for a window.
-func (s *Server) scopeAuditStore(window string, resp *ScopeAuditResponse) {
-	s.scopeAuditMu.Lock()
-	defer s.scopeAuditMu.Unlock()
-	if s.scopeAuditCache == nil {
-		s.scopeAuditCache = make(map[string]*ScopeAuditResponse)
-		s.scopeAuditCachedAt = make(map[string]time.Time)
-	}
-	s.scopeAuditCache[window] = resp
-	s.scopeAuditCachedAt[window] = time.Now()
-}
-
-// computeScopeAudit builds one window's audit response: the declared lists, the
-// forwarding evidence attributed to them, and the declared-region verification
-// that settles which unnameable traffic corroborates a declaration. Split out
-// of the handler so the cache and its singleflight wrap a plain function
-// instead of a request.
-func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse, error) {
-	declared, err := s.db.AllCurrentDeclaredRegions()
-	if err != nil {
-		return nil, err
-	}
-
-	targets := make([]string, 0, len(declared))
-	for _, d := range declared {
-		targets = append(targets, strings.ToLower(d.Target))
-	}
-
-	forwarding := map[string]*scopeAuditTargetAgg{}
-	if s.store != nil {
-		forwarding, err = s.store.ScopeAuditForwarding(sinceISO, targets)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Declared-region verification (M1b): a region this instance holds no key
-	// for is unnameable, not absent, and the audit can settle which by deriving
-	// the key from the repeater's own declaration and testing it against that
-	// repeater's own unnameable traffic. One verifier serves every row so each
-	// (region, transmission) pair is derived at most once — see scope_verify.go
-	// for why that memo is what keeps this affordable.
-	//
-	// A failure here degrades to "no verification" rather than failing the
-	// request: the audit was useful before this existed and must stay useful if
-	// the extra query errors.
-	var verifier *scopeVerifier
-	if s.store != nil {
-		unmatchedRows, truncated, uErr := s.store.unmatchedTransmissionsInWindow(sinceISO)
-		if uErr != nil {
-			log.Printf("[scope-audit] declared-region verification unavailable: %v", uErr)
-		} else {
-			if truncated {
-				// Said out loud rather than absorbed: past the cap a region can
-				// hold evidence this refresh did not look at, so a grey chip
-				// means "not corroborated in this sample", not "not forwarded".
-				log.Printf("[scope-audit] window %s holds more than %d unnameable packets; verification used the most recent %d and may under-report evidence",
-					window, scopeVerifyMaxWindowPackets, scopeVerifyMaxWindowPackets)
-			}
-			verifier = newScopeVerifier(unmatchedRows)
-		}
-	}
-
-	identities := s.db.scopeAuditNodeIdentities(targets)
-
-	resp := &ScopeAuditResponse{Window: window, Since: sinceISO, Repeaters: []ScopeAuditRow{}}
-	for _, d := range declared {
-		pk := strings.ToLower(d.Target)
-		if s.cfg != nil && s.cfg.IsBlacklisted(pk) {
-			continue
-		}
-		id := identities[pk]
-		// A target with no nodes row has no name to match a hidden-prefix rule
-		// against; it cannot be hidden by name, so only check when we have one.
-		if id.Name != nil && s.cfg != nil && s.cfg.IsNameHidden(*id.Name) {
-			continue
-		}
-
-		allRegions := splitRegionsCSV(d.RegionsCSV)
-		declaredWildcard := false
-		declaredNamed := make([]string, 0, len(allRegions))
-		declaredSet := make(map[string]bool, len(allRegions))
-		for _, rgn := range allRegions {
-			if rgn == "*" {
-				declaredWildcard = true
-				continue
-			}
-			// normScope mirrors the observed side (scopes.go: agg.scopes keys
-			// are already normScope'd) — regions_csv is not guaranteed to
-			// arrive with '#' already stripped in every case, and comparing
-			// raw here would reintroduce the exact trap normScope exists to
-			// prevent, just on the other side of the comparison.
-			rgn = normScope(rgn)
-			declaredNamed = append(declaredNamed, rgn)
-			declaredSet[rgn] = true
-		}
-
-		agg := forwarding[pk]
-
-		// Verify the declared regions this repeater has no NAMED evidence for,
-		// against its own unmatched traffic. Regions already observed by name
-		// need no verification and are not tested — that keeps the candidate
-		// set to exactly the open questions, which is also what keeps the
-		// verifier's work proportional to the problem rather than to the fleet.
-		unnamed := []string{}
-		for _, rgn := range declaredNamed {
-			if agg == nil || agg.scopes[rgn] == nil {
-				unnamed = append(unnamed, rgn)
-			}
-		}
-		regionEvidence := map[string]int{}
-		verifiedSet := map[string]bool{}
-		if verifier != nil && agg != nil && len(unnamed) > 0 {
-			// capVerifyRegions bounds the per-target half of the verifier's
-			// work. The declared list arrives from a companion app and its
-			// LENGTH is not validated anywhere on the way in, while each
-			// distinct name costs a full pass over the packet set.
-			regionEvidence = verifier.evidence(agg.unmatchedTxIDs, capVerifyRegions(unnamed))
-			for _, rgn := range verifier.verified(regionEvidence) {
-				verifiedSet[rgn] = true
-			}
-		}
-		notObserved := []string{}
-		for _, rgn := range unnamed {
-			if !verifiedSet[rgn] {
-				notObserved = append(notObserved, rgn)
-			}
-		}
-
-		undeclared := []ScopeObservation{}
-		if agg != nil {
-			names := make([]string, 0, len(agg.scopes))
-			for name := range agg.scopes {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			for _, name := range names {
-				if !declaredSet[name] {
-					undeclared = append(undeclared, *agg.scopes[name])
-				}
-			}
-		}
-
-		var unscopedPackets, ambiguousHops, unmatchedPackets, unmatchedSampled int64
-		if agg != nil {
-			unscopedPackets = agg.unscopedPackets
-			ambiguousHops = agg.ambiguousHops
-			unmatchedPackets = agg.unmatchedPackets
-			// What verification could actually see, against what was counted.
-			// The list is capped; the count is not.
-			unmatchedSampled = int64(len(agg.unmatchedTxIDs))
-		}
-
-		resp.Repeaters = append(resp.Repeaters, ScopeAuditRow{
-			PublicKey:                pk,
-			Name:                     id.Name,
-			Role:                     id.Role,
-			DeclaredRegions:          declaredNamed,
-			DeclaredWildcard:         declaredWildcard,
-			ConfigState:              scopeAuditConfigState(declaredNamed, declaredWildcard),
-			DeclaredAt:               d.ObservedAt,
-			Truncated:                d.Truncated,
-			NotObserved:              notObserved,
-			UndeclaredObserved:       undeclared,
-			ObservedUnscopedPackets:  unscopedPackets,
-			WildcardContradiction:    unscopedPackets > 0 && !declaredWildcard,
-			AmbiguousHops:            ambiguousHops,
-			ObservedUnmatchedPackets: unmatchedPackets,
-			ObservedUnmatchedSampled: unmatchedSampled,
-			RegionEvidence:           regionEvidence,
-		})
-	}
-
-	// Interesting rows first: a repeater silently not forwarding a declared
-	// region is the headline this endpoint exists to surface, ranked by how
-	// many declared regions it's missing. The wildcard contradiction and
-	// undeclared-observed counts are secondary tie-breaks — flags on the
-	// row, not a separate ranking. Full agreement (no issues at all) sorts
-	// to the bottom, alphabetically, so it doesn't crowd out the rows that
-	// matter.
-	sort.Slice(resp.Repeaters, func(i, j int) bool {
-		a, b := resp.Repeaters[i], resp.Repeaters[j]
-		if len(a.NotObserved) != len(b.NotObserved) {
-			return len(a.NotObserved) > len(b.NotObserved)
-		}
-		if a.WildcardContradiction != b.WildcardContradiction {
-			return a.WildcardContradiction
-		}
-		if len(a.UndeclaredObserved) != len(b.UndeclaredObserved) {
-			return len(a.UndeclaredObserved) > len(b.UndeclaredObserved)
-		}
-		// Fall back to the pubkey for an unnamed or unknown node so the order is
-		// still total and stable rather than grouping every nameless row together.
-		an, bn := a.PublicKey, b.PublicKey
-		if a.Name != nil && *a.Name != "" {
-			an = *a.Name
-		}
-		if b.Name != nil && *b.Name != "" {
-			bn = *b.Name
-		}
-		return an < bn
-	})
-
-	return resp, nil
 }
 
 // handlePruneGeoFilter identifies (dry_run=true, default) or enqueues (confirm=true)

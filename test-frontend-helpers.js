@@ -6895,6 +6895,78 @@ console.log('\n=== live.js: node-filter URL update preserves lat/lon/zoom (#1709
   });
 }
 
+// ===== roles.js: hashPrefixInfo =====
+// hash_size is evidence, not a default. A node the analyzer has heard no
+// countable advert from has none — rendering that as "1" invents a 1-byte
+// config. Guards the map against regressing to `node.hash_size || 1`.
+console.log('\n=== roles.js: hashPrefixInfo ===');
+{
+  const ctx = makeSandbox();
+  loadInCtx(ctx, 'public/roles.js');
+  const hashPrefixInfo = ctx.hashPrefixInfo;
+  const PK = 'aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899';
+
+  test('missing hash_size is not known', () => {
+    const r = hashPrefixInfo({ public_key: PK });
+    assert.strictEqual(r.known, false);
+  });
+
+  test('null hash_size is not known', () => {
+    assert.strictEqual(hashPrefixInfo({ public_key: PK, hash_size: null }).known, false);
+  });
+
+  test('unknown width still renders a 1-byte prefix to draw', () => {
+    const r = hashPrefixInfo({ public_key: PK, hash_size: null });
+    assert.strictEqual(r.bytes, 1);
+    assert.strictEqual(r.prefix, 'AA');
+  });
+
+  test('1-byte evidence is known', () => {
+    const r = hashPrefixInfo({ public_key: PK, hash_size: 1 });
+    assert.strictEqual(r.known, true);
+    assert.strictEqual(r.prefix, 'AA');
+  });
+
+  test('2-byte evidence widens the prefix', () => {
+    const r = hashPrefixInfo({ public_key: PK, hash_size: 2 });
+    assert.strictEqual(r.known, true);
+    assert.strictEqual(r.bytes, 2);
+    assert.strictEqual(r.prefix, 'AABB');
+  });
+
+  test('3-byte evidence widens the prefix', () => {
+    const r = hashPrefixInfo({ public_key: PK, hash_size: 3 });
+    assert.strictEqual(r.prefix, 'AABBCC');
+  });
+
+  test('hash_size 0 counts as unknown, not zero-width', () => {
+    const r = hashPrefixInfo({ public_key: PK, hash_size: 0 });
+    assert.strictEqual(r.known, false);
+    assert.strictEqual(r.prefix, 'AA');
+  });
+
+  test('missing public_key degrades to placeholder', () => {
+    assert.strictEqual(hashPrefixInfo({ hash_size: 2 }).prefix, '??');
+  });
+
+  test('null node does not throw', () => {
+    const r = hashPrefixInfo(null);
+    assert.strictEqual(r.known, false);
+    assert.strictEqual(r.prefix, '??');
+  });
+}
+
+// ===== map.js: no bare `hash_size || 1` =====
+console.log('\n=== map.js: hash size fallback ===');
+{
+  const mapSrc = fs.readFileSync(__dirname + '/public/map.js', 'utf8');
+
+  test('map.js does not default an unknown hash_size to 1', () => {
+    assert.ok(!/hash_size\s*\|\|\s*1/.test(mapSrc),
+      'map.js must go through hashPrefixInfo() — a bare `hash_size || 1` renders "unknown" as a measured 1 byte');
+  });
+}
+
 // ===== SUMMARY =====
 Promise.allSettled(pendingTests).then(() => {
   console.log(`\n${'═'.repeat(40)}`);
@@ -6964,6 +7036,156 @@ console.log('\n=== observers.js: healthStatus (configurable thresholds) ===');
     const r = runHealthStatus(null, null);
     assert.strictEqual(r.cls, 'health-red');
     assert.strictEqual(r.label, 'Unknown');
+  });
+}
+
+// ===== node-reach.js: scopeLineHtml (#1865) =====
+// The reach report states which region a node serves. Two claims that must
+// never be conflated: "Scope" is INFERRED from observed advert transport
+// scopes, "Configured scope" is CONFIRMED by reading it back off the node via
+// an observer /neighbors report. Asserting the rendered markup, not the source.
+console.log('\n=== node-reach.js: scopeLineHtml (#1865) ===');
+{
+  const ctx = makeSandbox();
+  ctx.registerPage = () => {};
+  loadInCtx(ctx, 'public/app.js');
+  loadInCtx(ctx, 'public/node-reach.js');
+  const scopeLineHtml = ctx.__meshcoreReachInternals.scopeLineHtml;
+
+  test('no scope data at all renders nothing', () => {
+    assert.strictEqual(scopeLineHtml({}), '');
+  });
+
+  test('inferred-only says "Scope" and marks it observed', () => {
+    const h = scopeLineHtml({ default_scope: '#be' });
+    assert.ok(h.includes('>Scope <'), 'should label it Scope');
+    assert.ok(h.includes('#be'), 'should show the value');
+    assert.ok(h.includes('observed'), 'should mark provenance as observed');
+    assert.ok(!h.includes('nq-scope-ok'), 'inferred data must not get the confirmed tick');
+  });
+
+  test('confirmed wins over inferred and gets the tick', () => {
+    const h = scopeLineHtml({ default_scope: '#be', configured_scope: '#be,#eu' });
+    assert.ok(h.includes('Configured scope'), 'should label it Configured scope');
+    assert.ok(h.includes('nq-scope-ok'), 'confirmed data gets the tick');
+    assert.ok(h.includes('#be,#eu'), 'should show the confirmed value');
+    assert.ok(!h.includes('>Scope <'), 'must not also render the inferred line');
+  });
+
+  test('confirmed-but-empty is a statement, not missing data', () => {
+    const h = scopeLineHtml({ configured_scope: '' });
+    assert.ok(h.includes('none configured'), 'empty confirmed value must render explicitly');
+    assert.ok(h.includes('nq-scope-ok'), 'it is still a confirmation');
+  });
+
+  test('empty confirmed value does not fall back to the inferred one', () => {
+    // A node that answered "I have no scopes" must not be shown its old
+    // inferred guess instead: that would silently contradict the node.
+    const h = scopeLineHtml({ default_scope: '#be', configured_scope: '' });
+    assert.ok(h.includes('none configured'));
+    assert.ok(!h.includes('#be'), 'inferred value must not leak back in');
+  });
+
+  test('confirmation instant is carried in the title, not the visible line', () => {
+    const h = scopeLineHtml({ configured_scope: '#dk', configured_scope_at: '2026-07-26T09:43:48Z' });
+    assert.ok(h.includes('2026-07-26T09:43:48Z'), 'timestamp should be present');
+    assert.ok(h.includes('title='), 'and it should live in a title attribute');
+  });
+
+  test('scope values are HTML-escaped', () => {
+    const h = scopeLineHtml({ configured_scope: '<img src=x onerror=alert(1)>' });
+    assert.ok(!h.includes('<img'), 'must not emit raw markup from node-controlled data');
+    assert.ok(h.includes('&lt;img'), 'should be escaped instead');
+  });
+}
+
+// ===== roles.js: getEffectiveHeardMs (#1845) =====
+// Extracted from getNodeStatus so the "silent longer than N" filter measures
+// the SAME freshness the Active/Stale badge does. Two definitions is how a node
+// ends up listed as silent for 10 days while its own badge says active.
+console.log('\n=== roles.js: getEffectiveHeardMs (#1845) ===');
+{
+  const ctx = makeSandbox();
+  loadInCtx(ctx, 'public/roles.js');
+  const eff = ctx.getEffectiveHeardMs;
+  const status = ctx.getNodeStatus;
+  const iso = ms => new Date(ms).toISOString();
+  const NOW = Date.now();
+
+  test('nothing known yields NaN, not 0', () => {
+    // 0 would read as "heard at the epoch", which is a real timestamp and would
+    // silently sort/compare as very old rather than as unknown.
+    assert.ok(Number.isNaN(eff({ role: 'repeater' })));
+  });
+
+  test('non-object input yields NaN', () => {
+    assert.ok(Number.isNaN(eff(null)));
+    assert.ok(Number.isNaN(eff('repeater')));
+  });
+
+  test('precedence: _liveSeen beats every stored timestamp', () => {
+    const r = eff({ role: 'companion', _liveSeen: NOW, _lastHeard: iso(NOW - 9e6), last_seen: iso(NOW - 9e7) });
+    assert.strictEqual(r, NOW);
+  });
+
+  test('precedence: _lastHeard beats last_heard and last_seen', () => {
+    const r = eff({ role: 'companion', _lastHeard: iso(NOW - 1000), last_heard: iso(NOW - 9e6), last_seen: iso(NOW - 9e7) });
+    assert.strictEqual(r, new Date(iso(NOW - 1000)).getTime());
+  });
+
+  test('infra: a recent relay beats a stale advert', () => {
+    const r = eff({ role: 'repeater', last_seen: iso(NOW - 9e7), last_relayed: iso(NOW - 1000) });
+    assert.strictEqual(r, new Date(iso(NOW - 1000)).getTime());
+  });
+
+  test('infra: a stale relay does NOT drag a fresh advert backwards', () => {
+    const fresh = iso(NOW - 1000);
+    const r = eff({ role: 'repeater', last_seen: fresh, last_relayed: iso(NOW - 9e7) });
+    assert.strictEqual(r, new Date(fresh).getTime());
+  });
+
+  test('infra: relay alone is enough when nothing else is known', () => {
+    const r = eff({ role: 'repeater', last_relayed: iso(NOW - 1000) });
+    assert.strictEqual(r, new Date(iso(NOW - 1000)).getTime());
+  });
+
+  test('room counts as infra, companion does not', () => {
+    const relayed = iso(NOW - 1000), old = iso(NOW - 9e7);
+    assert.strictEqual(eff({ role: 'room', last_seen: old, last_relayed: relayed }), new Date(relayed).getTime());
+    // A companion is not a relay, so last_relayed on one is meaningless and
+    // must not silently rescue it.
+    assert.strictEqual(eff({ role: 'companion', last_seen: old, last_relayed: relayed }), new Date(old).getTime());
+  });
+
+  test('role matching is case-insensitive', () => {
+    const relayed = iso(NOW - 1000);
+    assert.strictEqual(eff({ role: 'Repeater', last_seen: iso(NOW - 9e7), last_relayed: relayed }), new Date(relayed).getTime());
+  });
+
+  // Regression: getNodeStatus was rewritten to call this helper. Its contract
+  // must be unchanged, including the legacy (role, ms) call shape.
+  test('getNodeStatus still honours the legacy two-argument form', () => {
+    assert.strictEqual(status('repeater', NOW), 'active');
+    assert.strictEqual(status('repeater', NOW - 4 * 86400000), 'stale');
+  });
+
+  test('getNodeStatus is still relay-aware for infra', () => {
+    assert.strictEqual(status({ role: 'repeater', last_seen: iso(NOW - 9e7), last_relayed: iso(NOW - 1000) }), 'active');
+  });
+
+  test('getNodeStatus still marks a truly silent repeater stale', () => {
+    // Past infraSilentMs (72h). 9e7 ms is only 25h, which is correctly ACTIVE
+    // for infra and would make this assertion test nothing.
+    assert.strictEqual(status({ role: 'repeater', last_seen: iso(NOW - 4 * 86400000) }), 'stale');
+  });
+
+  test('72h is the infra boundary: 71h active, 73h stale', () => {
+    assert.strictEqual(status({ role: 'repeater', last_seen: iso(NOW - 71 * 3600000) }), 'active');
+    assert.strictEqual(status({ role: 'repeater', last_seen: iso(NOW - 73 * 3600000) }), 'stale');
+  });
+
+  test('getNodeStatus treats an unknown node as stale, not active', () => {
+    assert.strictEqual(status({ role: 'repeater' }), 'stale');
   });
 }
 
@@ -7198,7 +7420,7 @@ console.log('\n=== scope-audit.js: emptyStateHtml ===');
 
   test('links to both so the reader can act on it', () => {
     assert.ok(empty.includes('observer.gessaman.com'), 'observer firmware link');
-    // Upstream links the repo, this fork links its own hosted instance.
+    // Upstream links the repo; a fork may link its own hosted instance.
     assert.ok(/rx\.on8ar\.eu|coredrive-rx/.test(empty), 'companion app link');
   });
 

@@ -453,23 +453,36 @@
   // default trajectory is 47h flood adverts), so an actively-relaying
   // backbone repeater must not be marked stale just because its last
   // ADVERT is old.
+  // #1845: the single definition of "how recently did we hear from this node",
+  // extracted from getNodeStatus so a caller that needs the AGE gets the same
+  // answer as the caller that needs the STATUS. Before this, nodes.js carried
+  // two notions: getNodeStatus (relay-aware) and a local statusAge computed
+  // from the advert timestamp alone. They disagreed for exactly the nodes
+  // #1598 exists to protect. Returns NaN when nothing is known.
+  window.getEffectiveHeardMs = function (n) {
+    if (!n || typeof n !== 'object') return NaN;
+    var role = String(n.role || 'companion').toLowerCase();
+    // Freshness precedence mirrors the existing call sites:
+    // _liveSeen (live view, ms) > _lastHeard (health API) >
+    // last_heard (in-memory packets) > last_seen (DB, ADVERT).
+    var seenTime = n._lastHeard || n.last_heard || n.last_seen;
+    var effectiveMs = (typeof n._liveSeen === 'number' && n._liveSeen) ||
+                      (seenTime ? new Date(seenTime).getTime() : NaN);
+    // #1598: an infra node that forwards traffic is alive even when its last
+    // ADVERT is old, which operators increasingly cause on purpose (the
+    // firmware default flood advert interval moved to 47h).
+    if ((role === 'repeater' || role === 'room') && n.last_relayed) {
+      var relayedMs = new Date(n.last_relayed).getTime();
+      if (!(effectiveMs >= relayedMs)) effectiveMs = relayedMs;
+    }
+    return effectiveMs;
+  };
+
   window.getNodeStatus = function (roleOrNode, lastSeenMs) {
     var role, effectiveMs;
     if (roleOrNode && typeof roleOrNode === 'object') {
-      var n = roleOrNode;
-      role = n.role || 'companion';
-      // Freshness precedence mirrors the existing call sites:
-      // _liveSeen (live view, ms) > _lastHeard (health API) >
-      // last_heard (in-memory packets) > last_seen (DB, ADVERT).
-      var seenTime = n._lastHeard || n.last_heard || n.last_seen;
-      effectiveMs = (typeof n._liveSeen === 'number' && n._liveSeen) ||
-                    (seenTime ? new Date(seenTime).getTime() : NaN);
-      var infra = String(role).toLowerCase() === 'repeater' ||
-                  String(role).toLowerCase() === 'room';
-      if (infra && n.last_relayed) {
-        var relayedMs = new Date(n.last_relayed).getTime();
-        if (!(effectiveMs >= relayedMs)) effectiveMs = relayedMs;
-      }
+      role = roleOrNode.role || 'companion';
+      effectiveMs = window.getEffectiveHeardMs(roleOrNode);
       if (isNaN(effectiveMs)) effectiveMs = undefined;
     } else {
       role = roleOrNode;
@@ -949,6 +962,32 @@
   window.observerSkewSeverity = function(offsetSec) {
     var abs = Math.abs(offsetSec);
     return abs >= 3600 ? 'critical' : abs >= 300 ? 'warning' : 'ok';
+  };
+
+  /**
+   * Hash prefix for display. `hash_size` is EVIDENCE, not a default: it is set
+   * only from adverts the analyzer could actually read a size out of, so a node
+   * that has not advertised in the retention window has no value at all. Reading
+   * that absence as "1" claims a 1-byte configuration nobody observed — and the
+   * 1-byte bucket is exactly where a node is most likely to be miscounted.
+   *
+   * nodes.js (detail: "Unknown") and analytics.js ("?B") already treat it that
+   * way; this helper is the shared version so the map can too.
+   *
+   * @returns {{known: boolean, bytes: number, prefix: string}} `bytes` is the
+   * rendering width — the real evidence when known, a 1-byte fallback when not,
+   * in which case `known` is false and callers must not print it as a size.
+   */
+  window.hashPrefixInfo = function (node) {
+    var raw = node ? node.hash_size : null;
+    var known = raw != null && Number(raw) > 0;
+    var bytes = known ? Number(raw) : 1;
+    var pk = (node && node.public_key) || '';
+    return {
+      known: known,
+      bytes: bytes,
+      prefix: pk ? pk.slice(0, bytes * 2).toUpperCase() : '??',
+    };
   };
 
   /** Render a skew sparkline SVG (inline, word-sized) */

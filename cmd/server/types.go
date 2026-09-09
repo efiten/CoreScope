@@ -158,6 +158,13 @@ type PerfCacheStats struct {
 
 type WebSocketStatsResp struct {
 	Clients int `json:"clients"`
+	// #1794: upgrade rejections since boot, split by cause so an operator can
+	// tell a deny-list hit from a client that is merely reconnecting too fast.
+	// omitempty: an install with no limits configured sends none of these
+	// rather than three permanent zeroes.
+	RejectedDeny    int64 `json:"rejectedDeny,omitempty"`
+	RejectedRate    int64 `json:"rejectedRate,omitempty"`
+	RejectedConnCap int64 `json:"rejectedConnCap,omitempty"`
 }
 
 type HealthPacketStoreStats struct {
@@ -386,11 +393,6 @@ type PacketDetailResponse struct {
 	Path             []interface{}     `json:"path"`
 	ObservationCount int               `json:"observation_count"`
 	Observations     []ObservationResp `json:"observations,omitempty"`
-}
-
-type PacketIngestResponse struct {
-	ID      int64       `json:"id"`
-	Decoded interface{} `json:"decoded"`
 }
 
 type DecodeResponse struct {

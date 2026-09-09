@@ -82,8 +82,31 @@
   }
   let lastHeard = localStorage.getItem('meshcore-nodes-last-heard') || '';
   let statusFilter = localStorage.getItem('meshcore-nodes-status-filter') || 'all';
+  // #1845: "silent longer than N", the inverse of the Last Heard filter. Empty
+  // means off. Ages are relay-aware (getEffectiveHeardMs), so a repeater that
+  // forwards traffic is never counted as silent just because its ADVERT is old.
+  let silentFor = localStorage.getItem('meshcore-nodes-silent-for') || '';
+  const SILENT_MS = { '1d': 86400000, '3d': 259200000, '7d': 604800000, '14d': 1209600000, '30d': 2592000000 };
+  let _silentCounts = null;
   let wsHandler = null;
   let detailMap = null;
+  let detailMapResizeTimer = null;
+
+  function removeDetailMap(owner) {
+    // Async responses may still hold a detached view while another map is active.
+    if (owner && detailMap && !owner.contains(detailMap.getContainer())) return;
+    clearTimeout(detailMapResizeTimer);
+    detailMapResizeTimer = null;
+    if (detailMap) { detailMap.remove(); detailMap = null; }
+  }
+
+  function resizeDetailMapAfterLayout() {
+    const map = detailMap;
+    detailMapResizeTimer = setTimeout(() => {
+      detailMapResizeTimer = null;
+      map.invalidateSize();
+    }, 100);
+  }
 
   // #1461 followup: node-detail inset map tile layer that honors the
   // customizer dark-tile-provider pick (#1420/#1430). Falls back to
@@ -180,6 +203,15 @@
       return 'Stale \u2014 not heard for over ' + threshold + '. This sensor may be offline.';
     }
     return 'Stale \u2014 not heard for over ' + threshold + '. This ' + role + ' may be offline or out of range.';
+  }
+
+  // #1845: how long we have heard nothing at all from this node. Infinity when
+  // we have never heard it, which must count as silent for every window rather
+  // than dropping out of the filter. Uses the shared relay-aware definition so
+  // this agrees with the Active/Stale badge instead of contradicting it.
+  function silenceAgeMs(n) {
+    const ms = (typeof window.getEffectiveHeardMs === 'function') ? window.getEffectiveHeardMs(n) : NaN;
+    return (typeof ms === 'number' && !isNaN(ms) && ms > 0) ? (Date.now() - ms) : Infinity;
   }
 
   function getStatusInfo(n) {
@@ -497,6 +529,9 @@
     const _urlSearch = _listUrlParams.get('search');
     if (_urlTab && TABS.some(function(t) { return t.key === _urlTab; })) activeTab = _urlTab;
     if (_urlSearch) search = _urlSearch;
+    // #1845: shareable — "here are the repeaters silent over a week".
+    const _urlSilent = _listUrlParams.get('silent');
+    if (_urlSilent !== null) silentFor = SILENT_MS[_urlSilent] ? _urlSilent : '';
     // #749 — restore sort from URL (overrides localStorage persistence).
     var _urlSort = _listUrlParams.get('sort');
     if (_urlSort && window.URLState) {
@@ -630,6 +665,7 @@
       const dupKeys = n.name && dupMap[n.name.toLowerCase()] ? dupMap[n.name.toLowerCase()].filter(function(k) { return k !== n.public_key; }) : [];
       const dupSection = dupKeys.length ? '<div class="dup-also-known" style="font-size:11px;color:var(--text-muted);margin-top:4px">Also known as: ' + dupKeys.map(function(k) { return '<a href="#/nodes/' + encodeURIComponent(k) + '" class="mono" style="font-size:11px">' + escapeHtml(k.slice(0, 12)) + '…</a>'; }).join(', ') + '</div>' : '';
 
+      removeDetailMap(body);
       body.innerHTML = `
         <div class="node-full-card" style="padding:12px 16px;margin-bottom:8px">
           <div class="node-detail-name" style="font-size:20px" ${locodeAttr(n.name)}>${escapeHtml(n.name || '(unnamed)')}${dupBadge}</div>
@@ -699,10 +735,10 @@
             return `<tr id="row-bridge-score" data-bridge-score="${b.toFixed(4)}"><td title="${btooltip}">Bridge score <span style="color:var(--text-muted);cursor:help" aria-label="help">ⓘ</span></td><td><span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary,#333);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${bbarWidth}%;height:100%;background:${bcolor}"></span></span><span style="color:${bcolor};font-weight:600">${bpct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${blabel}</span></td></tr>`;
           })() : ''}
           ${(n.role === 'repeater' || n.role === 'room') && Array.isArray(n.transported_scopes) && n.transported_scopes.length ? `<tr id="row-transported-scopes"><td title="Distinct region scopes (transmissions.scope_name) of the non-advert packets whose path names this repeater by its full pubkey. Shows which regions' traffic it has carried (#1751). Packets that only carry a 1-byte hop are excluded: that byte is shared by every node with the same pubkey prefix, so it cannot say which of them relayed (#1902).">Transported scopes</td><td><span style="display:inline-flex;flex-wrap:wrap;gap:3px;vertical-align:middle">${n.transported_scopes.map(sc => '<span class="badge">' + escapeHtml(String(sc)) + '</span>').join('')}</span></td></tr>` : ''}
+          ${'configured_scope' in n && n.configured_scope !== null ? `<tr id="row-configured-scope"><td title="Region scopes this node has CONFIGURED, confirmed via an observer /neighbors report (status=responded) — concrete evidence, distinct from observed default scope and transported scopes (#1865).${n.configured_scope_at ? ' Last confirmed ' + escapeHtml(String(n.configured_scope_at)) + '.' : ''}">Configured scope <span style="color:var(--status-green,#2ecc71)" aria-label="confirmed">✓</span></td><td>${n.configured_scope === '' ? '<span style="color:var(--text-muted)">none configured</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.configured_scope)}</code>`}</td></tr>` : ''}
           <tr><td>First Seen</td><td>${renderNodeTimestampHtml(n.first_seen)}</td></tr>
           <tr><td>Total Packets</td><td>${stats.totalTransmissions || stats.totalPackets || n.advert_count || 0}${stats.totalObservations && stats.totalObservations !== (stats.totalTransmissions || stats.totalPackets) ? ' <span class="text-muted" style="font-size:0.85em">(seen ' + stats.totalObservations + '×)</span>' : ''}</td></tr>
           <tr><td>Packets Today</td><td>${stats.packetsToday || 0}</td></tr>
-          ${stats.avgSnr != null ? `<tr><td>Avg SNR</td><td>${Number(stats.avgSnr).toFixed(1)} dB</td></tr>` : ''}
           ${stats.avgHops ? `<tr><td>Avg Hops</td><td>${stats.avgHops}</td></tr>` : ''}
           ${hasLoc ? `<tr><td>Location</td><td>${Number(n.lat).toFixed(5)}, ${Number(n.lon).toFixed(5)}</td></tr>` : ''}
           <tr><td>Hash Prefix</td><td>${n.hash_size ? '<code style="font-family:var(--mono);font-weight:700">' + n.public_key.slice(0, n.hash_size * 2).toUpperCase() + '</code> (' + n.hash_size + '-byte)' : 'Unknown'}${n.hash_size_inconsistent ? ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + (Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : []).join(', ') + '-byte"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> varies</span>' : ''}</td></tr>
@@ -789,11 +825,10 @@
       // Map
       if (hasLoc) {
         try {
-          if (detailMap) { detailMap.remove(); detailMap = null; }
           detailMap = L.map('nodeFullMap', { zoomControl: true, attributionControl: false }).setView([n.lat, n.lon], 13);
           _applyTilesToNodeMap(detailMap);
           L.marker([n.lat, n.lon]).addTo(detailMap).bindPopup(escapeHtml(n.name || n.public_key.slice(0, 12)));
-          setTimeout(() => detailMap.invalidateSize(), 100);
+          resizeDetailMapAfterLayout();
         } catch {}
       }
 
@@ -970,17 +1005,18 @@
         }
         document.querySelector('#fullPathsSection h4').textContent = `Paths Through This Node (${pathData.totalPaths} unique, ${pathData.totalTransmissions} transmissions)`;
         const COLLAPSE_LIMIT = 10;
+        const currentPubkey = n.public_key.toLowerCase();
         function renderPaths(paths) {
           return paths.map(p => {
             const chain = p.hops.map(h => {
-              const isThis = h.pubkey === n.public_key;
+              const isThis = h.pubkey && h.pubkey.toLowerCase() === currentPubkey;
               if (window.HopDisplay) {
                 const entry = { name: h.name, pubkey: h.pubkey, ambiguous: h.ambiguous, conflicts: h.conflicts, totalGlobal: h.totalGlobal, totalRegional: h.totalRegional, globalFallback: h.globalFallback, unreliable: h.unreliable };
                 const html = HopDisplay.renderHop(h.prefix, entry);
                 return isThis ? html.replace('class="', 'class="hop-current ') : html;
               }
               const name = escapeHtml(h.name || h.prefix);
-              const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}" style="${isThis ? 'font-weight:700;color:var(--link-color, #3b82f6)' : ''}">${name}</a>` : `<span>${name}</span>`;
+              const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}"${isThis ? ' class="hop-current"' : ''}>${name}</a>` : `<span>${name}</span>`;
               return link;
             }).join(' → ');
             return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
@@ -1020,6 +1056,7 @@
       const detail = is404
         ? 'No node matched the requested public key on this instance. It may exist on another deployment, or it may have been evicted/blacklisted here.'
         : 'The node detail API call failed: ' + escapeHtml(msg);
+      removeDetailMap(body);
       body.innerHTML =
         '<div class="node-full-card" style="padding:24px;margin:16px auto;max-width:560px;text-align:center">' +
           '<div style="font-size:18px;font-weight:600;margin-bottom:8px">' + headline + '</div>' +
@@ -1044,7 +1081,7 @@
   function destroy() {
     if (wsHandler) offWS(wsHandler);
     wsHandler = null;
-    if (detailMap) { detailMap.remove(); detailMap = null; }
+    removeDetailMap();
     if (regionChangeHandler) RegionFilter.offChange(regionChangeHandler);
     regionChangeHandler = null;
     nodes = [];
@@ -1265,6 +1302,16 @@
       if (statusFilter === 'active' || statusFilter === 'stale') {
         filtered = filtered.filter(n => getNodeStatus(n) === statusFilter); // #1598
       }
+      // #1845: counts are taken BEFORE the silence filter is applied, so the
+      // dropdown keeps showing what each other window would select instead of
+      // collapsing to the one already chosen.
+      _silentCounts = {};
+      for (const k of Object.keys(SILENT_MS)) {
+        _silentCounts[k] = filtered.filter(n => silenceAgeMs(n) >= SILENT_MS[k]).length;
+      }
+      if (silentFor && SILENT_MS[silentFor]) {
+        filtered = filtered.filter(n => silenceAgeMs(n) >= SILENT_MS[silentFor]);
+      }
       nodes = filtered;
 
       // Defensive filter: hide nodes with obviously corrupted data
@@ -1355,6 +1402,10 @@
             <option value="14d" ${lastHeard==='14d'?'selected':''}>14 days</option>
             <option value="30d" ${lastHeard==='30d'?'selected':''}>30 days</option>
           </select>
+          <select id="nodeSilentFor" aria-label="Show only nodes silent longer than">
+            <option value="">Silent for: Any</option>
+            ${['1d','3d','7d','14d','30d'].map(k => `<option value="${k}" ${silentFor===k?'selected':''}>over ${k}${_silentCounts ? ` (${_silentCounts[k]})` : ''}</option>`).join('')}
+          </select>
         </div>
       </div>
       <div class="table-fluid-wrap"><table class="data-table" id="nodesTable">
@@ -1379,6 +1430,20 @@
 
     // Filter changes
     document.getElementById('nodeLastHeard').addEventListener('change', e => { lastHeard = e.target.value; localStorage.setItem('meshcore-nodes-last-heard', lastHeard); loadNodes(); });
+    // #1845: mirrors the Last Heard handler, and additionally keeps the URL in
+    // step so the current view can be pasted to whoever owns the silent gear.
+    document.getElementById('nodeSilentFor').addEventListener('change', e => {
+      silentFor = e.target.value;
+      localStorage.setItem('meshcore-nodes-silent-for', silentFor);
+      try {
+        const base = String(location.hash || '#/nodes').split('?')[0];
+        const params = getHashParams();
+        if (silentFor) { params.set('silent', silentFor); } else { params.delete('silent'); }
+        const qs = params.toString();
+        history.replaceState(null, '', base + (qs ? '?' + qs : ''));
+      } catch (err) { /* URL sync is a convenience; never block the filter on it */ }
+      loadNodes();
+    });
 
     // Status filter buttons
     document.querySelectorAll('#nodeStatusFilter .btn').forEach(btn => {
@@ -1422,6 +1487,7 @@
       if (e.key === 'Escape') {
         const panel = document.getElementById('nodesRight');
         if (panel && !panel.classList.contains('empty')) {
+          removeDetailMap();
           panel.classList.add('empty');
           panel.innerHTML = '<span>Select a node to view details</span>';
           selectedKey = null;
@@ -1448,6 +1514,7 @@
       }
       if (e.target.closest('.panel-close-btn')) {
         const panel = document.getElementById('nodesRight');
+        removeDetailMap();
         panel.classList.add('empty');
         panel.innerHTML = '<span>Select a node to view details</span>';
         selectedKey = null;
@@ -1599,12 +1666,15 @@
     renderRows();
     const panel = document.getElementById('nodesRight');
     panel.classList.remove('empty');
+    removeDetailMap();
     panel.innerHTML = '<div class="text-center text-muted" style="padding:40px">Loading…</div>';
 
     try {
       const data = await fetchNodeDetail(pubkey);
+      if (selectedKey !== pubkey || !panel.isConnected) return;
       renderDetail(panel, data);
     } catch (e) {
+      if (selectedKey !== pubkey || !panel.isConnected) return;
       panel.innerHTML = `<div class="text-muted">Error: ${e.message}</div>`;
     }
   }
@@ -1629,6 +1699,7 @@
     const dupMap = buildDupNameMap(_allNodes);
     const dupBadge = dupNameBadge(n.name, n.public_key, dupMap);
 
+    removeDetailMap(panel);
     panel.innerHTML = `
       <button class="panel-close-btn" title="Close detail pane (Esc)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>
       <div class="node-detail">
@@ -1656,7 +1727,6 @@
             <dt>First Seen</dt><dd>${renderNodeTimestampHtml(n.first_seen)}</dd>
             <dt>Total Packets</dt><dd>${totalPackets}</dd>
             <dt>Packets Today</dt><dd>${stats.packetsToday || 0}</dd>
-            ${stats.avgSnr != null ? `<dt>Avg SNR</dt><dd>${Number(stats.avgSnr).toFixed(1)} dB</dd>` : ''}
             ${stats.avgHops ? `<dt>Avg Hops</dt><dd>${stats.avgHops}</dd>` : ''}
             ${hasLoc ? `<dt>Location</dt><dd>${Number(n.lat).toFixed(5)}, ${Number(n.lon).toFixed(5)}</dd>` : ''}
           </dl>
@@ -1720,11 +1790,10 @@
     // Init map
     if (hasLoc) {
       try {
-        if (detailMap) { detailMap.remove(); detailMap = null; }
         detailMap = L.map('nodeMap', { zoomControl: false, attributionControl: false }).setView([n.lat, n.lon], 13);
         _applyTilesToNodeMap(detailMap);
         L.marker([n.lat, n.lon]).addTo(detailMap).bindPopup(escapeHtml(n.name || n.public_key.slice(0, 12)));
-        setTimeout(() => detailMap.invalidateSize(), 100);
+        resizeDetailMapAfterLayout();
       } catch {}
     }
 
@@ -1788,12 +1857,13 @@
       document.querySelector('#pathsSection h4').textContent = `Paths Through This Node (${pathData.totalPaths} unique path${pathData.totalPaths !== 1 ? 's' : ''}, ${pathData.totalTransmissions} transmissions)`;
       const COLLAPSE_LIMIT = 10;
       const showAll = pathData.paths.length <= COLLAPSE_LIMIT;
+      const currentPubkey = n.public_key.toLowerCase();
       function renderPaths(paths) {
         return paths.map(p => {
           const chain = p.hops.map(h => {
-            const isThis = h.pubkey === n.public_key;
+            const isThis = h.pubkey && h.pubkey.toLowerCase() === currentPubkey;
             const name = escapeHtml(h.name || h.prefix);
-            const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}" style="${isThis ? 'font-weight:700;color:var(--link-color, #3b82f6)' : ''}">${name}</a>` : `<span>${name}</span>`;
+            const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}"${isThis ? ' class="hop-current"' : ''}>${name}</a>` : `<span>${name}</span>`;
             return link;
           }).join(' → ');
           return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
