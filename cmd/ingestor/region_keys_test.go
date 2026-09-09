@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -481,5 +482,75 @@ func BenchmarkScopeMatch(b *testing.B) {
 				_ = snap.match(5, payload, code)
 			}
 		})
+	}
+}
+
+// TestRegionKeySetConcurrentRefreshAndMatch drives the shape the type exists
+// for and that nothing else in this suite produces: ingest goroutines naming
+// packets while the refresh ticker swaps the key set underneath them.
+//
+// It is written for `go test -race`. Run without it, it asserts only that the
+// explicit tier keeps naming its packet across 200 swaps, which is worth
+// little; run with it, the detector sees every unsynchronised read of the
+// snapshot that a real refresh would expose. Until this existed, a race run of
+// this package proved nothing about regionKeySet, because refreshDerived and
+// match were never called concurrently anywhere in it — the absence of a
+// finding was the absence of an experiment.
+//
+// The final assertion holds regardless of what the churn derives: a derived key
+// colliding with #be on this payload resolves to the explicit key by tier 2,
+// and #be is the only explicit key here, so there is no second explicit
+// candidate that could make the answer ambiguous.
+func TestRegionKeySetConcurrentRefreshAndMatch(t *testing.T) {
+	const explicitName = "#be"
+	payload := []byte{0x11, 0x22, 0x33, 0x44}
+	code1 := codeFor(explicitName, 5, payload)
+
+	set := newRegionKeySet(&Config{
+		HashRegions:    []string{explicitName},
+		AutoRegionKeys: &AutoRegionKeysConfig{Enabled: true},
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// snapshot() then match() is exactly the ingest hot path:
+				// one atomic load, then reads of the maps it points at.
+				if got := set.snapshot().match(5, payload, code1); got.Name != explicitName && got.Reason != scopeReasonAmbiguous {
+					// Reported rather than fataled: t.Fatalf from a
+					// non-test goroutine is undefined behaviour.
+					t.Errorf("match during refresh returned %q (%s), want %q", got.Name, got.Reason, explicitName)
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(stop)
+		for i := 0; i < 200; i++ {
+			// A different derived set each time, so every iteration really
+			// builds and swaps a new snapshot rather than reusing one.
+			set.refreshDerived([]string{fmt.Sprintf("r%03d", i%7), fmt.Sprintf("q%03d", i)})
+		}
+	}()
+
+	wg.Wait()
+
+	if got := set.snapshot().match(5, payload, code1); got.Name != explicitName {
+		t.Errorf("after 200 refreshes match = %q (%s), want %q — the explicit tier must survive every swap",
+			got.Name, got.Reason, explicitName)
 	}
 }
