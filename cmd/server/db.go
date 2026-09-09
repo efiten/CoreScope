@@ -42,9 +42,10 @@ type DB struct {
 	hasObsRawHex            bool   // observations table has raw_hex column (#881)
 	hasScopeName            bool   // transmissions.scope_name column exists (#899)
 	hasDefaultScope         bool   // nodes.default_scope column exists (#899)
+	hasConfiguredScope      bool   // nodes.configured_scope column exists (#1865)
+	hasDeclaredRegionsTable bool   // node_declared_regions table exists (#1975, optional second scope source)
 	hasMultibyteSupCols     bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
 	hasLastSeen             bool   // transmissions.last_seen column exists (#1690)
-	hasDeclaredRegionsTable bool   // node_declared_regions table exists (rf-data-surfacing task 2)
 
 	// Channel list caches, keyed by region param — avoids repeated GROUP BY
 	// scans (#762). Keyed per-region (not a single slot) so mixed-region
@@ -235,15 +236,14 @@ func (db *DB) detectSchema(ctx context.Context, q rowQuerier) error {
 	}
 	db.hasDefaultScope = nodes["default_scope"]
 	db.hasMultibyteSupCols = nodes["multibyte_sup"]
+	db.hasConfiguredScope = nodes["configured_scope"]
 
-	// node_declared_regions is an opt-in table that may be absent on older
-	// databases. PRAGMA table_info on a missing table returns zero rows rather
-	// than erroring, so an empty column set is the absence signal.
-	ndr, err := schemaColumns(ctx, q, "node_declared_regions")
-	if err != nil {
-		return fmt.Errorf("probe node_declared_regions: %w", err)
-	}
-	db.hasDeclaredRegionsTable = len(ndr) > 0
+	// #1975: an optional second confirmed-scope source. Absent on a stock
+	// install, so schemaColumns returns nothing and the flag stays false;
+	// present on deployments that collect the same fact by another route.
+	// A missing table is not an error here.
+	ndr, ndrErr := schemaColumns(ctx, q, "node_declared_regions")
+	db.hasDeclaredRegionsTable = ndrErr == nil && len(ndr) > 0
 
 	if db.isV3 {
 		log.Printf("[db] schema mode: v3 (observer_idx)")
@@ -291,6 +291,10 @@ func (db *DB) nodeSelectCols() string {
 	cols := "public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c, foreign_advert"
 	if db.hasDefaultScope {
 		cols += ", default_scope"
+	}
+	// #1865: confirmed scopes appended after default_scope; scan order must match.
+	if db.hasConfiguredScope {
+		cols += ", configured_scope, configured_scope_at"
 	}
 	return cols
 }
@@ -1725,12 +1729,19 @@ func (db *DB) GetChannels(region ...string) ([]map[string]interface{}, error) {
 			args = append(args, code)
 		}
 		regionPlaceholder := strings.Join(placeholders, ",")
+		// #1899: the sample_json subquery is region-scoped too, so its placeholders
+		// appear FIRST in the statement (it sits in the SELECT list, ahead of the
+		// WHERE). Bind the codes twice, subquery set first.
+		args = append(append(make([]interface{}, 0, len(regionCodes)*2), args...), args...)
 		if db.isV3 {
 			querySQL = fmt.Sprintf(`SELECT t.channel_hash,
 					COUNT(*) AS msg_count,
 					MAX(t.first_seen) AS last_activity,
 					(SELECT t2.decoded_json FROM transmissions t2
+					 JOIN observations o2 ON o2.transmission_id = t2.id
+					 LEFT JOIN observers obs2 ON obs2.rowid = o2.observer_idx
 					 WHERE t2.channel_hash = t.channel_hash AND t2.payload_type = 5
+					 AND obs2.rowid IS NOT NULL AND UPPER(TRIM(obs2.iata)) IN (%s)
 					 ORDER BY t2.first_seen DESC LIMIT 1) AS sample_json
 				FROM transmissions t
 				JOIN observations o ON o.transmission_id = t.id
@@ -1740,13 +1751,19 @@ func (db *DB) GetChannels(region ...string) ([]map[string]interface{}, error) {
 				AND t.channel_hash NOT LIKE 'enc_%%'
 				AND obs.rowid IS NOT NULL AND UPPER(TRIM(obs.iata)) IN (%s)
 				GROUP BY t.channel_hash
-				ORDER BY last_activity DESC`, regionPlaceholder)
+				ORDER BY last_activity DESC`, regionPlaceholder, regionPlaceholder)
 		} else {
 			querySQL = fmt.Sprintf(`SELECT t.channel_hash,
 					COUNT(*) AS msg_count,
 					MAX(t.first_seen) AS last_activity,
 					(SELECT t2.decoded_json FROM transmissions t2
+					 JOIN observations o2 ON o2.transmission_id = t2.id
 					 WHERE t2.channel_hash = t.channel_hash AND t2.payload_type = 5
+					 AND EXISTS (
+						SELECT 1 FROM observers obs2
+						WHERE obs2.id = o2.observer_id
+						AND UPPER(TRIM(obs2.iata)) IN (%s)
+					 )
 					 ORDER BY t2.first_seen DESC LIMIT 1) AS sample_json
 				FROM transmissions t
 				JOIN observations o ON o.transmission_id = t.id
@@ -1759,7 +1776,7 @@ func (db *DB) GetChannels(region ...string) ([]map[string]interface{}, error) {
 					AND UPPER(TRIM(obs.iata)) IN (%s)
 				)
 				GROUP BY t.channel_hash
-				ORDER BY last_activity DESC`, regionPlaceholder)
+				ORDER BY last_activity DESC`, regionPlaceholder, regionPlaceholder)
 		}
 	} else {
 		querySQL = `SELECT channel_hash,
@@ -2462,10 +2479,14 @@ func (db *DB) scanNodeRow(rows *sql.Rows) map[string]interface{} {
 	var temperatureC sql.NullFloat64
 	var foreign sql.NullInt64
 	var defaultScope sql.NullString
+	var configuredScope, configuredScopeAt sql.NullString
 
 	scanArgs := []interface{}{&pk, &name, &role, &lat, &lon, &lastSeen, &firstSeen, &advertCount, &batteryMv, &temperatureC, &foreign}
 	if db.hasDefaultScope {
 		scanArgs = append(scanArgs, &defaultScope)
+	}
+	if db.hasConfiguredScope {
+		scanArgs = append(scanArgs, &configuredScope, &configuredScopeAt)
 	}
 	if err := rows.Scan(scanArgs...); err != nil {
 		return nil
@@ -2496,6 +2517,10 @@ func (db *DB) scanNodeRow(rows *sql.Rows) map[string]interface{} {
 	}
 	if db.hasDefaultScope {
 		m["default_scope"] = nullStr(defaultScope)
+	}
+	if db.hasConfiguredScope {
+		m["configured_scope"] = nullStr(configuredScope)
+		m["configured_scope_at"] = nullStr(configuredScopeAt)
 	}
 	return m
 }
