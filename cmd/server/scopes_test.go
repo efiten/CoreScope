@@ -105,47 +105,6 @@ func seedTransmissionRouteAt(t *testing.T, s *PacketStore, forwarder string, see
 	seedTransmissionPathAt(t, s, []string{forwarder}, seed, routeType, firstSeen)
 }
 
-// seedTransmissionPathAt seeds one transmission whose single observation
-// carries a MULTI-hop path. A one-hop seed cannot tell the two reasons a node
-// gets attributed apart — it is simultaneously path[0] and path[last] — so the
-// mid-path cases below need a path with something after the target on it.
-//
-// Hops are upper-cased for the same reason seedTransmissionRoute does it: the
-// decoder writes them that way (packetpath.DecodePathFromRawHex), and the join
-// has to cope with that rather than with a lowercase convenience fiction.
-func seedTransmissionPathAt(t *testing.T, s *PacketStore, hops []string, seed scopeSeed, routeType int, firstSeen string) {
-	t.Helper()
-	scopeSeedCounter++
-	hash := fmt.Sprintf("scopehash%d", scopeSeedCounter)
-
-	res, err := s.db.conn.Exec(
-		`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, code1, code2, scope_name)
-		 VALUES ('AA', ?, ?, ?, 1, ?, '00', ?)`,
-		hash, firstSeen, routeType, seed.code1, seed.scopeName,
-	)
-	if err != nil {
-		t.Fatalf("seed transmission: %v", err)
-	}
-	txID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("seed transmission id: %v", err)
-	}
-
-	quoted := make([]string, len(hops))
-	for i, h := range hops {
-		quoted[i] = `"` + strings.ToUpper(h) + `"`
-	}
-	pathJSON := "[" + strings.Join(quoted, ",") + "]"
-	if _, err := s.db.conn.Exec(
-		`INSERT INTO observations (transmission_id, path_json, timestamp) VALUES (?, ?, ?)`,
-		txID, pathJSON, time.Now().Unix(),
-	); err != nil {
-		t.Fatalf("seed observation: %v", err)
-	}
-}
-
-// seedTransmission seeds a FLOOD packet (route_type=1) — path[last] is the
-// actual transmitter, so forwarder is attributable.
 func seedTransmission(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed) {
 	t.Helper()
 	seedTransmissionRoute(t, s, forwarder, seed, RouteFlood)

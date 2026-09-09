@@ -26,13 +26,6 @@ import (
 )
 
 func main() {
-	// scope-repair is a one-off maintenance subcommand (#1609); it never
-	// runs as part of normal startup, only when explicitly invoked. See
-	// scope_repair.go.
-	if len(os.Args) > 1 && os.Args[1] == "scope-repair" {
-		os.Exit(runScopeRepair(os.Args[2:]))
-	}
-
 	// pprof profiling — off by default, enable with ENABLE_PPROF=true
 	if os.Getenv("ENABLE_PPROF") == "true" {
 		pprofPort := os.Getenv("PPROF_PORT")
@@ -110,6 +103,8 @@ func main() {
 
 	regionSet := newRegionKeySet(cfg)
 	if cfg.AutoRegionKeysEnabled() {
+		// Fill the derived tier before the first packet is matched, so a
+		// restart does not spend a refresh interval naming nothing.
 		regionSet.refreshFromStore(store)
 	} else {
 		log.Printf("[regions] autoRegionKeys disabled — only the %d configured hashRegions key(s) are in force", len(regionSet.snapshot().all))
@@ -325,18 +320,6 @@ func main() {
 		}
 	}
 
-	// Declared-region retention: bounds the opt-in node_declared_regions
-	// table (Task 6), independent of clientRxDays/clientRxObsDays/clientRfDays.
-	// 0 = disabled.
-	clientRegionsDays := cfg.ClientRegionsDaysOrZero()
-	if clientRegionsDays > 0 {
-		if n, err := store.PruneOldClientDeclaredRegions(clientRegionsDays); err != nil {
-			log.Printf("[prune] node_declared_regions: %v", err)
-		} else if n > 0 {
-			log.Printf("[prune] startup pruned %d node_declared_regions older than %d days", n, clientRegionsDays)
-		}
-	}
-
 	vacuumPages := cfg.IncrementalVacuumPages()
 	store.RunIncrementalVacuum(vacuumPages)
 
@@ -402,11 +385,11 @@ func main() {
 	}
 
 	// Daily ticker for client-RX coverage retention (#1727), reused for the
-	// diagnostic client_rx_observations, client_rf_samples, and
-	// node_declared_regions retention (Task 6) rather than starting a second
-	// ticker — the four flags are independent (0 disables each separately),
-	// so the ticker itself must run when any is set.
-	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 || clientRegionsDays > 0 {
+	// diagnostic client_rx_observations and client_rf_samples retention
+	// (Task 6) rather than starting a second ticker — the three flags are
+	// independent (0 disables each separately), so the ticker itself must
+	// run when any is set.
+	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 {
 		clientRxRetentionTicker := time.NewTicker(24 * time.Hour)
 		go func() {
 			for range clientRxRetentionTicker.C {
@@ -431,13 +414,6 @@ func main() {
 						store.RunIncrementalVacuum(vacuumPages)
 					}
 				}
-				if clientRegionsDays > 0 {
-					if n, err := store.PruneOldClientDeclaredRegions(clientRegionsDays); err != nil {
-						log.Printf("[prune] node_declared_regions: %v", err)
-					} else if n > 0 {
-						store.RunIncrementalVacuum(vacuumPages)
-					}
-				}
 			}
 		}()
 		if clientRxDays > 0 {
@@ -449,15 +425,12 @@ func main() {
 		if clientRfDays > 0 {
 			log.Printf("[prune] auto-prune enabled: client_rf_samples older than %d days will be removed daily", clientRfDays)
 		}
-		if clientRegionsDays > 0 {
-			log.Printf("[prune] auto-prune enabled: node_declared_regions older than %d days will be removed daily", clientRegionsDays)
-		}
 	}
 
 	// Derived region keys refresh on their own ticker rather than the daily
-	// retention one: declared-region answers arrive continuously (a companion
-	// app driving past a repeater), and waiting up to 24h to name a
-	// newly-discovered region would defeat the point of deriving them at all.
+	// retention one: declared-region answers arrive continuously (an observer
+	// report lands, a node is asked again), and waiting up to 24h to name a
+	// newly-discovered region would defeat the point of deriving them.
 	if cfg.AutoRegionKeysEnabled() {
 		interval := time.Duration(cfg.AutoRegionKeysRefreshMinutes()) * time.Minute
 		regionRefreshTicker := time.NewTicker(interval)
@@ -722,13 +695,11 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		return
 	}
 
-	// Mobile client topics: meshcore/client/{PUBLIC_KEY}/packets (RX coverage),
-	// meshcore/client/{PUBLIC_KEY}/rf (RF environment samples), and
-	// meshcore/client/{PUBLIC_KEY}/regions (declared-region answers). A
-	// roaming companion reports where it directly heard a node, its own
-	// radio's counters, or a repeater's declared region list; all three are
-	// handled in isolation from the observer/observations path. EMQX ACL
-	// binds parts[2] to the client's own key.
+	// Mobile client topics: meshcore/client/{PUBLIC_KEY}/packets (RX coverage)
+	// and meshcore/client/{PUBLIC_KEY}/rf (RF environment samples). A roaming
+	// companion reports where it directly heard a node, or its own radio's
+	// counters; both are handled in isolation from the observer/observations
+	// path. EMQX ACL binds parts[2] to the client's own key.
 	//
 	// The topic match and the enable-gate MUST be separate: matching on
 	// parts[1]=="client" always returns from this branch, whatever the config
@@ -1691,24 +1662,20 @@ func loadRegionKeys(cfg *Config) map[string][]byte {
 	return keys
 }
 
-// matchScope was removed in M2 (docs/plans/2026-09-07-auto-derived-region-keys.md).
-// Naming a packet's region now goes through regionKeySnapshot.match in
-// region_keys.go, which keeps #1609's abstain-on-ambiguity rule but adds a
-// principled tie-break: an operator-configured hashRegions key beats one
-// derived from a declared-region answer.
+// matchingRegions returns every configured region whose derived code equals
+// the packet's code1, rather than the first one found.
 //
-// Its doc comment also suggested a "pre-indexed lookup table" beyond ~50
-// regions. That is not achievable and the idea should not come back: code1 is
-// an HMAC over the packet payload, so there is no payload-independent key to
-// index on. The cost is inherently one HMAC per region per transport-scoped
-// packet, which is exactly why autoRegionKeys.maxDerived exists.
-
-// matchingRegions returns the name of every configured region whose derived
-// 2-byte code equals code1, in no particular order. matchScope uses the
-// length of this list to decide between a unique match, no match, and an
-// ambiguous match; the scope-repair tool (#1609, scope_repair.go) uses it
-// directly to tell an ambiguous multi-key match apart from no match at all —
-// only the former is the historical first-match bug and safe to correct.
+// The distinction matters because code1 is two bytes: two configured regions
+// collide on a given payload with probability 1/65536, and at 159 keys on a
+// live instance that is roughly 0.25% of transport-scoped packets, hundreds a
+// week rather than a curiosity. Returning the first match made the stored
+// region name depend on Go's randomised map iteration order, so the same
+// packet could be named differently on two runs and neither answer was
+// evidence of anything.
+//
+// The cost is unchanged: this is the same single pass over the same keys, it
+// just does not stop early. There is no indexable shortcut, because code1 is
+// an HMAC over the payload and nothing here is payload-independent.
 func matchingRegions(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) []string {
 	if code1 == "0000" || len(regionKeys) == 0 || len(payloadRaw) == 0 {
 		return nil

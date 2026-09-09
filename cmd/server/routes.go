@@ -70,14 +70,17 @@ type Server struct {
 	scopeStatsCache    map[string]*ScopeStatsResponse
 	scopeStatsCachedAt map[string]time.Time
 
-	// Cached /api/scope-audit response — per-window, with a singleflight so a
-	// cold key costs one scan no matter how many requests arrive on it. See
-	// scopeAuditTTLFor (scope_audit.go) for why the 7d window's TTL is not the
-	// 30s the others use, and the scan itself for what that window costs.
+	// #1975: cached /api/scope-audit response, per window, recomputed at most
+	// once every 30s. Mirrors the scopeStats cache directly above it.
 	scopeAuditMu       sync.Mutex
 	scopeAuditCache    map[string]*ScopeAuditResponse
 	scopeAuditCachedAt map[string]time.Time
 	scopeAuditSF       singleflight.Group
+
+	// #1975: /api/scope-audit window cache and its single-flight guard, so a
+	// burst of viewers on a cold cache recomputes the network-wide scan once
+	// rather than once per request. Lives in scope_audit.go.
+	scopes scopesState
 
 	// Router reference for OpenAPI spec generation
 	router *mux.Router
@@ -107,10 +110,6 @@ type Server struct {
 	// package globals) so multiple instances don't share observable
 	// state. Initialised lazily on first use; see node_reach.go.
 	reach reachState
-
-	// Per-server state for GET /api/nodes/{pubkey}/scopes: TTL cache +
-	// singleflight, mirroring reach above. See scopes.go.
-	scopes scopesState
 
 	// Known-channels catalogue cache (issue #1323). Nil until configured;
 	// when nil the /api/known-channels endpoint returns an empty snapshot.
@@ -298,12 +297,13 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	// an unregistered /api route would hit). See requireClientRxCoverage.
 	r.HandleFunc("/api/nodes/{pubkey}/rx-coverage", s.handleNodeRxCoverage).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}/scopes", s.handleNodeScopes).Methods("GET")
-	r.HandleFunc("/api/nodes/resolve", s.handleResolvePrefix).Methods("GET")
-	r.HandleFunc("/api/rx-coverage", s.handleRxCoverage).Methods("GET")
-	r.HandleFunc("/api/rx-leaderboard", s.handleRxLeaderboard).Methods("GET")
+
 	// Same registered-unconditionally / 404-when-off pattern as coverage above,
 	// gated by requireClientRfSamples instead.
 	r.HandleFunc("/api/rf-noise", s.handleRfNoise).Methods("GET")
+	r.HandleFunc("/api/nodes/resolve", s.handleResolvePrefix).Methods("GET")
+	r.HandleFunc("/api/rx-coverage", s.handleRxCoverage).Methods("GET")
+	r.HandleFunc("/api/rx-leaderboard", s.handleRxLeaderboard).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}", s.handleNodeDetail).Methods("GET")
 	r.HandleFunc("/api/nodes", s.handleNodes).Methods("GET")
 

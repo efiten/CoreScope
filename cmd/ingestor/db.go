@@ -87,6 +87,11 @@ type Store struct {
 
 	sampleIntervalSec int
 	backfillWg        sync.WaitGroup
+	// geoIdx holds the in-memory prefix→positioned-candidates index
+	// used to geographically resolve 1-byte client-reception hops (see
+	// geo_hop.go). Rebuilt on startup and once per neighbor-edges
+	// builder tick (60s), same cadence as prefixIdx/neighborGraph.
+	geoIdx geoIndexHolder
 
 	// prefixIdx holds the prefix → pubkey index used by the
 	// resolved_path writer (#1547). Rebuilt on startup and once per
@@ -98,11 +103,6 @@ type Store struct {
 	// once per neighbor-edges builder tick (60s).
 	neighborGraph neighborGraphHolder
 
-	// geoIdx holds the in-memory prefix→positioned-candidates index
-	// used to geographically resolve 1-byte client-reception hops (see
-	// geo_hop.go). Rebuilt on startup and once per neighbor-edges
-	// builder tick (60s), same cadence as prefixIdx/neighborGraph.
-	geoIdx geoIndexHolder
 	// relayTouched is the debounce map for touchRelayNodesLocked:
 	// pubkey -> rxTime of the last last_seen write (#1598). Guarded by
 	// writerMu, which InsertTransmission holds for its whole body.
@@ -1608,10 +1608,9 @@ func (s *Store) BackfillPathJSONAsync() {
 // the single connection pool. busy_timeout(5000) handles transient cross-process
 // contention with the read-only server process. No additional locking is needed.
 func (s *Store) BackfillDefaultScopeAsync(regionSet *regionKeySet) {
-	// No region keys in force — all scope_name values will be NULL, nothing to
-	// backfill. Read once here rather than per row: the backfill is a long
-	// loop, and a refresh landing halfway through would otherwise change the
-	// key set under it.
+	// No region keys at all — every scope_name is NULL, nothing to backfill.
+	// The emptiness gate is read once here rather than per row: the loop below
+	// uses no keys, it only copies names that are already stored.
 	if len(regionSet.snapshot().all) == 0 {
 		return
 	}
@@ -2289,9 +2288,7 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		pd.Code2 = decoded.TransportCodes.Code2
 		if decoded.TransportCodes.Code1 != "0000" {
 			pd.IsTransportScoped = true
-			m := regionSet.snapshot().match(byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
-			recordScopeMatch(m)
-			pd.ScopeName = m.Name
+			pd.ScopeName = regionSet.matchScopeName(byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
 		}
 	}
 

@@ -52,6 +52,7 @@ type Config struct {
 	ChannelKeys          map[string]string           `json:"channelKeys,omitempty"`
 	HashChannels         []string                    `json:"hashChannels,omitempty"`
 	HashRegions          []string                    `json:"hashRegions,omitempty"`
+	AutoRegionKeys       *AutoRegionKeysConfig       `json:"autoRegionKeys,omitempty"`
 	Retention            *RetentionConfig            `json:"retention,omitempty"`
 	Metrics              *MetricsConfig              `json:"metrics,omitempty"`
 	Runtime              *RuntimeConfig              `json:"runtime,omitempty"`
@@ -59,7 +60,6 @@ type Config struct {
 	ClientRxObservations *ClientRxObservationsConfig `json:"clientRxObservations,omitempty"`
 	ClientRfSamples      *ClientRfSamplesConfig      `json:"clientRfSamples,omitempty"`
 	ClientRegions        *ClientRegionsConfig        `json:"clientRegions,omitempty"`
-	AutoRegionKeys       *AutoRegionKeysConfig       `json:"autoRegionKeys,omitempty"`
 	GeoFilter            *GeoFilterConfig            `json:"geo_filter,omitempty"`
 	// PathTrust configures the minimum path-hash prefix length trusted as
 	// mapping/topology evidence (issue #1784).
