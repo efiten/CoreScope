@@ -448,9 +448,7 @@ func buildClientRxObservation(
 		obs.Code1 = &decoded.TransportCodes.Code1
 		obs.Code2 = &decoded.TransportCodes.Code2
 		if decoded.TransportCodes.Code1 != "0000" {
-			m := regionSet.snapshot().match(byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
-			recordScopeMatch(m)
-			sn := m.Name
+			sn := regionSet.matchScopeName(byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
 			obs.ScopeName = &sn
 		}
 	}

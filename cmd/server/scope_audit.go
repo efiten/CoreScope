@@ -1,12 +1,23 @@
 package main
 
-// Network-wide Scope Audit (#1975/#1976 upstream, extended here by the
-// forwarder-attribution, unnameable-traffic and declared-region-verification
-// work of 2026-09-07).
+// Issue #1975: the network-wide Scope Audit, GET /api/scope-audit.
+//
+// One row per repeater whose configured region list is known, answering a
+// question no other view answers: you declare these regions, but were you
+// actually seen forwarding them? default_scope says what a node's adverts were
+// observed under and transported_scopes (#1751) says what it carried, but
+// nothing lines the declared list up against observed forwarding, so a
+// repeater configured for eight regions that only ever forwards one looks
+// healthy everywhere else.
 //
 // Declared side: nodes.configured_scope, written by the observer /neighbors
-// ingestion (#1865/#1971), plus the node_declared_regions table a companion
-// app fills. Observed side: what this instance saw each repeater forward.
+// ingest from #1865/#1971. Observed side: forwarder hops in the window,
+// aggregated per target. Both sides are compared through normScope, so the
+// leading "#" that configured_scope carries and a bare region name are the
+// same region.
+//
+// Ported from a long-running fork deployment. The measurements quoted in
+// #1975 come from a 1179-repeater instance.
 
 import (
 	"database/sql"
@@ -31,18 +42,21 @@ type ScopeObservation struct {
 	LastSeen  string `json:"lastSeen"`
 }
 
+// RouteTypeMix is the route-type breakdown of packets this node was
+// observed FORWARDING — i.e. packets on which this pubkey was the last hop
+// of a FLOOD-family route (RouteTransportFlood, RouteFlood). It does NOT
+// mean "packets in which this node appears anywhere in the path": a DIRECT
+// or TRANSPORT_DIRECT packet's last path hop is the route's far end, never
+// the transmitter, so crediting it here would attribute forwarding this node
+// never did. Direct and TransportDirect are therefore always zero by
+// construction — the forwarder join can never match those route types.
+
 // scopeConformanceForwarderRouteTypesSQL restricts the forwarder join to the
-// only route types whose path hops are a record of who transmitted the packet:
-// RouteTransportFlood (0) and RouteFlood (1), where every forwarder appends
-// its own hash. A DIRECT route consumes hops from the front, so its path is
-// the route's remaining plan and its path[last] is the far end rather than a
-// forwarder — including RouteDirect (2) / RouteTransportDirect (3) here would
-// misattribute a scope to a node that never forwarded the packet.
-//
-// Since the attribution below reads EVERY hop rather than only path[last],
-// this filter is the sole guard against that misattribution. It is pinned by
-// TestScopeConformanceIgnoresDirectRoutesMidPath and
-// TestScopeAuditForwardingIgnoresDirectRoutes; do not widen it.
+// only route types whose path[last] is the packet's actual transmitter:
+// RouteTransportFlood (0) and RouteFlood (1). A DIRECT route consumes hops
+// from the front, so its path[last] is the route's far end rather than the
+// forwarder — including RouteDirect (2) / RouteTransportDirect (3) here
+// would misattribute a scope to a node that never forwarded the packet.
 const scopeConformanceForwarderRouteTypesSQL = "t.route_type IN (0, 1)"
 
 // minForwarderHopHexLen is the shortest path_json hop ScopeConformance will
@@ -53,14 +67,6 @@ const scopeConformanceForwarderRouteTypesSQL = "t.route_type IN (0, 1)"
 // attributing none.
 const minForwarderHopHexLen = 4
 
-// DeclaredRegions is the most recently *declared* region list a repeater
-// reported when a mobile app asked it over RF, mirroring the ingestor's
-// CurrentDeclaredRegions (cmd/ingestor/client_reception.go). Regions is
-// never nil — an empty slice is itself a meaningful answer ("this repeater
-// declares nothing flood-allowed"), distinct from *DeclaredRegions being nil
-// ("never successfully asked": out of RF range, firmware too old, or the
-// request was silently ignored — the repeater only answers DIRECT-routed
-// requests, so silence means nothing).
 type DeclaredRegions struct {
 	Regions    []string `json:"regions"`
 	ObservedAt string   `json:"observedAt"`
@@ -83,8 +89,15 @@ func splitRegionsCSV(csv string) []string {
 	return regions
 }
 
-// DeclaredRegionsRow is one repeater's most recently declared region list,
-// as returned in bulk by AllCurrentDeclaredRegions for GET /api/scope-audit.
+// CurrentDeclaredRegions returns pubkey's most recently declared region
+// list, or nil (not an error) when the repeater has never successfully
+// answered, or when node_declared_regions is absent (an older database that
+// predates this table).
+//
+// "Most recent" is ordered by the greatest observed_at, NEVER ingested_at —
+// mirrors the ingestor's own CurrentDeclaredRegions exactly: a drive
+// buffered offline can arrive days late, and ordering by arrival would let
+
 type DeclaredRegionsRow struct {
 	Target     string
 	ObservedAt string
@@ -201,9 +214,6 @@ func (db *DB) AllCurrentDeclaredRegions() ([]DeclaredRegionsRow, error) {
 // scope-audit row, resolved in bulk (one IN query for every declared
 // target) rather than one GetNodeByPubkey call per repeater.
 
-// scopeAuditNodeIdentity is the name/role display identity for one
-// scope-audit row, resolved in bulk (one IN query for every declared
-// target) rather than one GetNodeByPubkey call per repeater.
 type scopeAuditNodeIdentity struct {
 	Name *string
 	Role *string
@@ -257,6 +267,7 @@ func (db *DB) scopeAuditNodeIdentities(pubkeys []string) map[string]scopeAuditNo
 // are configured as hashRegions: ["#belgium", "#eu"]); regions_csv arrives
 // from the firmware with the prefix already stripped. Comparing raw
 // silently inverts the whole comparison while looking entirely plausible.
+
 func normScope(s string) string {
 	if strings.HasPrefix(s, "#") {
 		return s[1:]
@@ -269,18 +280,14 @@ func normScope(s string) string {
 // normScope'd name) plus a count of the plain-FLOOD (unscoped) packets it
 // forwarded — the signal the wildcard-contradiction check needs, since '*'
 // governs exactly those packets, not any named scope.
+
 type scopeAuditTargetAgg struct {
 	scopes          map[string]*ScopeObservation
 	unscopedPackets int64
-	// ambiguousHops counts forwarder-hop observations in the window whose
-	// truncated hash prefix matched this target AND at least one other
-	// declared target — see ScopeAuditForwarding's doc comment for why
-	// those hops are attributed to neither candidate instead of both.
-	ambiguousHops int64
 	// unmatchedPackets counts packets this target was observed forwarding
 	// that carried a transport scope no configured region key matched
-	// (transmissions.scope_name = ""). Deliberately NOT folded into
-	// unscopedPackets: those two are opposites. Unscoped means the packet
+	// (transmissions.scope_name = the empty string). Deliberately NOT folded
+	// into unscopedPackets: those two are opposites. Unscoped means the packet
 	// carried no scope at all (scope_name SQL NULL) and is what '*' governs;
 	// unmatched means it IS scoped and this instance simply holds no key for
 	// that region, so '*' says nothing about it. See scopeNameForDB in the
@@ -290,6 +297,7 @@ type scopeAuditTargetAgg struct {
 	// of them may be a region this instance cannot name rather than one the
 	// repeater is not forwarding.
 	unmatchedPackets int64
+
 	// unmatchedTxIDs are the transmissions behind unmatchedPackets, kept so
 	// declared-region verification can test this target's own declarations
 	// against this target's own unnameable traffic (scope_verify.go). The same
@@ -299,6 +307,12 @@ type scopeAuditTargetAgg struct {
 	// Bounded by scopeVerifyMaxPacketsPerTarget, which unmatchedPackets is NOT:
 	// the count stays the honest total, this is the working set.
 	unmatchedTxIDs []int64
+
+	// ambiguousHops counts forwarder-hop observations in the window whose
+	// truncated hash prefix matched this target AND at least one other
+	// declared target — see ScopeAuditForwarding's doc comment for why
+	// those hops are attributed to neither candidate instead of both.
+	ambiguousHops int64
 }
 
 // scopeAuditPrefixIndex builds, for every even hex length from
@@ -378,6 +392,47 @@ var scopeAuditForwarderScanQuery = `
 // of stored hops are uppercase), GROUP BY t.id, hop takes 38.0s, and
 // SELECT DISTINCT t.id, path_json takes 17.7s. The 3.47M rows are inherent:
 // 1,368,761 observations carrying a path, ~2.5 usable hops each.
+
+// ScopeAuditForwarding runs scopeAuditForwarderScanQuery once for the whole
+// window and attributes every forwarder hop it finds to targets, by the same
+// truncated-hash prefix match ScopeConformance uses for a single pubkey.
+//
+// A hop is attributed only when its prefix matches EXACTLY ONE declared
+// target. This endpoint exists to find a repeater that declares a region and
+// is not actually forwarding it — crediting a hop to every target sharing
+// its prefix would let a colliding neighbour's traffic silently paper over a
+// real gap, and crediting nobody (the alternative of dropping the hop
+// entirely) would invent failures for targets that simply share a collision-
+// prone prefix. Instead, an ambiguous hop is credited to NEITHER candidate,
+// and every candidate's ambiguousHops counter is incremented instead, so the
+// row can say "this notObserved might just be a prefix collision" rather
+// than presenting it as a confirmed finding. See scopeAuditTargetAgg's
+// ambiguousHops field and ScopeAuditRow.AmbiguousHops.
+//
+// Each (target, transmission) pair is counted at most once even if seen via
+// multiple observations, for both the attributed and the ambiguous count —
+// the same de-duplication scopeConformanceQuery gets for free from EXISTS,
+// done explicitly here since this scan is not correlated per target.
+
+// scopeAuditWindowMetaQuery reads the two per-TRANSMISSION facts the hop scan
+// used to carry on every hop row: the scope name and the timestamp. It applies
+// the identical window and route-type filter, so it covers every transmission
+// the hop scan can produce, and both run inside one read transaction so the
+// two see the same snapshot.
+//
+// Splitting these out is why the hop scan carries two columns instead of four.
+// Measured on the live-shaped staging database on 2026-09-07, a 7d window
+// yields 3,470,188 hop rows against 79,652 transmissions: 43 hop rows per
+// transmission, each of which was re-reading the same scope_name and
+// first_seen. SQLite spends 2.7s of the 16.7s that window cost; the rest was
+// the Go side scanning columns it already knew.
+//
+// Every SQL-side attempt to shrink the hop scan itself measured worse on that
+// same database and was rejected: a first-4-hex prefix filter against the
+// declared targets takes 20.9s (and needs lower() on both sides, because 80%
+// of stored hops are uppercase), GROUP BY t.id, hop takes 38.0s, and
+// SELECT DISTINCT t.id, path_json takes 17.7s. The 3.47M rows are inherent:
+// 1,368,761 observations carrying a path, ~2.5 usable hops each.
 var scopeAuditWindowMetaQuery = `
 	SELECT t.id, t.scope_name, t.first_seen
 	FROM transmissions t
@@ -387,10 +442,17 @@ var scopeAuditWindowMetaQuery = `
 
 // scopeAuditTxMeta is one transmission's contribution to the aggregate, held
 // once per transmission rather than once per hop.
+
+// scopeAuditTxMeta is one transmission's contribution to the aggregate, held
+// once per transmission rather than once per hop.
 type scopeAuditTxMeta struct {
 	scopeName sql.NullString
 	firstSeen string
 }
+
+// scopeAuditWindowMeta loads scopeAuditWindowMetaQuery into a map keyed by
+// transmission id. Runs on the caller's transaction so it shares the hop
+// scan's snapshot.
 
 // scopeAuditWindowMeta loads scopeAuditWindowMetaQuery into a map keyed by
 // transmission id. Runs on the caller's transaction so it shares the hop
@@ -422,10 +484,42 @@ func scopeAuditWindowMeta(tx *sql.Tx, sinceISO string) (map[int64]scopeAuditTxMe
 // built into: the hop scan reaches millions of rows on a 7d window, and every
 // candidate hop was allocating a fresh "<target>|<txID>" string to ask a
 // question that a comparable struct answers without allocating.
+
+// scopeAuditSeenKey identifies one (target, transmission) pair for the
+// de-duplication below. A struct key rather than the string it used to be
+// built into: the hop scan reaches millions of rows on a 7d window, and every
+// candidate hop was allocating a fresh "<target>|<txID>" string to ask a
+// question that a comparable struct answers without allocating.
 type scopeAuditSeenKey struct {
 	target string
 	txID   int64
 }
+
+// ScopeAuditForwarding runs scopeAuditForwarderScanQuery once for the whole
+// window and attributes every forwarder hop it finds to targets, by the same
+// truncated-hash prefix match ScopeConformance uses for a single pubkey.
+//
+// A hop is attributed only when its prefix matches EXACTLY ONE declared
+// target. This endpoint exists to find a repeater that declares a region and
+// is not actually forwarding it — crediting a hop to every target sharing
+// its prefix would let a colliding neighbour's traffic silently paper over a
+// real gap, and crediting nobody (the alternative of dropping the hop
+// entirely) would invent failures for targets that simply share a collision-
+// prone prefix. Instead, an ambiguous hop is credited to NEITHER candidate,
+// and every candidate's ambiguousHops counter is incremented instead, so the
+// row can say "this notObserved might just be a prefix collision" rather
+// than presenting it as a confirmed finding. See scopeAuditTargetAgg's
+// ambiguousHops field and ScopeAuditRow.AmbiguousHops.
+//
+// Each (target, transmission) pair is counted at most once even if seen via
+// multiple observations OR via several hops of one path (a routing loop, or two
+// hops colliding on the same truncated prefix), for both the attributed and the
+// ambiguous count — the same de-duplication scopeConformanceQuery gets for free
+// from EXISTS, done explicitly here since this scan is not correlated per
+// target. Since the scan reads every hop rather than only path[last], this is
+// the only thing keeping one transmission from counting several times for the
+// same target; TestScopeAuditForwardingCountsOneTransmissionOncePerTarget pins
+// it.
 
 // ScopeAuditForwarding runs scopeAuditForwarderScanQuery once for the whole
 // window and attributes every forwarder hop it finds to targets, by the same
@@ -588,6 +682,7 @@ func (s *PacketStore) ScopeAuditForwarding(sinceISO string, targets []string) (m
 
 // Scope audit configuration-state values — see ScopeAuditRow.ConfigState and
 // scopeAuditConfigState.
+
 const (
 	ScopeConfigFull       = "full"        // named regions AND '*'
 	ScopeConfigNoScopes   = "no-scopes"   // '*' only, no named regions
@@ -633,6 +728,7 @@ func scopeAuditConfigState(namedRegions []string, wildcard bool) string {
 // already normalised (no leading '#') and '*' is never present in
 // DeclaredRegions/NotObserved/UndeclaredObserved — see DeclaredWildcard and
 // WildcardContradiction for its counterpart.
+
 type ScopeAuditRow struct {
 	PublicKey string `json:"publicKey"`
 	// Name/Role are pointers so "we hold no nodes row for this target" serialises
@@ -733,12 +829,18 @@ type ScopeAuditResponse struct {
 	Repeaters []ScopeAuditRow `json:"repeaters"`
 }
 
-// scopesState is per-server cache + singleflight state for
-// GET /api/nodes/{pubkey}/scopes, mirroring reachState (node_reach.go): a
-// bounded TTL cache keyed on (pubkey, window) plus a singleflight group so
-// concurrent cold-cache requests for the same key compute once, not N
-// times. Lives on *Server (not a package global) for the same reason reach
-// does — multiple *Server instances must not share observable state.
+// NodeScopesResponse is the payload for GET /api/nodes/{pubkey}/scopes: the
+// observed-forwarding side (ScopeConformance, embedded BY VALUE so its three
+// scope states sit at the JSON top level — unmatched and unscoped are
+// separate counts and a matched scope never has an empty name) plus the
+// declared side (DeclaredRegions), returned together so the UI needs only
+// one request per node rather than a second per-item call.
+//
+// ScopeConformance is embedded by value rather than as *ScopeConformance:
+// encoding/json silently skips fields promoted through a nil embedded
+// pointer instead of erroring, which would drop observed/unmatched/unscoped
+// from the body entirely rather than surfacing the failure.
+
 type scopesState struct {
 	cacheMu sync.RWMutex
 	cache   map[string]scopesCacheEntry
@@ -836,6 +938,7 @@ func (s *Server) scopesPurgeIfBlacklistGenChanged(gen uint64) {
 // duration. Matches the sibling /api/scope-stats endpoint's vocabulary
 // exactly (1h, 24h, 7d) rather than the broader ParseTimeWindow alias set
 // (which also accepts 1d/3d/1w/30d) used by unrelated analytics endpoints.
+
 func nodeScopesWindowLookback(window string) (time.Duration, bool) {
 	switch window {
 	case "1h":
@@ -848,6 +951,13 @@ func nodeScopesWindowLookback(window string) (time.Duration, bool) {
 		return 0, false
 	}
 }
+
+// handleNodeScopes serves GET /api/nodes/{pubkey}/scopes?window=1h|24h|7d.
+//
+// A pubkey never heard forwarding anything is a valid question with an
+// empty answer (200), not a 404 — ScopeConformance already treats it that
+// way, and this handler performs no node-existence lookup that would
+// override it.
 
 // handleScopeAudit serves GET /api/scope-audit?window=1h|24h|7d: the
 // network-wide answer to "which repeaters declare a region they are not
@@ -875,12 +985,12 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 
 	// singleflight: the compute below runs outside the cache mutex, so without
 	// this every request arriving on a cold window ran its own full scan
-	// concurrently. On the 7d window that scan is seconds of work over millions
-	// of hop rows, which is exactly the shape that makes a thundering herd
-	// expensive rather than merely wasteful. Same treatment /api/observers and
+	// concurrently. Reading every hop makes that scan seconds of work over
+	// millions of rows, which is the shape that turns a thundering herd from
+	// wasteful into expensive. Same treatment /api/observers and
 	// /api/nodes/{pubkey}/reach already have.
 	v, err, _ := s.scopeAuditSF.Do(window, func() (interface{}, error) {
-		// The waiters that arrive while a scan is in flight are served by that
+		// Waiters that arrive while a scan is in flight are served by that
 		// scan's result; this second look is for the caller that acquires the
 		// group right after a winner stored one.
 		if cached, ok := s.scopeAuditCached(window); ok {
@@ -902,13 +1012,14 @@ func (s *Server) handleScopeAudit(w http.ResponseWriter, r *http.Request) {
 
 // scopeAuditTTLFor is how long one window's computed audit stays fresh.
 //
-// 7d is not 30s because it does not cost what the others cost. Measured on the
-// live-shaped staging database on 2026-09-07: 16.7s cold for 7d against 4.0s
-// for 24h and 0.15s for 1h, and the 7d scan reads 3,470,188 hop rows. At a 30s
-// TTL a single reader with that window open keeps the instance recomputing more
-// than half the time, for an aggregate that moves at the pace of a week of
-// traffic. Five minutes of staleness on a seven-day window is not a fact the
-// reader can act on differently.
+// 7d is not 30s because it does not cost what the others cost. Measured on a
+// live-shaped database with 206 declared repeaters and 965k transmissions:
+// 16.7s cold for 7d against 4.0s for 24h and 0.15s for 1h, with the 7d scan
+// reading 3,470,188 hop rows. At a 30s TTL a single reader with that window
+// open keeps the instance recomputing more than half the time, for an
+// aggregate that moves at the pace of a week of traffic. Five minutes of
+// staleness on a seven-day window is not a fact the reader can act on
+// differently.
 func scopeAuditTTLFor(window string) time.Duration {
 	if window == "7d" {
 		return 5 * time.Minute
@@ -943,11 +1054,9 @@ func (s *Server) scopeAuditStore(window string, resp *ScopeAuditResponse) {
 	s.scopeAuditCachedAt[window] = time.Now()
 }
 
-// computeScopeAudit builds one window's audit response: the declared lists, the
-// forwarding evidence attributed to them, and the declared-region verification
-// that settles which unnameable traffic corroborates a declaration. Split out
-// of the handler so the cache and its singleflight wrap a plain function
-// instead of a request.
+// computeScopeAudit builds one window's audit response: the declared lists and
+// the forwarding evidence attributed to them. Split out of the handler so the
+// cache and its singleflight wrap a plain function instead of a request.
 func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse, error) {
 	declared, err := s.db.AllCurrentDeclaredRegions()
 	if err != nil {
@@ -967,9 +1076,9 @@ func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse
 		}
 	}
 
-	// Declared-region verification (M1b): a region this instance holds no key
-	// for is unnameable, not absent, and the audit can settle which by deriving
-	// the key from the repeater's own declaration and testing it against that
+	// Declared-region verification: a region this instance holds no key for is
+	// unnameable, not absent, and the audit can settle which by deriving the key
+	// from the repeater's own declaration and testing it against that
 	// repeater's own unnameable traffic. One verifier serves every row so each
 	// (region, transmission) pair is derived at most once — see scope_verify.go
 	// for why that memo is what keeps this affordable.
@@ -1045,9 +1154,9 @@ func (s *Server) computeScopeAudit(window, sinceISO string) (*ScopeAuditResponse
 		verifiedSet := map[string]bool{}
 		if verifier != nil && agg != nil && len(unnamed) > 0 {
 			// capVerifyRegions bounds the per-target half of the verifier's
-			// work. The declared list arrives from a companion app and its
-			// LENGTH is not validated anywhere on the way in, while each
-			// distinct name costs a full pass over the packet set.
+			// work. The declared list arrives from a collector and its LENGTH
+			// is not validated anywhere on the way in, while each distinct name
+			// costs a full pass over the packet set.
 			regionEvidence = verifier.evidence(agg.unmatchedTxIDs, capVerifyRegions(unnamed))
 			for _, rgn := range verifier.verified(regionEvidence) {
 				verifiedSet[rgn] = true

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -23,31 +24,140 @@ type declaredRegionStat struct {
 const maxRegionNameLen = 32
 
 // regionNameAcceptable reports whether a declared name may become a derived
-// region key.
+// region key, and returns the name in the form the key is derived from.
 //
-// The rules are structural, never about the name's meaning. The declared set
-// contains entries that look like junk ("null", "bierhuis", "sol3"), but a
-// blocklist on string values is unmaintainable and the cost of one bad name is
-// a single slot out of maxDerived plus a 1-in-65536 collision chance. What IS
-// rejected is anything that could not have come from the firmware intact:
+// The two declared-region sources spell a name differently, so this
+// canonicalises before judging: nodes.configured_scope carries the leading
+// "#" (normalizeScopeList puts it there, matching every other stored scope
+// value), while a node_declared_regions row carries the bare name the OTA
+// query returned. Both mean the same region, and loadRegionKeys already
+// prefixes a missing "#" before hashing, so the "#" is stripped here and put
+// back by the caller.
 //
-//   - a comma would split the name on the next regions_csv round-trip
-//   - a '#' cannot appear (the firmware strips it), so its presence means the
-//     value was mangled somewhere upstream
-//   - non-ASCII or whitespace would make the key SHA256 over bytes nobody
+// The rules are structural, never about the name's meaning. A declared set
+// contains entries that look like junk ("null", "sol3"), but a blocklist on
+// string values is unmaintainable, and the cost of one bad name is a single
+// slot out of maxDerived plus a 1-in-65536 collision chance. What IS rejected
+// is anything that cannot be a region name:
+//
+//   - "*" is the flood wildcard, not a region, and hashing it would invent a
+//     region nobody declared
+//   - a comma would split the name on the next round-trip through a
+//     comma-separated column
+//   - a second "#" cannot come from either source intact
+//   - non-ASCII or whitespace would make the key a hash over bytes nobody
 //     intended, silently mismatching the sender
-//   - a NUL is the block-cipher padding a stale client failed to trim
-func regionNameAcceptable(name string) bool {
-	if name == "" || len(name) > maxRegionNameLen {
-		return false
+//   - a NUL is block-cipher padding a stale client failed to trim
+func regionNameAcceptable(name string) (string, bool) {
+	name = strings.TrimPrefix(name, "#")
+	if name == "" || name == "*" || len(name) > maxRegionNameLen {
+		return "", false
 	}
 	for i := 0; i < len(name); i++ {
 		c := name[i]
 		if c <= ' ' || c >= 0x7F || c == ',' || c == '#' {
-			return false
+			return "", false
 		}
 	}
-	return true
+	return name, true
+}
+
+// declaredRegionSources reads the declared region names from every source this
+// instance has, newest answer per node, and counts how many distinct nodes
+// declare each name.
+//
+// Two sources, mirroring what the server's AllCurrentDeclaredRegions already
+// merges, so the derived tier sees exactly what the audit sees:
+//
+//   - nodes.configured_scope, written by the observer /neighbors ingestion
+//     (#1865). Always present; the column is part of the schema.
+//   - node_declared_regions, an optional table a deployment may fill by other
+//     means. Absent on a stock install, so its absence is not an error: the
+//     probe below asks sqlite_master first rather than letting "no such table"
+//     abort a refresh that the first source could still answer.
+//
+// A node counts once per name however many times it declares it, so the
+// ranking below reflects how widely a region is claimed rather than how
+// chatty one node is.
+func (s *Store) declaredRegionSources() ([]declaredRegionStat, error) {
+	agg := map[string]*declaredRegionStat{}
+	count := func(csv, at string) {
+		seenHere := map[string]bool{} // one node counts once per name
+		for _, name := range splitDeclaredRegionsCSV(csv) {
+			// '*' is the flood wildcard, not a region. regionNameAcceptable
+			// rejects it too, but skipping it here as well keeps it out of the
+			// declared-name count that the cap arithmetic and the refresh log
+			// are stated in: nearly every node declares it, so counting it
+			// would overstate both on every deployment.
+			if name == "*" || name == "#*" || seenHere[name] {
+				continue
+			}
+			seenHere[name] = true
+			st, ok := agg[name]
+			if !ok {
+				st = &declaredRegionStat{Name: name}
+				agg[name] = st
+			}
+			st.Declarers++
+			if at > st.LastSeen {
+				st.LastSeen = at
+			}
+		}
+	}
+
+	rows, err := s.db.Query(`
+		SELECT COALESCE(configured_scope, ''), COALESCE(configured_scope_at, '')
+		FROM nodes
+		WHERE configured_scope IS NOT NULL AND configured_scope != ''
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("declared regions from configured_scope: %w", err)
+	}
+	for rows.Next() {
+		var csv, at string
+		if err := rows.Scan(&csv, &at); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("declared regions from configured_scope scan: %w", err)
+		}
+		count(csv, at)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("declared regions from configured_scope rows: %w", err)
+	}
+	rows.Close()
+
+	var present string
+	if err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='node_declared_regions'`).Scan(&present); err == nil && present != "" {
+		ndr, err := s.db.Query(`
+			WITH ranked AS (
+				SELECT target, observed_at, regions_csv,
+					ROW_NUMBER() OVER (PARTITION BY target ORDER BY observed_at DESC) AS rn
+				FROM node_declared_regions
+			)
+			SELECT observed_at, regions_csv FROM ranked WHERE rn = 1
+		`)
+		if err != nil {
+			return nil, fmt.Errorf("declared regions from node_declared_regions: %w", err)
+		}
+		defer ndr.Close()
+		for ndr.Next() {
+			var at, csv string
+			if err := ndr.Scan(&at, &csv); err != nil {
+				return nil, fmt.Errorf("declared regions from node_declared_regions scan: %w", err)
+			}
+			count(csv, at)
+		}
+		if err := ndr.Err(); err != nil {
+			return nil, fmt.Errorf("declared regions from node_declared_regions rows: %w", err)
+		}
+	}
+
+	out := make([]declaredRegionStat, 0, len(agg))
+	for _, st := range agg {
+		out = append(out, *st)
+	}
+	return out, nil
 }
 
 // rankDeclaredRegions filters stats through regionNameAcceptable and returns at
@@ -58,7 +168,8 @@ func regionNameAcceptable(name string) bool {
 func rankDeclaredRegions(stats []declaredRegionStat, max int) []string {
 	kept := make([]declaredRegionStat, 0, len(stats))
 	for _, s := range stats {
-		if regionNameAcceptable(s.Name) {
+		if canonical, ok := regionNameAcceptable(s.Name); ok {
+			s.Name = canonical
 			kept = append(kept, s)
 		}
 	}
@@ -138,6 +249,21 @@ func newRegionKeySet(cfg *Config) *regionKeySet {
 	return s
 }
 
+// regionKeySetFromKeys wraps an explicit key map in a set with no derived
+// tier. Tests that predate the derived tier use it to keep expressing "these
+// are the configured regions" without building a Config.
+func regionKeySetFromKeys(keys map[string][]byte) *regionKeySet {
+	names := make(map[string]bool, len(keys))
+	all := make(map[string][]byte, len(keys))
+	for name, key := range keys {
+		names[name] = true
+		all[name] = key
+	}
+	s := &regionKeySet{}
+	s.cur.Store(&regionKeySnapshot{all: all, explicit: names})
+	return s
+}
+
 // emptyRegionKeySnapshot backs the nil case below. Shared and never mutated:
 // refreshDerived always builds a fresh map rather than writing into one.
 var emptyRegionKeySnapshot = &regionKeySnapshot{all: map[string][]byte{}, explicit: map[string]bool{}}
@@ -176,10 +302,11 @@ func (s *regionKeySet) refreshDerived(names []string) []string {
 	}
 	added := make([]string, 0, len(names))
 	for _, raw := range names {
-		if !regionNameAcceptable(raw) {
+		canonical, ok := regionNameAcceptable(raw)
+		if !ok {
 			continue
 		}
-		name := "#" + raw
+		name := "#" + canonical
 		if old.explicit[name] {
 			continue
 		}
@@ -256,6 +383,16 @@ func (s *regionKeySnapshot) match(payloadType byte, payloadRaw []byte, code1 str
 	return scopeMatch{Reason: scopeReasonAmbiguous, Candidates: matched}
 }
 
+// matchScopeName is what the ingest path calls: the tiered decision above,
+// reduced to the string transmissions.scope_name stores, with the outcome
+// tallied for the counters. A nil set (no region keys at all) names nothing,
+// which is what an unconfigured instance did before this existed.
+func (s *regionKeySet) matchScopeName(payloadType byte, payloadRaw []byte, code1 string) string {
+	m := s.snapshot().match(payloadType, payloadRaw, code1)
+	recordScopeMatch(m)
+	return m.Name
+}
+
 // scopeMatchCounters tallies how each transport-scoped packet's region was
 // decided. It exists to answer one question before more machinery is built:
 // how often does an ambiguous collision actually happen? The spec gates the
@@ -305,7 +442,7 @@ func (s *regionKeySet) refreshFromStore(store *Store) {
 	if s == nil || !s.enabled {
 		return
 	}
-	stats, err := store.DeclaredRegionStats()
+	stats, err := store.declaredRegionSources()
 	if err != nil {
 		log.Printf("[regions] derived-key refresh failed, keeping %d existing key(s): %v", len(s.snapshot().all), err)
 		return
