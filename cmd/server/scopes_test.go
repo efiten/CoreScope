@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,110 +12,7 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// setupScopeConformanceDB builds an in-memory transmissions/observations pair
-// carrying exactly the columns ScopeConformance reads: code1/scope_name/
-// first_seen/route_type on transmissions, path_json on observations. Mirrors
-// the live ingestor schema (cmd/ingestor/db.go) rather than a convenient
-// fiction, so the join behaves the way it does against a real database.
-func setupScopeConformanceDB(t *testing.T) *DB {
-	t.Helper()
-	conn, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn.SetMaxOpenConns(1)
-	schema := `
-		CREATE TABLE transmissions (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			raw_hex TEXT NOT NULL,
-			hash TEXT NOT NULL UNIQUE,
-			first_seen TEXT NOT NULL,
-			route_type INTEGER,
-			payload_type INTEGER,
-			code1 TEXT,
-			code2 TEXT,
-			scope_name TEXT
-		);
-		CREATE TABLE observations (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			transmission_id INTEGER NOT NULL REFERENCES transmissions(id),
-			path_json TEXT,
-			timestamp INTEGER NOT NULL
-		);
-	`
-	if _, err := conn.Exec(schema); err != nil {
-		t.Fatal(err)
-	}
-	return &DB{conn: conn}
-}
-
-// newScopeTestStore wires a *PacketStore to a freshly seeded scope-conformance
-// schema. ScopeConformance is a pure SQL read against s.db, so no other
-// PacketStore field needs to be populated.
-func newScopeTestStore(t *testing.T) *PacketStore {
-	t.Helper()
-	db := setupScopeConformanceDB(t)
-	return newTestStoreWithDB(t, db, &Config{})
-}
-
 // scopeSeed carries the code1/scope_name pair for one of the three states a
-// seeded transmission can be in. scopeName mirrors scopeNameForDB's own
-// encoding: nil means the packet carried no scope at all, a non-nil pointer
-// to an empty string means transport-scoped but unmatched, and a non-nil
-// pointer to a name means matched.
-type scopeSeed struct {
-	code1     string
-	scopeName *string
-}
-
-func scopeMatched(name string) scopeSeed {
-	n := name
-	return scopeSeed{code1: "1234", scopeName: &n}
-}
-
-func scopeUnmatched() scopeSeed {
-	empty := ""
-	return scopeSeed{code1: "1234", scopeName: &empty}
-}
-
-func scopeUnscoped() scopeSeed {
-	return scopeSeed{code1: "0000", scopeName: nil}
-}
-
-var scopeSeedCounter int
-
-// seedTransmissionRoute inserts one transmission plus a single observation
-// attributing it to forwarder, built the way the ingestor would build it: the
-// path_json hop is uppercase (packetpath.DecodePathFromRawHex does
-// strings.ToUpper on every hop), so the seed exercises the same case the
-// live join has to cope with rather than a lowercase convenience fiction.
-func seedTransmissionRoute(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed, routeType int) {
-	t.Helper()
-	seedTransmissionRouteAt(t, s, forwarder, seed, routeType, "2026-01-15T12:00:00Z")
-}
-
-// seedTransmissionRouteAt is seedTransmissionRoute with an explicit
-// first_seen, for tests (e.g. the handler tests below) that need a
-// transmission to fall inside a real-wall-clock ?window= lookback rather
-// than the fixed date the ScopeConformance unit tests above use.
-func seedTransmissionRouteAt(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed, routeType int, firstSeen string) {
-	t.Helper()
-	seedTransmissionPathAt(t, s, []string{forwarder}, seed, routeType, firstSeen)
-}
-
-func seedTransmission(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed) {
-	t.Helper()
-	seedTransmissionRoute(t, s, forwarder, seed, RouteFlood)
-}
-
-// seedDirectTransmission seeds a DIRECT packet (route_type=2) — path[last] is
-// the route's far end, never the transmitter, so forwarder must NOT be
-// attributed even though it appears in path_json.
-func seedDirectTransmission(t *testing.T, s *PacketStore, forwarder string, seed scopeSeed) {
-	t.Helper()
-	seedTransmissionRoute(t, s, forwarder, seed, RouteDirect)
-}
-
 // seedTransmissionPath is seedTransmissionPathAt at the fixed date the
 // ScopeConformance unit tests use.
 func seedTransmissionPath(t *testing.T, s *PacketStore, hops []string, seed scopeSeed, routeType int) {
@@ -404,14 +299,6 @@ func TestScopeConformanceRespectsSinceWindow(t *testing.T) {
 
 // testFullPubkeyA/testFullPubkeyB are 64-hex-char (32-byte) pubkeys standing
 // in for real node identities. Task 2's endpoint hands ScopeConformance a
-// full pubkey like this, not a short hash — path_json hops are truncated
-// hashes (1-4 bytes), so the join must match the hop as a PREFIX of the full
-// pubkey, not by exact equality.
-var (
-	testFullPubkeyA = "1a2b" + strings.Repeat("11", 30) // 64 hex chars
-	testFullPubkeyB = "bbbb" + strings.Repeat("22", 30) // 64 hex chars
-)
-
 // TestScopeConformanceMatchesTruncatedHopAgainstFullPubkey is the case that
 // fails without prefix matching: a real repeater query passes the full
 // 64-char pubkey, but path_json only ever stores a 1-4 byte hash prefix. An
@@ -816,31 +703,6 @@ func TestHandleNodeScopesServesFromCache(t *testing.T) {
 
 // --- FIX 1: ScopeAuditForwarding ambiguous-hop attribution ---
 
-// seedUnmatchedRawAt seeds one unmatched transmission carrying a real raw_hex,
-// attributed to forwarder. Distinct from seedTransmissionRouteAt, which seeds
-// raw_hex 'AA' - fine for tests that never parse it, useless here.
-func seedUnmatchedRawAt(t *testing.T, s *PacketStore, forwarder, rawHex string, routeType int, firstSeen string) {
-	t.Helper()
-	scopeSeedCounter++
-	hash := fmt.Sprintf("scoperaw%d", scopeSeedCounter)
-	res, err := s.db.conn.Exec(
-		`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, code1, code2, scope_name)
-		 VALUES (?, ?, ?, ?, 5, '9209', '0000', '')`,
-		rawHex, hash, firstSeen, routeType)
-	if err != nil {
-		t.Fatal(err)
-	}
-	txID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.conn.Exec(
-		`INSERT INTO observations (transmission_id, path_json, timestamp) VALUES (?, ?, 0)`,
-		txID, `["`+strings.ToUpper(forwarder)+`"]`); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // TestHandleNodeScopesDifferentWindowIsSeparateCacheEntry confirms the cache
 // key includes window: a request for a different window must recompute
 // rather than reuse another window's cached entry.
@@ -872,5 +734,76 @@ func TestHandleNodeScopesDifferentWindowIsSeparateCacheEntry(t *testing.T) {
 	}
 	if len(got.Observed) != 1 || got.Observed[0].Packets != 2 {
 		t.Errorf("window=24h response = %+v, want a fresh compute (2 packets), not the window=1h cache entry", got.Observed)
+	}
+}
+
+// TestHandleScopeAuditLeavesCleanRowsAlone: a repeater whose declared regions
+// are all observed by name, with no unmatched traffic at all, must be untouched
+// by verification - no evidence, no change to notObserved, and an empty (not
+// null) regionEvidence so a client can iterate it without a guard.
+func TestHandleScopeAuditLeavesCleanRowsAlone(t *testing.T) {
+	srv, router := setupScopeAuditServer(t)
+	pk := testFullPubkeyA
+	insertDeclared(t, srv, pk, time.Now().UTC().Format(time.RFC3339), "be", 0)
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionRouteAt(t, srv.store, pk[:4], scopeMatched("#be"), RouteFlood, recent)
+
+	got := getScopeAudit(t, router, "")
+	row := got.Repeaters[0]
+	if len(row.NotObserved) != 0 {
+		t.Errorf("notObserved = %v, want empty", row.NotObserved)
+	}
+	if row.RegionEvidence == nil {
+		t.Error("regionEvidence = nil, want an empty object - a client must not need a null guard")
+	}
+	if len(row.RegionEvidence) != 0 {
+		t.Errorf("regionEvidence = %v, want empty - nothing needed verifying here", row.RegionEvidence)
+	}
+}
+
+// TestHandleScopeAuditNoDeclaredRegionsTable covers the missing-table
+// degrade path (mirrors TestHandleNodeScopesNoDeclaredRegionsTable): an
+// older database predating node_declared_regions must not fail the request.
+func TestHandleScopeAuditNoDeclaredRegionsTable(t *testing.T) {
+	db := setupScopeConformanceDB(t) // no node_declared_regions table at all
+	cfg := &Config{Port: 3000}
+	hub := NewHub()
+	srv := NewServer(db, cfg, hub)
+	srv.store = newTestStoreWithDB(t, db, cfg)
+	router := mux.NewRouter()
+	srv.RegisterRoutes(router)
+
+	got := getScopeAudit(t, router, "")
+	if len(got.Repeaters) != 0 {
+		t.Errorf("repeaters = %+v, want empty when node_declared_regions doesn't exist", got.Repeaters)
+	}
+}
+
+// TestScopeAuditForwardingRecordsUnmatchedTxIDs: the counter M1 added says how
+// many, verification needs to know which. The IDs must be de-duplicated the
+// same way the counter is â€” a target appearing twice in one path contributed
+// one packet, and counting it twice would let a single packet reach the
+// two-corroboration threshold on its own.
+func TestScopeAuditForwardingRecordsUnmatchedTxIDs(t *testing.T) {
+	s := newScopeTestStore(t)
+	hop := testFullPubkeyA[:4]
+	recent := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedTransmissionPathAt(t, s, []string{hop, "AAAA", hop}, scopeUnmatched(), RouteFlood, recent)
+	seedTransmissionPathAt(t, s, []string{"BBBB", hop}, scopeUnmatched(), RouteFlood, recent)
+	seedTransmissionPathAt(t, s, []string{hop}, scopeMatched("#be"), RouteFlood, recent)
+
+	got, err := s.ScopeAuditForwarding("2026-01-01T00:00:00Z", []string{testFullPubkeyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := got[testFullPubkeyA]
+	if agg == nil {
+		t.Fatalf("want an agg, got none (result = %+v)", got)
+	}
+	if len(agg.unmatchedTxIDs) != 2 {
+		t.Errorf("unmatchedTxIDs = %v, want 2 distinct ids â€” the twice-hopped packet counts once, and the matched packet not at all", agg.unmatchedTxIDs)
+	}
+	if agg.unmatchedPackets != int64(len(agg.unmatchedTxIDs)) {
+		t.Errorf("unmatchedPackets = %d but %d ids recorded â€” the count and the ids must not drift", agg.unmatchedPackets, len(agg.unmatchedTxIDs))
 	}
 }
