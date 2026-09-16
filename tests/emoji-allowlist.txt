@@ -96,3 +96,10 @@ cmd/decrypt/*.go                          # standalone decrypt CLI HTML template
 # --- live.css / style.css inline comments referencing prior glyphs ---
 public/live.css                          # comments describing ⚙/⚠/✕/◫ legacy chrome
 public/style.css                         # CSS comments + ▾/▸ group-header caret pseudo
+
+# Fork-local (locode): MeshCore operators put the power source in the node
+# NAME itself, so these codepoints are protocol content the parser matches on
+# and the naming guide documents. Not iconography: replacing them with a
+# Phosphor sprite would stop the parser recognising real node names.
+public/locode.js
+public/naming-guide.html
