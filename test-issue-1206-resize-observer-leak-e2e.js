@@ -63,7 +63,17 @@ async function withNodeMaps(browser, fn, allowedErrors = []) {
         : path === '/api/nodes/clock-skew' ? []
         : /\/health$/.test(path) ? { stats: {}, observers: [], recentPackets: [] }
         : /\/neighbors$/.test(path) ? { neighbors: [] }
-        : /\/paths$/.test(path) ? { paths: [] } : {};
+        : /\/paths$/.test(path) ? { paths: [] }
+        // Fork-local: the full node view mounts the Scopes card for repeater
+        // and room roles (nodes.js, node-scopes.js), and the fixtures are
+        // repeaters. The server always sends observed: [] (scopes.go:140), so
+        // the mock has to as well; an empty {} made buildRows() throw on
+        // undefined.forEach and the pageerror assertion failed every full-view
+        // case.
+        : /\/scopes$/.test(path)
+          ? { observed: [], unmatched: 0, unscoped: 0, declared: null,
+              routes: { transportFlood: 0, flood: 0, direct: 0, transportDirect: 0 } }
+        : {};
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
     });
     await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
