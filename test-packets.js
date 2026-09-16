@@ -90,6 +90,10 @@ function makeSandbox() {
     _registeredPages: registeredPages,
     // Stub global functions packets.js depends on
     registerPage: (name, handler) => { registeredPages[name] = handler; },
+    // Fork-local: locode.js decorates node names with a decoding tooltip and
+    // is loaded separately in the browser, so packets.js calls this global.
+    // Same stand-in as test-issue-1606-pagination.js uses.
+    locodeAttr: () => '',
   };
   vm.createContext(ctx);
   return ctx;

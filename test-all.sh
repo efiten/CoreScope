@@ -140,6 +140,7 @@ node test-live-legend-helper.js
 node test-live-multibyte-filter.js
 node test-live-region-filter.js
 node test-live.js
+node test-locode.js
 node test-map-clustering.js
 node test-mqtt-status-panel.js
 node test-my-repeaters-dashboard.js
@@ -147,6 +148,7 @@ node test-naive-banner-tone.js
 node test-node-hop-analytics.js
 node test-node-reach-coverage-debounce.js
 node test-node-reach-coverage.js
+node test-node-scopes.js
 node test-nodes-export-wiring.js
 node test-nodes-export.js
 node test-observer-iata-1188.js
