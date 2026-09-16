@@ -129,6 +129,12 @@ func newTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Fork-local: this fork schedules more async migrations than upstream, and
+	// their goroutines log. A later test that captures log output with
+	// log.SetOutput then races the migration's log.Println on the same buffer
+	// (seen on TestHandleMessageDecodeErrorLog_PII_Issue1211 under -race).
+	// Waiting here keeps every test that uses this helper race-clean.
+	s.WaitForAsyncMigrations()
 	t.Cleanup(func() { s.Close() })
 	return s
 }
