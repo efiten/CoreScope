@@ -7751,6 +7751,9 @@ func (s *PacketStore) computeAnalyticsDistance(region, area string) map[string]i
 	}
 
 	s.mu.RLock()
+	// MUTATION (do not merge): hold the RLock for the whole compute, the
+	// exact #1239 pattern, to prove the calibrated test still catches it.
+	defer s.mu.RUnlock()
 	hopsSnap := s.distHops
 	pathsSnap := s.distPaths
 
@@ -7788,7 +7791,7 @@ func (s *PacketStore) computeAnalyticsDistance(region, area string) map[string]i
 			}
 		}
 	}
-	s.mu.RUnlock()
+	// MUTATION: original unlock removed, see the defer above
 
 	// Everything below operates on hopsSnap / pathsSnap / matchSet —
 	// no s.mu, no s.distHops / s.distPaths access. Safe to run while
