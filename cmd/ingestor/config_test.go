@@ -524,21 +524,6 @@ func TestClientRxObservationsGate(t *testing.T) {
 	}
 }
 
-func TestClientRegionsDaysOrZero(t *testing.T) {
-	var c Config
-	if got := c.ClientRegionsDaysOrZero(); got != 0 {
-		t.Errorf("unset retention = %d, want 0", got)
-	}
-	c.Retention = &RetentionConfig{ClientRegionsDays: 21}
-	if got := c.ClientRegionsDaysOrZero(); got != 21 {
-		t.Errorf("retention = %d, want 21", got)
-	}
-	c.Retention = &RetentionConfig{ClientRegionsDays: 0}
-	if got := c.ClientRegionsDaysOrZero(); got != 0 {
-		t.Errorf("retention=0 = %d, want 0", got)
-	}
-}
-
 // --- #1784: GetPathTrust ---
 
 func TestGetPathTrustDefaults(t *testing.T) {
@@ -562,6 +547,21 @@ func TestGetPathTrustNilConfig(t *testing.T) {
 	pt := cfg.GetPathTrust()
 	if pt.MinHashBytesForMapping != packetpath.DefaultMinHashBytesForMapping {
 		t.Errorf("expected default %d for nil *Config, got %d", packetpath.DefaultMinHashBytesForMapping, pt.MinHashBytesForMapping)
+	}
+}
+
+func TestClientRegionsDaysOrZero(t *testing.T) {
+	var c Config
+	if got := c.ClientRegionsDaysOrZero(); got != 0 {
+		t.Errorf("unset retention = %d, want 0", got)
+	}
+	c.Retention = &RetentionConfig{ClientRegionsDays: 21}
+	if got := c.ClientRegionsDaysOrZero(); got != 21 {
+		t.Errorf("retention = %d, want 21", got)
+	}
+	c.Retention = &RetentionConfig{ClientRegionsDays: 0}
+	if got := c.ClientRegionsDaysOrZero(); got != 0 {
+		t.Errorf("retention=0 = %d, want 0", got)
 	}
 }
 
