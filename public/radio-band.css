@@ -1,0 +1,28 @@
+/* radio-band.css — the band pill on the observers list.
+ *
+ * Lives in its own file rather than in style.css so an upstream change to that
+ * file cannot conflict with this fork-local feature, matching how
+ * node-reach-coverage.css is kept apart. See public/radio-band.js.
+ *
+ * The badge itself reuses .badge-iata, so the default (868, the overwhelming
+ * majority) needs no rule at all and tracks the theme exactly like every other
+ * inline pill. Only the exception gets a colour.
+ */
+
+/* 433 MHz is the one worth spotting in a list where nearly everything is 868,
+ * so it borrows the amber pair rather than a colour of its own. Both variables
+ * are defined for light AND dark (style.css :root and both dark blocks) and
+ * are already paired this way by .skew-badge--bimodal_clock, so the contrast
+ * is one the theme already ships rather than a new combination to verify.
+ *
+ * No hex here on purpose: a literal would not follow the customizer, and the
+ * #1719 contrast gate checks the variables, not the values a component
+ * happens to hardcode. */
+.band-badge.band-433 {
+  background: var(--status-amber-light);
+  color: var(--status-amber-text);
+}
+
+/* 915 gets nothing for now. It does not occur on this deployment, and giving
+ * it a colour before anyone has seen one would be decorating a guess. When US
+ * traffic shows up, add it here — the per-band class is already emitted. */
