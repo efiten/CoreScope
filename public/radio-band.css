@@ -4,25 +4,38 @@
  * file cannot conflict with this fork-local feature, matching how
  * node-reach-coverage.css is kept apart. See public/radio-band.js.
  *
- * The badge itself reuses .badge-iata, so the default (868, the overwhelming
- * majority) needs no rule at all and tracks the theme exactly like every other
- * inline pill. Only the exception gets a colour.
+ * Loaded after style.css, so these rules win over .badge-iata at equal
+ * specificity without needing !important.
  */
 
-/* 433 MHz is the one worth spotting in a list where nearly everything is 868,
- * so it borrows the amber pair rather than a colour of its own. Both variables
- * are defined for light AND dark (style.css :root and both dark blocks) and
- * are already paired this way by .skew-badge--bimodal_clock, so the contrast
- * is one the theme already ships rather than a new combination to verify.
+/* The band pill needs its OWN colour family, and not for decoration: the badge
+ * reuses .badge-iata, whose background/colour are var(--nav-bg)/var(--nav-text)
+ * — byte-for-byte the same as .badge-repeater, which sits in the same name
+ * cell. Measured on the live observers list, a repeater row rendered two pills
+ * at rgb(15,15,35) on white: one meaning "this is a repeater", the other
+ * meaning "this listens on 868". Identical styling for unrelated facts.
  *
- * No hex here on purpose: a literal would not follow the customizer, and the
- * #1719 contrast gate checks the variables, not the values a component
- * happens to hardcode. */
+ * A translucent accent tint keeps the majority readable without shouting, and
+ * separates band from role at a glance. --accent-bg with --text is the pairing
+ * .multibyte-badge and .copy-link-btn already use, so it is contrast the theme
+ * ships rather than a new combination. No border: .badge-iata has 1px vertical
+ * padding, and adding one would grow every row in a dense table. */
+.band-badge {
+  background: var(--accent-bg);
+  color: var(--text);
+}
+
+/* 433 is the exception you scan a mostly-868 list for, so it keeps a solid
+ * fill rather than a tint. Both variables are defined for light AND dark
+ * (style.css :root plus both dark blocks) and are already paired this way by
+ * .skew-badge--bimodal_clock. Measured: 6.37:1 light, 10.11:1 dark. */
 .band-badge.band-433 {
   background: var(--status-amber-light);
   color: var(--status-amber-text);
 }
 
-/* 915 gets nothing for now. It does not occur on this deployment, and giving
- * it a colour before anyone has seen one would be decorating a guess. When US
- * traffic shows up, add it here — the per-band class is already emitted. */
+/* 915 deliberately has no rule: it inherits the .band-badge tint, which is
+ * correct — it is a band, just not the one this deployment watches for. It
+ * does not occur here at all, and giving it a colour before anyone has seen
+ * one would be decorating a guess. The per-band class is already emitted, so
+ * adding it later is one rule. */
