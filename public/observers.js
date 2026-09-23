@@ -438,6 +438,10 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
       </table></div>`;
     makeColumnsResizable('#obsTable', 'meshcore-obs-col-widths');
     const obsTbl = document.getElementById('obsTable');
+    // Fork-local: band badge from the observer's own radio config. Decorates
+    // after render rather than inside the row template, so an upstream change
+    // to that template does not conflict. See public/radio-band.js.
+    if (window.RadioBand) window.RadioBand.decorateObservers(el, filtered);
     // #1644 — restore previously-checked compare-select boxes.
     if (obsTbl && _prevSelected.size > 0) {
       var _tbody = obsTbl.querySelector('tbody');
