@@ -44,12 +44,28 @@
     if (!parsed) return null;
     var country = (data.countries || {})[parsed.cc];
     if (!country) return null;
-    // Regions before locations, so an explicit ISO 3166-2 region code wins over
-    // a colliding city code (NRW the Bundesland over Neuweier the town). This
-    // mirrors buildLocodeHtml in locode.js on purpose; if one changes the other
-    // has to, or the column and the tooltip will disagree about the same node.
-    var place = ((data.regions || {})[parsed.cc] || {})[parsed.loc] ||
-                ((data.locations || {})[parsed.cc] || {})[parsed.loc];
+    // A province or Bundesland is NOT a location, and this column must not fill
+    // itself with one. An earlier version looked in `regions` first, the way
+    // buildLocodeHtml does for the tooltip, and the result was that 601 of the 964
+    // resolving nodes showed a province while only 363 showed a real place:
+    // DE-NW-* as "Nordrhein-Westfalen", BE-VAN-* as "Antwerpen" the province,
+    // nl-li-* as "Limburg". The tooltip may say that, since it lists every field
+    // it can decode. A column headed Location may not.
+    //
+    // Reading the city code out of the THIRD position does not rescue them and
+    // was measured, not assumed: of those 601 it resolves for 80, and roughly half
+    // of those 80 are wrong, because German Kfz codes occupy the same two- and
+    // three-letter space as UN/LOCODE with different meanings. DE-NW-HSK is
+    // Hochsauerlandkreis and resolves to Kaisersesch in Rhineland-Palatinate;
+    // DE-NW-HER is Herne and resolves to Herbrechtingen in Baden-Wuerttemberg.
+    // Those rows are better served by the GPS fallback, which gives a real place
+    // with a distance the reader can judge.
+    //
+    // Checking regions first and rejecting is deliberate rather than just reading
+    // locations: DE-NRW is both a Bundesland and the town Neuweier, and an
+    // operator writing DE-NRW means the Bundesland.
+    if (((data.regions || {})[parsed.cc] || {})[parsed.loc]) return null;
+    var place = ((data.locations || {})[parsed.cc] || {})[parsed.loc];
     if (!place) return null;
     return { place: place, country: country, cc: parsed.cc, loc: parsed.loc };
   }

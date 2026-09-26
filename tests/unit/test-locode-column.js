@@ -68,21 +68,33 @@ function load(opts) {
     assert.strictEqual(r.country, 'Belgium');
   });
 
-  await test('an ISO 3166-2 region code resolves too, not just cities', () => {
-    const r = LC.placeOf('DE-NW-SOME-REPEATER', DATA);
-    assert.ok(r, 'DE-NW did not resolve');
-    assert.strictEqual(r.place, 'Nordrhein-Westfalen');
+  await test('a province is not a location, so a region code resolves to nothing', () => {
+    // Changed on 2026-09-26 after efite pointed out the column was filling itself
+    // with provinces. Measured on 2013 live names at the time: 601 nodes resolved
+    // to a province against 363 to a real place. DE-NW is Nordrhein-Westfalen,
+    // BE-VAN the province of Antwerpen, NL-LI Limburg. The tooltip in locode.js
+    // may still name them; a column headed Location may not.
+    assert.strictEqual(DATA.regions.DE.NW, 'Nordrhein-Westfalen', 'DE-NW is no longer a region in locode.json');
+    assert.strictEqual(LC.placeOf('DE-NW-SOME-REPEATER', DATA), null);
+    assert.strictEqual(LC.placeOf('BE-VAN-AAR-KOFFIE', DATA), null, 'BE-VAN is the province of Antwerpen');
+    assert.strictEqual(LC.placeOf('nl-li-sti-rptr', DATA), null, 'NL-LI is Limburg');
   });
 
-  await test('on a collision the region wins over the town', () => {
-    // DE-NRW is the only code in locode.json that is both, and it is why the
-    // lookup order is regions before locations. Assert the collision still
-    // exists, so this cannot pass by the data changing underneath it.
+  await test('a code that is both a province and a town resolves to neither', () => {
+    // DE-NRW is the only such collision in the data: the Bundesland, and the town
+    // Neuweier. An operator writing DE-NRW means the Bundesland, so answering
+    // "Neuweier" would be worse than answering nothing. This is why regions are
+    // checked and rejected rather than simply not consulted.
     assert.strictEqual(DATA.regions.DE.NRW, 'Nordrhein-Westfalen', 'DE-NRW is no longer a region in locode.json');
     assert.strictEqual(DATA.locations.DE.NRW, 'Neuweier', 'DE-NRW is no longer also a town in locode.json');
-    const r = LC.placeOf('DE-NRW-REPEATER', DATA);
-    assert.strictEqual(r.place, 'Nordrhein-Westfalen',
-      'the town won, so the column and locode.js\'s tooltip now disagree about the same node');
+    assert.strictEqual(LC.placeOf('DE-NRW-REPEATER', DATA), null);
+  });
+
+  await test('a real city code still resolves, which is the whole point', () => {
+    // The guard above must not swallow the cases the column exists for.
+    assert.strictEqual(LC.placeOf('BE-ANR-ON8AR', DATA).place, 'Antwerpen');
+    assert.strictEqual(LC.placeOf('be-ras-rausimous-3', DATA).place, 'Ranst');
+    assert.strictEqual(LC.placeOf('BE-OEL-X', DATA).place, 'Oelegem');
   });
 
   await test('a name without the convention resolves to nothing, not a guess', () => {
