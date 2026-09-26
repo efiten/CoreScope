@@ -280,6 +280,10 @@
 
     return '<tr data-pubkey="' + escapeHtml(row.publicKey) + '">' +
       '<td class="sa-name" data-value="' + escapeHtml(nameSortValue) + '">' + nameHtml(row) + (row.role != null && row.role !== '' ? '<span class="text-muted sa-role"> ' + escapeHtml(row.role) + '</span>' : '') + '</td>' +
+      // Fork-local (locode): pairs with the <th> in pageHtml. Must stay in the
+      // same position as that header or the column and its values separate,
+      // because table-sort.js maps a header to a cell by index.
+      (window.LocodeColumn ? window.LocodeColumn.cellHtml(row.name || '') : '') +
       '<td data-value="' + statusScore(row) + '">' + issuesHtml + '</td>' +
       '<td data-value="' + escapeHtml(CONFIG_STATES[row.configState].label) + '">' + configStateHtml(row) + '</td>' +
       '<td data-value="' + row.notObserved.length + '">' + mergedScopeChips(row) + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + ambiguousCaveat(row) + unmatchedCaveat(row) + '</td>' +
@@ -348,6 +352,11 @@
       windowHonestyNote(d.window) +
       '<div class="sa-table-wrap"><table class="ns-table sa-table" id="saTable"><thead><tr>' +
       '<th data-sort-key="name">Repeater</th>' +
+      // Fork-local (locode): a Location column derived from the node name. All
+      // the logic is in public/locode-column.js so upstream churn in this file
+      // cannot reach it; this line and the matching <td> below are the whole
+      // wiring. If this conflicts on an integration, re-insert both.
+      (window.LocodeColumn ? window.LocodeColumn.headerHtml() : '') +
       '<th data-sort-key="status" data-type="numeric">Status</th>' +
       '<th data-sort-key="config">Config</th>' +
       '<th data-sort-key="notObserved" data-type="numeric" title="Declared regions, coloured by whether forwarding was observed in this window. Green = observed, red = declared but not observed.">Scopes</th>' +
@@ -381,9 +390,15 @@
     }
     var body = document.getElementById('saBody');
     if (body) body.innerHTML = '<div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading scope audit…</div>';
+    // Fork-local (locode): resolve locode.json before rendering, so the Location
+    // cells carry their sort value on first paint instead of filling in later.
+    // Runs alongside the audit fetch rather than before it, and a failure inside
+    // prime() leaves the column empty rather than blocking the page.
+    var primed = window.LocodeColumn ? window.LocodeColumn.prime() : Promise.resolve();
     var d;
     try {
       d = await api('/scope-audit?window=' + encodeURIComponent(w), { ttl: 30000 });
+      await primed;
     } catch (e) {
       if (myGen !== loadGen) return;
       if (body) body.innerHTML = '<div class="ns-empty">Failed to load scope audit: ' + escapeHtml(e.message) + '</div>';

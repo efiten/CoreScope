@@ -146,6 +146,7 @@ node tests/unit/test-live-multibyte-filter.js
 node tests/unit/test-live-region-filter.js
 node tests/unit/test-live.js
 node tests/unit/test-locode.js
+node tests/unit/test-locode-column.js
 node tests/unit/test-map-clustering.js
 node tests/unit/test-mqtt-status-panel.js
 node tests/unit/test-my-repeaters-dashboard.js

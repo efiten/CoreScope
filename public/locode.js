@@ -93,6 +93,12 @@ function _ensureData() {
   return _locodePromise;
 }
 
+// locode-column.js resolves the same codes for its table column. locode.json is
+// 947 KB, so it shares this one load instead of fetching it a second time.
+window.ensureLocodeData = function () {
+  return _ensureData().then(() => _locodeData);
+};
+
 // buildLocodeHtml renders the tooltip from a name + the locode data object.
 // Pure (no module state) so it is unit-testable. Each piece is shown only if it
 // resolves; returns null when nothing does. Handles both the LOCODE type code
