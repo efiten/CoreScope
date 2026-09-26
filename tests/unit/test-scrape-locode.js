@@ -12,7 +12,9 @@
 'use strict';
 
 const assert = require('assert');
-const { parseCsv, toDecimal, COUNTRIES } = require('../../scripts/scrape-locode.js');
+const fs = require('fs');
+const path = require('path');
+const { parseCsv, toDecimal, COUNTRIES, PREFER_NAME_STARTING } = require('../../scripts/scrape-locode.js');
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -89,6 +91,46 @@ test('the country list is the five the fork resolves', () => {
   // A country added here needs a matching entry in locode.json's regions to be
   // useful, so the list is not incidental.
   assert.deepStrictEqual(Object.keys(COUNTRIES).sort(), ['BE', 'DE', 'FR', 'GB', 'NL']);
+});
+
+console.log('\n=== scrape-locode: the bilingual preference reached the shipped data ===');
+
+// The source lists 22 codes twice, and which row wins is a preference rather than
+// a correctness question. efite asked for the Dutch form first, so the check that
+// matters is on the committed file: re-running the scraper without the table, or
+// with a broken lookup, changes public/locode.json and fails here. No network.
+const SHIPPED = JSON.parse(
+  fs.readFileSync(path.join(__dirname, '..', '..', 'public', 'locode.json'), 'utf8'));
+
+test('every preferred name is the one in public/locode.json', () => {
+  const wrong = [];
+  for (const [key, want] of Object.entries(PREFER_NAME_STARTING)) {
+    const [cc, code] = key.split('-');
+    const got = ((SHIPPED.locations || {})[cc] || {})[code];
+    if (got === undefined) { wrong.push(key + ' is absent from the shipped data'); continue; }
+    if (!got.startsWith(want)) {
+      wrong.push(key + ': wanted a name starting ' + JSON.stringify(want) + ', shipped ' + JSON.stringify(got));
+    }
+  }
+  assert.deepStrictEqual(wrong, [], 'the shipped data does not match the preference table');
+});
+
+test('the preference table is shaped as CC-CODE to a non-empty name', () => {
+  for (const [key, want] of Object.entries(PREFER_NAME_STARTING)) {
+    assert.ok(/^[A-Z]{2}-[A-Z0-9]{2,3}$/.test(key), 'bad key: ' + key);
+    assert.ok(typeof want === 'string' && want.length > 1, 'bad value for ' + key + ': ' + JSON.stringify(want));
+  }
+});
+
+test('Dutch-first is what actually landed, on codes a reader would notice', () => {
+  // Full names rather than prefixes, so a lookup that happened to satisfy every
+  // startsWith above still shows up here if it picked the wrong row.
+  const be = SHIPPED.locations.BE;
+  assert.strictEqual(be.BRU, 'Brussel (Bruxelles)');
+  assert.strictEqual(be.TRN, 'Doornik (Tournai)');
+  assert.strictEqual(be.MOS, 'Moeskroen (Mouscron)');
+  assert.strictEqual(be.LNY, 'Ternaaien (Lanaye)');
+  assert.strictEqual(be.KAN, 'Kanne (Canne)');
 });
 
 console.log(`\nTotal: ${passed} passed, ${failed} failed`);

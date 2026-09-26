@@ -41,6 +41,42 @@ const COUNTRIES = {
   FR: 'France',
 };
 
+// 22 codes appear twice in the source. 21 are Belgian bilingual listings of one
+// place with the languages swapped ("Brussel (Bruxelles)" against "Bruxelles
+// (Brussel)"), same coordinates and same status; DE-LAA is a spa-town prefix
+// rather than a language pair. Either row is correct, so this is a preference,
+// and efite asked for the Dutch form first (2026-09-26): this is a Belgian mesh
+// and its readers are mostly Flemish.
+//
+// Keyed by "<cc>-<code>" to the opening word of the wanted name, which keeps the
+// table short and reviewable. A duplicate that is NOT listed here falls back to
+// the alphabetically first name AND logs a warning, so a new pair in a future
+// edition cannot pass unnoticed.
+const PREFER_NAME_STARTING = {
+  'BE-BRU': 'Brussel',                  // Bruxelles
+  'BE-BTS': 'Bitsingen',                // Bassenge
+  'BE-ESE': 'Elsene',                   // Ixelles
+  'BE-ITR': 'Itter',                    // Ittre
+  'BE-KAN': 'Kanne',                    // Canne
+  'BE-LNY': 'Ternaaien',                // Lanaye
+  'BE-MOS': 'Moeskroen',                // Mouscron
+  'BE-MSJ': 'Sint-Jans-Molenbeek',      // Molenbeek-Saint-Jean
+  'BE-ODE': 'Oudergem',                 // Auderghem
+  'BE-OST': 'Oostende',                 // Ostend, English rather than French here
+  'BE-SBK': 'Schaarbeek',               // Schaerbeek
+  'BE-SGI': 'Sint-Gillis',              // Saint-Gilles
+  'BE-SJN': 'Sint-Joost-ten-Node',      // Saint-Josse-ten-Noode
+  'BE-SLW': 'Sint-Lambrechts-Woluwe',   // Woluwé-Saint-Lambert
+  'BE-SPI': 'Spiere',                   // Espierres
+  'BE-SPO': 'Sint-Pieters-Woluwe',      // Woluwé-Saint-Pierre
+  'BE-TRN': 'Doornik',                  // Tournai
+  'BE-UKE': 'Ukkel',                    // Uccle
+  'BE-VOS': 'Vorst',                    // Forest
+  'BE-WBV': 'Watermaal-Bosvoorde',      // Watermael-Boitsfort
+  'BE-ZUN': 'Zuun',                     // Zuen
+  'DE-LAA': 'Bad Laasphe',              // Laasphe, the official name carries the Bad
+};
+
 // MeshCore's own naming convention, not part of UN/LOCODE.
 const TYPES = {
   COR: 'Core Repeater',
@@ -137,6 +173,7 @@ async function main() {
   const locations = {};
   const coords = {};
   let skipped = 0, collapsed = 0;
+  const unlisted = [];
   for (const r of rows) {
     const cc = (r[col.Country] || '').trim();
     if (!COUNTRIES[cc]) continue;
@@ -150,14 +187,16 @@ async function main() {
     if (bucket[loc] === undefined) {
       bucket[loc] = name;
     } else if (name !== bucket[loc]) {
-      // 22 codes in these five countries appear twice, all Belgian bilingual
-      // listings of one place with the languages swapped: "Brussel (Bruxelles)"
-      // against "Bruxelles (Brussel)", same coordinates, same status. Either is
-      // correct, so the choice only has to be reproducible: taking whichever row
-      // came last would change the committed file if the source ever reorders.
-      // Alphabetical does not depend on row order.
+      // See PREFER_NAME_STARTING. Neither branch depends on row order, so the
+      // committed file does not change if the source ever reorders.
       collapsed++;
-      if (name < bucket[loc]) bucket[loc] = name;
+      const want = PREFER_NAME_STARTING[cc + '-' + loc];
+      if (want) {
+        if (name.startsWith(want)) bucket[loc] = name;
+      } else {
+        unlisted.push(cc + '-' + loc + ': ' + JSON.stringify([bucket[loc], name].sort()));
+        if (name < bucket[loc]) bucket[loc] = name;
+      }
     }
     const d = toDecimal(r[col.Coordinates]);
     if (d && (coords[cc] = coords[cc] || {})[loc] === undefined) coords[cc][loc] = d;
@@ -171,7 +210,12 @@ async function main() {
       c + ' with coordinates (' + (n ? Math.round((100 * c) / n) : 0) + '%)');
   }
   if (skipped) console.log('  skipped ' + skipped + ' cross-reference or placeholder rows');
-  if (collapsed) console.log('  collapsed ' + collapsed + ' duplicate codes to the alphabetically first name (bilingual listings)');
+  if (collapsed) console.log('  collapsed ' + collapsed + ' duplicate codes (bilingual listings)');
+  if (unlisted.length) {
+    console.log('  WARNING: ' + unlisted.length + ' duplicate code(s) are not in PREFER_NAME_STARTING,');
+    console.log('           so the alphabetically first name was taken. Add them deliberately:');
+    unlisted.forEach(function (u) { console.log('             ' + u); });
+  }
 
   // Merge: replace what this source owns, keep everything it does not.
   const merged = Object.assign({}, existing, {
@@ -201,7 +245,7 @@ async function main() {
 
 // Exported for tests/unit/test-scrape-locode.js. main() runs only as a script, so
 // requiring this file parses no CSV and fetches nothing.
-module.exports = { parseCsv, toDecimal, COUNTRIES, TYPES, CSV_URL };
+module.exports = { parseCsv, toDecimal, COUNTRIES, TYPES, CSV_URL, PREFER_NAME_STARTING };
 
 if (require.main === module) {
   main().catch(err => { console.error(err); process.exit(1); });
