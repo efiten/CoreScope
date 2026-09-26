@@ -1508,6 +1508,123 @@ func (s *Store) RunIncrementalVacuum(pages int) {
 	}
 }
 
+// RefreshPlannerStats rebuilds the query planner's cardinality statistics
+// (#2058).
+//
+// Without a sqlite_stat1 table the planner works from built-in guesses, and on
+// the channel queries it guesses wrong: it drives from the plain
+// idx_transmissions_payload_type rather than idx_tx_channel_hash, the partial
+// index (WHERE payload_type = 5) this schema already carries for that exact
+// filter.
+//
+// Measured on the 9.4 GB staging database (1,250,489 transmissions, 14,169,329
+// observations), region-filtered GetChannels, counting page-cache misses
+// because wall time there is dominated by the OS page cache (56.7s cold, 0.80s
+// warm, for the same query and plan):
+//
+//	analysis_limit   ANALYZE    driving index                     page misses
+//	none (no stats)  -          idx_transmissions_payload_type     143,442
+//	400              171ms      idx_transmissions_payload_type     143,449
+//	1000             171ms      idx_transmissions_payload_type     143,450
+//	10000            2.0s*      idx_tx_channel_hash                107,429
+//	0 (unbounded)    242.9s     idx_tx_channel_hash                107,429
+//
+// (*) Every ANALYZE duration in that table was timed on a warm page cache, one
+// after another. The same statement at limit 10000 took 3m43.9s cold, on a
+// freshly started container. See EnsurePlannerStats.
+//
+// So 10000 buys the whole plan change, and the four-minute unbounded ANALYZE
+// buys nothing beyond it. 400, the value SQLite's documentation offers for the
+// bounded form, changes nothing at all on this data: it samples too few rows to
+// separate the 126,336-row partial index from the 920,700-row plain one.
+//
+// ANALYZE, not PRAGMA optimize. Measured on the same database: optimize is a
+// no-op here, because it only analyzes tables that the calling connection has
+// itself queried during the session, and a maintenance call has queried none.
+// PRAGMA optimize(0x03) returned no statements and sqlite_stat1 was not
+// created.
+//
+// Note that analysis_limit=0 means *no* limit to SQLite, not "use a default".
+// Config.AnalysisLimit maps an unset config to 10000 for that reason, and a
+// negative value here disables the refresh.
+//
+// Returns whether the statistics were refreshed. This function owns its
+// logging; callers need add nothing.
+func (s *Store) RefreshPlannerStats(analysisLimit int) bool {
+	if analysisLimit < 0 {
+		return false
+	}
+	first := !s.hasPlannerStats()
+	start := time.Now()
+	// Tagged for /api/perf writer-lock visibility (#1340).
+	if _, err := s.instrumentedExec("analyze", fmt.Sprintf("PRAGMA analysis_limit=%d", analysisLimit)); err != nil {
+		log.Printf("[analyze] could not set analysis_limit: %v", err)
+		return false
+	}
+	if _, err := s.instrumentedExec("analyze", "ANALYZE"); err != nil {
+		log.Printf("[analyze] ANALYZE failed: %v", err)
+		return false
+	}
+	elapsed := time.Since(start).Round(time.Millisecond)
+	if first {
+		log.Printf("[analyze] planner statistics built in %v (analysis_limit=%d, first run against this database)", elapsed, analysisLimit)
+	} else {
+		log.Printf("[analyze] planner statistics refreshed in %v (analysis_limit=%d)", elapsed, analysisLimit)
+	}
+	return true
+}
+
+// EnsurePlannerStats builds planner statistics when the database has none, and
+// reports whether it did (#2058).
+//
+// This exists to close the window the startup stagger opens. The refresh ticker
+// waits 2 minutes before its first run, and a query arriving in that window
+// against a database with no statistics at all gets the plan measured in
+// RefreshPlannerStats above: 143,442 pages read, which timed at 56.7s cold on
+// the 9.4 GB staging file.
+//
+// It fires once per database, not once per restart. sqlite_stat1 is an ordinary
+// table, so once written it stays in the file and a fresh read-only connection
+// reads it back (verified across connection close, and through a mode=ro
+// handle). Every later start therefore costs one query against sqlite_master and
+// leaves the work to the ticker.
+//
+// The trade is a one-time ANALYZE early in startup, and it is not cheap on a
+// cold page cache. Observed on staging at 9.4 GB: 3m43.9s, against the 2.0s the
+// same statement takes warm. For those 3m44s it holds the store's single write
+// connection (SetMaxOpenConns(1), db.go:142), so ingest stalls and buffers: the
+// observations table took zero rows for four minutes and then 1027 in the minute
+// the ANALYZE finished, against about 130 a minute either side, with nothing
+// dropped. Hence the warning below, so an operator watching a first deploy can
+// tell this apart from a hang.
+//
+// That cost belongs to the first ANALYZE, not to running it here. The refresh
+// ticker would pay exactly the same 3m44s two minutes later; this only moves it
+// earlier, where it overlaps the startup burst the ingest buffer is already
+// sized for.
+func (s *Store) EnsurePlannerStats(analysisLimit int) bool {
+	if s.hasPlannerStats() {
+		return false
+	}
+	log.Printf("[analyze] this database has no planner statistics; building them now. " +
+		"ANALYZE holds the single write connection until it finishes (3m43.9s measured on 9.4 GB, cold), " +
+		"so ingest will buffer and catch up. Once per database, not once per restart.")
+	return s.RefreshPlannerStats(analysisLimit)
+}
+
+// hasPlannerStats reports whether ANALYZE has ever run against this database.
+// A query error reads as "no stats", which is the safe direction for both
+// callers: it costs the log line a wrong word, and costs EnsurePlannerStats one
+// ANALYZE that was not needed, rather than skipping one that was.
+func (s *Store) hasPlannerStats() bool {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'`).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
 // Checkpoint runs a WAL checkpoint (TRUNCATE mode).
 // Returns the number of WAL frames checkpointed (0 if WAL was already empty).
 // TRUNCATE resets the WAL file to zero bytes when all frames are checkpointed;

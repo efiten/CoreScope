@@ -481,6 +481,42 @@ func main() {
 	}()
 	log.Printf("[db] WAL checkpoint scheduled every 1h")
 
+	// Daily planner statistics refresh (#2058), in two parts.
+	//
+	// The routine refresh is staggered 2 minutes past startup for the same reason
+	// as the checkpoint above: it takes the write lock, and by then the initial
+	// ingest burst has passed, so it also sees the rows that burst added.
+	//
+	// The build in front of it deliberately does compete with that burst, because
+	// a database with no statistics at all has nothing better to offer the queries
+	// arriving in those 2 minutes. It only runs once per database; see
+	// Store.EnsurePlannerStats, which also carries what that costs.
+	//
+	// Bounded by analysis_limit either way, so neither grows with the file the way
+	// an unbounded ANALYZE does: 2.0s against 242.9s on a 9.4 GB database, both
+	// timed warm. Cold, on a first start, it is 3m43.9s.
+	{
+		analysisLimit := cfg.AnalysisLimit()
+		if analysisLimit < 0 {
+			log.Printf("[analyze] planner statistics refresh disabled (db.analysisLimit=%d)", analysisLimit)
+		} else {
+			analyzeTicker := time.NewTicker(24 * time.Hour)
+			go func() {
+				// Before the stagger, and only on a database that has never been
+				// analyzed: the stagger is a 2 minute window in which the first
+				// query would otherwise run on no statistics at all. A restart
+				// finds sqlite_stat1 already in the file and skips this.
+				store.EnsurePlannerStats(analysisLimit)
+				time.Sleep(2 * time.Minute)
+				store.RefreshPlannerStats(analysisLimit)
+				for range analyzeTicker.C {
+					store.RefreshPlannerStats(analysisLimit)
+				}
+			}()
+			log.Printf("[analyze] planner statistics refresh scheduled every 24h (analysis_limit=%d)", analysisLimit)
+		}
+	}
+
 	// Daily neighbor_edges retention (#1287 — moved from cmd/server).
 	{
 		nDays := cfg.NeighborEdgesDaysOrDefault()
@@ -823,6 +859,14 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// Global observer IATA whitelist: if configured, drop messages from observers
 	// in non-whitelisted IATA regions. Applies to ALL message types (status + packets).
 	if len(parts) > 1 && !cfg.IsObserverIATAAllowed(parts[1]) {
+		// Throttled to one line per region per cfg.IATAWarnInterval — see
+		// ShouldWarnIATADrop. Format matches the fleet's Python region filter so
+		// one scraper regex covers both.
+		if cfg.ShouldWarnIATADrop(parts[1]) {
+			code := strings.ToUpper(strings.TrimSpace(parts[1]))
+			log.Printf("MQTT [%s] [region-filter] dropping unknown region '%s' (not in observerIATAWhitelist) -- further messages from %s suppressed for %.0fh",
+				tag, code, code, cfg.IATAWarnInterval().Hours())
+		}
 		return
 	}
 
