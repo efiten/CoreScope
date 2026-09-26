@@ -283,7 +283,7 @@
       // Fork-local (locode): pairs with the <th> in pageHtml. Must stay in the
       // same position as that header or the column and its values separate,
       // because table-sort.js maps a header to a cell by index.
-      (window.LocodeColumn ? window.LocodeColumn.cellHtml(row.name || '') : '') +
+      (window.LocodeColumn ? window.LocodeColumn.cellHtml(row.name || '', row.publicKey) : '') +
       '<td data-value="' + statusScore(row) + '">' + issuesHtml + '</td>' +
       '<td data-value="' + escapeHtml(CONFIG_STATES[row.configState].label) + '">' + configStateHtml(row) + '</td>' +
       '<td data-value="' + row.notObserved.length + '">' + mergedScopeChips(row) + (row.declaredWildcard ? ' <span class="sa-chip sa-chip-wildcard" title="Declares the \'*\' wildcard — allows plain unscoped floods.">*</span>' : '') + ambiguousCaveat(row) + unmatchedCaveat(row) + '</td>' +
@@ -394,7 +394,7 @@
     // cells carry their sort value on first paint instead of filling in later.
     // Runs alongside the audit fetch rather than before it, and a failure inside
     // prime() leaves the column empty rather than blocking the page.
-    var primed = window.LocodeColumn ? window.LocodeColumn.prime() : Promise.resolve();
+    var primed = window.LocodeColumn ? window.LocodeColumn.prime({ withGps: true }) : Promise.resolve();
     var d;
     try {
       d = await api('/scope-audit?window=' + encodeURIComponent(w), { ttl: 30000 });

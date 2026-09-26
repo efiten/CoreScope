@@ -123,7 +123,8 @@ function load(opts) {
     const c = LC2.cellHtml('BE-ANR-ON8AR');
     assert.ok(/data-value="Antwerpen"/.test(c), 'sort value missing: ' + c);
     assert.ok(/>Antwerpen</.test(c), 'place not rendered: ' + c);
-    assert.ok(/title="Belgium/.test(c), 'country belongs in the tooltip: ' + c);
+    assert.ok(/title="Declared in the node name: Belgium/.test(c),
+      'the tooltip must name the country and say the value was declared: ' + c);
   });
 
   await test('the node name never reaches the cell, which is why it is safe', async () => {
@@ -139,7 +140,8 @@ function load(opts) {
     await LC2.prime();
     const marker = '"><img src=x onerror=alert(1)>';
     const c = LC2.cellHtml('BE-ANR-' + marker);
-    assert.strictEqual(c, '<td class="lc-place" data-value="Antwerpen" title="Belgium · BE-ANR">Antwerpen</td>',
+    assert.strictEqual(c,
+      '<td class="lc-place" data-value="Antwerpen" title="Declared in the node name: Belgium · BE-ANR">Antwerpen</td>',
       'the cell is no longer exactly place plus country: ' + c);
     for (const fragment of ['img', 'onerror', 'alert', marker]) {
       assert.ok(!c.includes(fragment), 'part of the node name reached the cell (' + fragment + '): ' + c);
@@ -172,6 +174,114 @@ function load(opts) {
     // apart, the column empties and the page still works.
     const LC4 = load({ withoutParser: true });
     assert.strictEqual(await LC4.prime(), null);
+  });
+
+  console.log('\n=== the GPS fallback ===');
+
+  // A synthetic set with predictable distances. At 51°N, 0.01° of latitude is
+  // about 1.11 km, so the offsets below are chosen to sit either side of the 5 km
+  // cap without depending on the real data.
+  const DATA_XX = {
+    countries: { XX: 'Testland' },
+    locations: { XX: { AAA: 'Nearby', BBB: 'FarAway', CCC: 'OverTheLine' } },
+  };
+  const COORDS_XX = {
+    XX: {
+      AAA: [51.00, 4.00],
+      BBB: [51.04, 4.00],   // 4.45 km from 51.00, and in bucket 510
+      CCC: [52.00, 4.00],   // 111 km away, never a candidate
+    },
+  };
+  function withGps(nodeCoords) {
+    const LC = load();
+    LC._setForTest(DATA_XX, COORDS_XX, nodeCoords || {});
+    return LC;
+  }
+
+  await test('a place inside the cap is found, with its distance', () => {
+    const LC = withGps();
+    const n = LC.nearestPlace(51.00, 4.00);
+    assert.ok(n, 'nothing found at the exact coordinates of a place');
+    assert.strictEqual(n.place, 'Nearby');
+    assert.ok(n.km < 0.01, 'distance should be ~0, got ' + n.km);
+  });
+
+  await test('the nearer of two candidates wins', () => {
+    const LC = withGps();
+    // 51.03 is ~3.3 km from AAA and ~1.1 km from BBB.
+    assert.strictEqual(LC.nearestPlace(51.03, 4.00).place, 'FarAway');
+  });
+
+  await test('a place in a neighbouring bucket is still found', () => {
+    // The index buckets on round(lat*10): 51.04 lands in 510 and 51.06 in 511.
+    // A query that only looked in its own bucket would miss BBB here, which is
+    // 2.2 km away. This is the assertion that the 3x3 scan exists.
+    const LC = withGps();
+    const n = LC.nearestPlace(51.06, 4.00);
+    assert.ok(n, 'a place 2.2 km away in the next bucket was not found');
+    assert.strictEqual(n.place, 'FarAway');
+  });
+
+  await test('beyond the cap there is no answer, rather than a distant one', () => {
+    const LC = withGps();
+    // 51.5 is ~55 km from AAA/BBB and ~55 km from CCC: a nearest place exists in
+    // every direction, and naming one would be worse than naming none.
+    assert.strictEqual(LC.nearestPlace(51.5, 4.00), null);
+    assert.strictEqual(LC.MAX_KM, 5, 'the cap changed; the measurements in the header comment were taken at 5 km');
+  });
+
+  await test('0,0 and non-numbers are refused', () => {
+    const LC = withGps();
+    // 35% of the Dutch locode rows have no coordinate, and a node can advertise
+    // 0,0. Treating that as the Gulf of Guinea would still find no place, but the
+    // guard makes it explicit rather than incidental.
+    assert.strictEqual(LC.nearestPlace(0, 0), null);
+    assert.strictEqual(LC.nearestPlace(NaN, 4), null);
+    assert.strictEqual(LC.nearestPlace('51', '4'), null);
+    assert.strictEqual(LC.nearestPlace(undefined, undefined), null);
+  });
+
+  console.log('\n=== declared against derived ===');
+
+  await test('a GPS-derived cell is emphasised and says why', () => {
+    const LC = withGps({ pk1: [51.00, 4.00] });
+    const c = LC.cellHtml('No Convention Here', 'pk1');
+    assert.ok(/<em>Nearby<\/em>/.test(c), 'the derived value must be emphasised: ' + c);
+    assert.ok(/class="lc-place lc-derived"/.test(c), 'no lc-derived class: ' + c);
+    assert.ok(/title="Derived from/.test(c), 'the tooltip must say it is derived: ' + c);
+    assert.ok(/data-value="Nearby"/.test(c), 'derived rows must still sort on the place: ' + c);
+  });
+
+  await test('the tooltip carries the distance, so the reader can judge it', () => {
+    const LC = withGps({ pk1: [51.03, 4.00] });
+    const c = LC.cellHtml('Nothing', 'pk1');
+    assert.ok(/1\.1 km away/.test(c), 'expected a distance in km: ' + c);
+    const close = withGps({ pk2: [51.0, 4.0] }).cellHtml('Nothing', 'pk2');
+    assert.ok(/ m away/.test(close), 'under a kilometre should read in metres: ' + close);
+  });
+
+  await test('a declared name beats GPS, and is not emphasised', () => {
+    // The whole point of the distinction: if the operator said where it is, that
+    // is the answer, and it must not be dressed up as derived.
+    const LC = load();
+    LC._setForTest(
+      { countries: { XX: 'Testland' }, locations: { XX: { AAA: 'Declared', BBB: 'Derived' } } },
+      { XX: { BBB: [51.0, 4.0] } },
+      { pk1: [51.0, 4.0] });
+    const c = LC.cellHtml('XX-AAA-NODE', 'pk1');
+    assert.ok(/>Declared</.test(c), 'the declared place should win: ' + c);
+    assert.ok(!/<em>/.test(c), 'a declared value must not be emphasised: ' + c);
+    assert.ok(/title="Declared in the node name/.test(c), 'the tooltip should say it was declared: ' + c);
+  });
+
+  await test('no GPS for that node leaves the cell empty, not guessed', () => {
+    const LC = withGps({ other: [51.0, 4.0] });
+    assert.strictEqual(LC.cellHtml('Nothing', 'pk-unknown'), '<td class="lc-place" data-value=""></td>');
+  });
+
+  await test('GPS with no place within the cap leaves the cell empty', () => {
+    const LC = withGps({ pk1: [51.5, 4.0] });
+    assert.strictEqual(LC.cellHtml('Nothing', 'pk1'), '<td class="lc-place" data-value=""></td>');
   });
 
   console.log(`\nTotal: ${passed} passed, ${failed} failed`);
