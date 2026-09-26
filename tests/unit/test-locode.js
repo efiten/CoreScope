@@ -64,8 +64,23 @@ test('type absent returns null type', () => {
   const r = parseLocodeName('BE-BLZ-SomeNode');
   assert.ok(r); assert.strictEqual(r.type, null);
 });
-test('lowercase country code: returns null', () => {
-  assert.strictEqual(parseLocodeName('be-BRE-test-EDG-01'), null);
+test('lowercase and mixed case resolve, uppercased', () => {
+  // Changed deliberately on 2026-09-26. The convention is written in capitals,
+  // but an operator who types it in lower case has still declared where the node
+  // is, and 12 of 2013 live names do exactly that (be-ras-rausimous-1/2/3,
+  // be-van-aar-koffie-253, BE-Kon-W4E_, NL-ech-rp03, three de-nw-ne, two nl-li),
+  // none of them an accident. The codes are uppercased for the lookup, so
+  // everything downstream still sees BE / BRE.
+  const lower = parseLocodeName('be-bre-test-edg-01');
+  assert.ok(lower, 'a fully lowercase name must resolve');
+  assert.strictEqual(lower.cc, 'BE');
+  assert.strictEqual(lower.loc, 'BRE');
+  assert.strictEqual(lower.type, 'EDG', 'the type code is matched case-insensitively too');
+
+  const mixed = parseLocodeName('BE-Kon-W4E_ Repeater');
+  assert.ok(mixed, 'a mixed-case name must resolve');
+  assert.strictEqual(mixed.cc, 'BE');
+  assert.strictEqual(mixed.loc, 'KON');
 });
 test('no dash pattern: returns null', () => {
   assert.strictEqual(parseLocodeName('SomeRandomName'), null);

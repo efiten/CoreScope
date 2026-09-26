@@ -86,8 +86,22 @@ function load(opts) {
   });
 
   await test('a name without the convention resolves to nothing, not a guess', () => {
-    for (const name of ['My Repeater', 'ON8AR', '', 'be-anr-lowercase', 'BELGIUM-ANR']) {
+    for (const name of ['My Repeater', 'ON8AR', '', 'BELGIUM-ANR', 'B-ANR-x', 'BE_ANR_x']) {
       assert.strictEqual(LC.placeOf(name, DATA), null, 'invented a place for ' + JSON.stringify(name));
+    }
+  });
+
+  await test('case is not part of the convention', () => {
+    // A lowercase name is still a declaration. Moved here from the negative list
+    // above on 2026-09-26: 12 of 2013 live names are written this way, and
+    // rejecting them on a formatting detail lost a location the operator had
+    // given. See the comment on the regex in public/locode.js.
+    for (const name of ['be-anr-lowercase', 'BE-anr-mixed', 'Be-AnR-x']) {
+      const r = LC.placeOf(name, DATA);
+      assert.ok(r, 'did not resolve ' + JSON.stringify(name));
+      assert.strictEqual(r.place, 'Antwerpen');
+      assert.strictEqual(r.cc, 'BE', 'the country code must be uppercased for downstream lookups');
+      assert.strictEqual(r.loc, 'ANR', 'the location code must be uppercased');
     }
   });
 
