@@ -21,6 +21,7 @@ const path = require('path');
 const EMBED_DESCRIPTION_LIMIT = 4096;
 const COLOR = 3447003;
 const ANALYZER_URL = 'https://analyzer.on8ar.eu';
+const HEALTH_URL = ANALYZER_URL + '/api/health';
 const SAFE_TAG = /^[A-Za-z0-9._-]+$/;
 // discord.com and the legacy discordapp.com, with an optional /vN API version.
 const WEBHOOK_URL = /^https:\/\/(discord|discordapp)\.com\/api\/(v\d+\/)?webhooks\/\d+\/[\w-]+$/;
@@ -116,6 +117,37 @@ function resolveWebhook(env) {
   return url;
 }
 
+// assertLiveVersion refuses to say "staat live" about something that is not.
+//
+// The tag push and the deploy are separate acts: deploy.yml triggers on pushes to
+// master, while the live deploy is the manual /root/bin/deploy-live.sh. Nothing
+// orders them, so a tag pushed before the deploy would otherwise announce a
+// version that is not serving. /api/health reports the running version, so the
+// claim can be checked instead of assumed.
+//
+// Anything unreadable also stops it: not being able to confirm what is live is
+// not permission to say it is.
+function assertLiveVersion(tag, health) {
+  const live = health && typeof health === 'object' ? String(health.version || '') : '';
+  if (!live) {
+    throw new Error('could not read the running version from ' + HEALTH_URL +
+      ', so "' + tag + ' staat live" cannot be confirmed and will not be posted');
+  }
+  if (live !== tag) {
+    throw new Error('refusing to announce ' + tag + ': ' + ANALYZER_URL + ' is running ' + live +
+      '. Deploy first, then announce.');
+  }
+}
+
+async function liveHealth() {
+  try {
+    const res = await fetch(HEALTH_URL);
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+}
+
 // parseArgs is separate and exported because the dry-run flag is the only thing
 // between a test run and a post in a channel people read. Hardcoding either
 // direction is a silent regression, so both directions are asserted.
@@ -158,11 +190,19 @@ async function main(argv, env, log) {
     log(JSON.stringify(payload, null, 2));
     return;
   }
-  const msg = await post(resolveWebhook(env), payload);
+  // The local check first, so a missing secret says so instead of spending a
+  // network call to fail on something else.
+  const url = resolveWebhook(env);
+
+  // Then the live check, before the post rather than after: an announcement is
+  // not retractable.
+  assertLiveVersion(parsed.tag, await liveHealth());
+
+  const msg = await post(url, payload);
   log('Posted message ' + msg.id + ' to channel ' + msg.channel_id);
 }
 
-module.exports = { noteFileFor, readNote, buildPayload, post, resolveWebhook, parseArgs, main, EMBED_DESCRIPTION_LIMIT };
+module.exports = { noteFileFor, readNote, buildPayload, post, resolveWebhook, parseArgs, main, assertLiveVersion, EMBED_DESCRIPTION_LIMIT };
 
 if (require.main === module) {
   main(process.argv.slice(2), process.env, console.log).catch((err) => { console.error(err.message); process.exit(1); });

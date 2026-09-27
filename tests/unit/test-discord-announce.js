@@ -12,7 +12,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  noteFileFor, readNote, buildPayload, post, resolveWebhook, parseArgs, main, EMBED_DESCRIPTION_LIMIT,
+  noteFileFor, readNote, buildPayload, post, resolveWebhook, parseArgs, main, assertLiveVersion, EMBED_DESCRIPTION_LIMIT,
 } = require('../../scripts/discord-announce.js');
 
 let passed = 0, failed = 0;
@@ -133,6 +133,33 @@ test('surrounding whitespace is trimmed off the URL', () => {
   assert.strictEqual(resolveWebhook({ DISCORD_ANALYZER_WEBHOOK: '  ' + url + ' \r\n' }), url);
 });
 
+console.log('\n=== discord-announce: do not claim "staat live" before it is ===');
+
+test('the running version must be the tag being announced', () => {
+  // The tag push and the deploy are separate acts: deploy.yml triggers on
+  // master pushes, and the live deploy is the manual /root/bin/deploy-live.sh.
+  // Nothing orders them, so without this the note can announce a version that is
+  // not serving yet.
+  assert.doesNotThrow(() => assertLiveVersion('v3.12.0-on8ar.2', { version: 'v3.12.0-on8ar.2' }));
+});
+
+test('a different running version stops the announcement, naming both', () => {
+  const err = (() => {
+    try { assertLiveVersion('v3.12.0-on8ar.3', { version: 'v3.12.0-on8ar.2' }); } catch (e) { return e; }
+  })();
+  assert.ok(err, 'announced a version that is not live');
+  assert.ok(err.message.includes('v3.12.0-on8ar.3'), 'name the tag: ' + err.message);
+  assert.ok(err.message.includes('v3.12.0-on8ar.2'), 'name what is actually live: ' + err.message);
+});
+
+test('an unreadable health response stops it too', () => {
+  // If we cannot confirm what is live, we do not get to say it is live.
+  for (const health of [null, {}, { version: '' }, 'not an object']) {
+    assert.throws(() => assertLiveVersion('v3.12.0-on8ar.2', health), /live/i,
+      'accepted ' + JSON.stringify(health));
+  }
+});
+
 console.log('\n=== discord-announce: the argument gate ===');
 
 test('the dry-run flag is read from argv, both ways', () => {
@@ -162,6 +189,21 @@ test('the checkout does not use the tag as its ref', () => {
   // only its name.
   assert.ok(!/ref:\s*\$\{\{\s*steps\.t\.outputs\.tag\s*\}\}/.test(WORKFLOW),
     'the workflow checks out the tag again; a tag older than this feature cannot be announced');
+});
+
+test('two runs for the same tag cannot post at the same time', () => {
+  // A moved tag re-pushed, or a dispatch racing a push, would otherwise post the
+  // same embed twice. Keyed on the tag, and never cancelling: cancelling a run
+  // that has already POSTed would hide that it did.
+  assert.ok(/concurrency:/.test(WORKFLOW), 'no concurrency guard, so duplicates can run together');
+  assert.ok(/cancel-in-progress:\s*false/.test(WORKFLOW),
+    'cancel-in-progress must be false; cancelling mid-post hides whether it posted');
+});
+
+test('the run is named after the tag and whether it posts', () => {
+  // So the history answers "did we already announce this?" at a glance, which is
+  // the part a concurrency guard cannot do.
+  assert.ok(/^run-name:/m.test(WORKFLOW), 'runs are not named, so the history is unreadable');
 });
 
 test('the dry-run flag fails safe, not open', () => {

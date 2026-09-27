@@ -25,6 +25,18 @@ on:
         type: boolean
         default: true
 
+# Named after what it does, so the history answers "did we already announce this
+# tag?" at a glance. A concurrency guard cannot answer that; only a readable log
+# can.
+run-name: Announce ${{ inputs.tag || github.ref_name }} (${{ inputs.dry_run == false && 'post' || 'preview' }})
+
+# Keyed on the tag, so a moved tag re-pushed, or a dispatch racing a push, cannot
+# post the same embed twice at once. NOT cancelling: a cancelled run may already
+# have posted, and cancelling it would hide that.
+concurrency:
+  group: discord-announce-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
