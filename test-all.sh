@@ -148,6 +148,7 @@ node tests/unit/test-live.js
 node tests/unit/test-locode.js
 node tests/unit/test-locode-column.js
 node tests/unit/test-scrape-locode.js
+node tests/unit/test-discord-announce.js
 node tests/unit/test-map-clustering.js
 node tests/unit/test-mqtt-status-panel.js
 node tests/unit/test-my-repeaters-dashboard.js
