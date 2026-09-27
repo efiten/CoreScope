@@ -1,0 +1,77 @@
+name: Discord announce
+
+# FORK-LOCAL. Announces a deploy of analyzer.on8ar.eu in #analyzer-bot on the
+# radiocommunicatie.be Discord. A NEW file on purpose, not a change to deploy.yml:
+# upstream never touches it, so an integration cannot conflict with it.
+#
+# Triggers on the on8ar deploy tag, not on an upstream release tag. Readers use
+# analyzer.on8ar.eu, so the news is what has been deployed for them: upstream
+# v3.12.0 changed nothing for them, v3.12.0-on8ar.2 did. Upstream tags are not in
+# this fork in any case, since `git push origin master` pushes no tags.
+#
+# Spec: docs/superpowers/specs/2026-09-27-discord-announce-design.md
+on:
+  push:
+    tags: ['v*-on8ar.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to announce, e.g. v3.12.0-on8ar.2'
+        required: true
+        type: string
+      dry_run:
+        description: 'Print the payload and post nothing'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    name: "Announce in Discord"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the tag and mode
+        id: t
+        env:
+          # Inputs and refs travel through the environment rather than being
+          # interpolated into the script, so a value carrying shell characters
+          # cannot become part of the command.
+          EVENT: ${{ github.event_name }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_DRY: ${{ inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "tag=$IN_TAG" >> "$GITHUB_OUTPUT"
+            if [ "$IN_DRY" = "true" ]; then
+              echo "dry=--dry-run" >> "$GITHUB_OUTPUT"
+            else
+              echo "dry=" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # A tag push always posts; dry_run exists only on the manual trigger.
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "dry=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.t.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Announce
+        env:
+          # The URL is a credential and is never echoed. A missing note, an
+          # over-long note, or a non-2xx from Discord all fail this step.
+          DISCORD_ANALYZER_WEBHOOK: ${{ secrets.DISCORD_ANALYZER_WEBHOOK }}
+          TAG: ${{ steps.t.outputs.tag }}
+          DRY: ${{ steps.t.outputs.dry }}
+        run: node scripts/discord-announce.js --tag "$TAG" $DRY
