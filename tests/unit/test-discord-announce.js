@@ -97,11 +97,38 @@ test('an absent, empty or whitespace-only secret is an error', () => {
   }
 });
 
+test('a URL that is not a Discord webhook endpoint is refused', () => {
+  // The run on 2026-09-27 got an HTML page back, which means the request never
+  // reached the API. Checking the shape up front turns that into a clear message
+  // before anything is sent, and the message never echoes the value.
+  for (const bad of [
+    'https://discord.com/channels/123/456',
+    'https://example.test/hook/abc',
+    'discord.com/api/webhooks/1/abc',
+    'https://discord.com/api/webhook/1/abc',
+  ]) {
+    const err = (() => { try { resolveWebhook({ DISCORD_ANALYZER_WEBHOOK: bad }); } catch (e) { return e; } })();
+    assert.ok(err, 'accepted ' + bad);
+    assert.ok(/webhook/i.test(err.message), 'unclear message for ' + bad + ': ' + err.message);
+    assert.ok(!err.message.includes(bad), 'the value was echoed back: ' + err.message);
+  }
+});
+
+test('both Discord hostnames are accepted', () => {
+  for (const good of [
+    'https://discord.com/api/webhooks/1553507181817765898/TOKEN',
+    'https://discordapp.com/api/webhooks/1/TOKEN',
+    'https://discord.com/api/v10/webhooks/1/TOKEN',
+  ]) {
+    assert.strictEqual(resolveWebhook({ DISCORD_ANALYZER_WEBHOOK: good }), good, 'refused ' + good);
+  }
+});
+
 test('surrounding whitespace is trimmed off the URL', () => {
   // A secret pasted with a trailing newline would otherwise become
   // "...token\n?wait=true", which fails with a confusing error instead of a clear
   // one.
-  const url = 'https://discord.test/api/webhooks/1/TOKEN';
+  const url = 'https://discord.com/api/webhooks/1/TOKEN';
   assert.strictEqual(resolveWebhook({ DISCORD_ANALYZER_WEBHOOK: url + '\n' }), url);
   assert.strictEqual(resolveWebhook({ DISCORD_ANALYZER_WEBHOOK: '  ' + url + ' \r\n' }), url);
 });
@@ -205,6 +232,20 @@ async function asyncTest(name, fn) {
     const err = await post('discord.test/api/webhooks/123/SECRET-TOKEN', { embeds: [] }).catch((e) => e);
     assert.ok(!String(err.message).includes('SECRET-TOKEN'), 'the token reached the message: ' + err.message);
     assert.ok(/request failed/i.test(err.message), 'the error should still say what happened: ' + err.message);
+  });
+
+  await asyncTest('a 2xx that is not JSON says what came back, without the URL', async () => {
+    // Hit for real on 2026-09-27: Discord answered 200 with an HTML page and
+    // JSON.parse threw "Unexpected token '<'", which says nothing about the
+    // status, the endpoint or whether anything was posted.
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      text: async () => '<!DOCTYPE html><html><head><title>Cloudflare</title></head></html>',
+    });
+    const err = await post('https://discord.test/hook/SECRET-TOKEN', { embeds: [] }).catch((e) => e);
+    assert.ok(/200/.test(err.message), 'the status belongs in the message: ' + err.message);
+    assert.ok(/not JSON|DOCTYPE/i.test(err.message), 'say what came back instead: ' + err.message);
+    assert.ok(!err.message.includes('SECRET-TOKEN'), 'the token reached the message: ' + err.message);
   });
 
   console.log('\n=== discord-announce: the dry-run gate in main ===');

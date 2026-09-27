@@ -22,6 +22,8 @@ const EMBED_DESCRIPTION_LIMIT = 4096;
 const COLOR = 3447003;
 const ANALYZER_URL = 'https://analyzer.on8ar.eu';
 const SAFE_TAG = /^[A-Za-z0-9._-]+$/;
+// discord.com and the legacy discordapp.com, with an optional /vN API version.
+const WEBHOOK_URL = /^https:\/\/(discord|discordapp)\.com\/api\/(v\d+\/)?webhooks\/\d+\/[\w-]+$/;
 
 // noteFileFor bounds the path: the tag becomes a file name, so it may not carry
 // a separator or a parent reference. Tags are ours, but a path built from input
@@ -83,7 +85,16 @@ async function post(webhookUrl, payload) {
     // Discord's body is safe to show; the URL is not, and is deliberately absent.
     throw new Error('Discord answered HTTP ' + res.status + ': ' + text.slice(0, 500));
   }
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    // Hit on 2026-09-27: a 200 carrying an HTML page, where JSON.parse's own
+    // "Unexpected token '<'" said nothing about the status, the endpoint, or
+    // whether anything had been posted. Report both, and never the URL.
+    throw new Error('Discord answered HTTP ' + res.status +
+      ' but the body is not JSON, so it is unclear whether anything was posted: ' +
+      text.slice(0, 200));
+  }
 }
 
 // resolveWebhook trims, because a secret pasted with a trailing newline would
@@ -94,6 +105,14 @@ function resolveWebhook(env) {
   const raw = (env && env.DISCORD_ANALYZER_WEBHOOK) || '';
   const url = String(raw).trim();
   if (!url) throw new Error('DISCORD_ANALYZER_WEBHOOK is not set');
+  // Checked before anything is sent, because the failure otherwise arrives as an
+  // HTML page parsed as JSON, long after the request left. The value is never
+  // echoed back: it is the credential, and this log is world-readable.
+  if (!WEBHOOK_URL.test(url)) {
+    throw new Error('DISCORD_ANALYZER_WEBHOOK is not a Discord webhook endpoint. ' +
+      'Expected https://discord.com/api/webhooks/<id>/<token>, optionally with an ' +
+      'API version, and the whole URL rather than the token alone.');
+  }
   return url;
 }
 
@@ -124,9 +143,18 @@ async function main(argv, env, log) {
     // the credential for a preview would break that on any machine without it.
     // "present" carries the same proof as a length would, without describing a
     // credential in a world-readable log.
-    const wired = !!String((env && env.DISCORD_ANALYZER_WEBHOOK) || '').trim();
+    // The shape is checked here too, so a dry run can tell a well-formed secret
+    // from a wrong one WITHOUT posting. Without that, a malformed URL only
+    // surfaces as an HTML page parsed as JSON on a real run.
+    let status;
+    try {
+      resolveWebhook(env);
+      status = 'present and well-formed';
+    } catch (e) {
+      status = /not set/.test(e.message) ? 'absent (preview only)' : 'present but NOT a Discord webhook endpoint';
+    }
     log('DRY RUN, posting nothing.');
-    log('DISCORD_ANALYZER_WEBHOOK: ' + (wired ? 'present' : 'absent (preview only)'));
+    log('DISCORD_ANALYZER_WEBHOOK: ' + status);
     log(JSON.stringify(payload, null, 2));
     return;
   }
