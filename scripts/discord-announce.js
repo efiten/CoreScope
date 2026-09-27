@@ -64,11 +64,20 @@ function buildPayload(tag, body) {
 async function post(webhookUrl, payload) {
   // wait=true so Discord returns the created message instead of an empty 204,
   // which lets the caller assert the message exists rather than trust a status.
-  const res = await fetch(webhookUrl + '?wait=true', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  let res;
+  try {
+    res = await fetch(webhookUrl + '?wait=true', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    // fetch puts the URL in its own message: a secret stored without a scheme
+    // gives "Failed to parse URL from <the whole credential>". GitHub masks
+    // secrets in its logs, but this repository is public and that protection is
+    // GitHub's rather than this code's, so the URL is dropped here.
+    throw new Error('request failed before Discord answered: ' + ((e && e.name) || 'Error'));
+  }
   const text = await res.text();
   if (!res.ok) {
     // Discord's body is safe to show; the URL is not, and is deliberately absent.
@@ -88,32 +97,45 @@ function resolveWebhook(env) {
   return url;
 }
 
-async function main(argv) {
+// parseArgs is separate and exported because the dry-run flag is the only thing
+// between a test run and a post in a channel people read. Hardcoding either
+// direction is a silent regression, so both directions are asserted.
+function parseArgs(argv) {
   const tagIdx = argv.indexOf('--tag');
   const tag = tagIdx !== -1 ? argv[tagIdx + 1] : '';
-  const dryRun = argv.includes('--dry-run');
-  if (!tag) throw new Error('usage: node scripts/discord-announce.js --tag <tag> [--dry-run]');
-
-  const repoRoot = path.resolve(__dirname, '..');
-  const payload = buildPayload(tag, readNote(noteFileFor(repoRoot, tag)));
-
-  // Resolved before the dry-run branch on purpose. A dry run that skipped this
-  // could not tell anyone whether the secret is wired, which would leave posting
-  // for real as the only way to find out.
-  const url = resolveWebhook(process.env);
-
-  if (dryRun) {
-    console.log('DRY RUN, posting nothing.');
-    console.log('Webhook resolved from DISCORD_ANALYZER_WEBHOOK: ' + url.length + ' characters. Payload:');
-    console.log(JSON.stringify(payload, null, 2));
-    return;
+  if (!tag || tag.startsWith('--')) {
+    throw new Error('usage: node scripts/discord-announce.js --tag <tag> [--dry-run]');
   }
-  const msg = await post(url, payload);
-  console.log('Posted message ' + msg.id + ' to channel ' + msg.channel_id);
+  return { tag: tag, dryRun: argv.includes('--dry-run') };
 }
 
-module.exports = { noteFileFor, readNote, buildPayload, post, resolveWebhook, EMBED_DESCRIPTION_LIMIT };
+// env and log are injected rather than reached for, so the dry-run gate can be
+// tested without touching process state.
+async function main(argv, env, log) {
+  env = env || process.env;
+  log = log || console.log;
+  const parsed = parseArgs(argv);
+  const repoRoot = path.resolve(__dirname, '..');
+  const payload = buildPayload(parsed.tag, readNote(noteFileFor(repoRoot, parsed.tag)));
+
+  if (parsed.dryRun) {
+    // A dry run reports whether the secret is wired but does not require it: the
+    // spec promises any note can be previewed before it goes out, and demanding
+    // the credential for a preview would break that on any machine without it.
+    // "present" carries the same proof as a length would, without describing a
+    // credential in a world-readable log.
+    const wired = !!String((env && env.DISCORD_ANALYZER_WEBHOOK) || '').trim();
+    log('DRY RUN, posting nothing.');
+    log('DISCORD_ANALYZER_WEBHOOK: ' + (wired ? 'present' : 'absent (preview only)'));
+    log(JSON.stringify(payload, null, 2));
+    return;
+  }
+  const msg = await post(resolveWebhook(env), payload);
+  log('Posted message ' + msg.id + ' to channel ' + msg.channel_id);
+}
+
+module.exports = { noteFileFor, readNote, buildPayload, post, resolveWebhook, parseArgs, main, EMBED_DESCRIPTION_LIMIT };
 
 if (require.main === module) {
-  main(process.argv.slice(2)).catch((err) => { console.error(err.message); process.exit(1); });
+  main(process.argv.slice(2), process.env, console.log).catch((err) => { console.error(err.message); process.exit(1); });
 }

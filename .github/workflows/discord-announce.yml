@@ -47,7 +47,10 @@ jobs:
           set -euo pipefail
           if [ "$EVENT" = "workflow_dispatch" ]; then
             echo "tag=$IN_TAG" >> "$GITHUB_OUTPUT"
-            if [ "$IN_DRY" = "true" ]; then
+            # Fails safe: anything that is not exactly "false" means dry. This
+            # guards a channel real people read, so an unexpected value must not
+            # post.
+            if [ "$IN_DRY" != "false" ]; then
               echo "dry=--dry-run" >> "$GITHUB_OUTPUT"
             else
               echo "dry=" >> "$GITHUB_OUTPUT"
@@ -58,10 +61,17 @@ jobs:
             echo "dry=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout the tagged commit
+      # The default branch, NOT the tag. The tag being announced generally
+      # predates the announcer: v3.12.0-on8ar.2 points at a commit that contains
+      # no scripts/discord-announce.js, so checking out the tag would make this
+      # job die on "Cannot find module" for every tag cut before this feature,
+      # including the backfill the spec calls the first real test. The note is a
+      # communication artifact that lives on the default branch and the tag is
+      # only its name, which also means a corrected note is the one that posts.
+      - name: Checkout the default branch
         uses: actions/checkout@v5
         with:
-          ref: ${{ steps.t.outputs.tag }}
+          ref: ${{ github.event.repository.default_branch }}
 
       - uses: actions/setup-node@v4
         with:
