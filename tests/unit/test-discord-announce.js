@@ -12,7 +12,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  noteFileFor, readNote, buildPayload, post, EMBED_DESCRIPTION_LIMIT,
+  noteFileFor, readNote, buildPayload, post, resolveWebhook, EMBED_DESCRIPTION_LIMIT,
 } = require('../../scripts/discord-announce.js');
 
 let passed = 0, failed = 0;
@@ -85,6 +85,25 @@ test('a body over the embed limit is refused, not truncated', () => {
   const tooLong = 'x'.repeat(EMBED_DESCRIPTION_LIMIT + 1);
   assert.throws(() => buildPayload('v1.0.0-on8ar.1', tooLong), /4096|too long/i);
   assert.doesNotThrow(() => buildPayload('v1.0.0-on8ar.1', 'x'.repeat(EMBED_DESCRIPTION_LIMIT)));
+});
+
+console.log('\n=== discord-announce: the webhook from the environment ===');
+
+test('an absent, empty or whitespace-only secret is an error', () => {
+  // A dry run resolves this too, so a dry run proves the secret is wired without
+  // posting. Without it there is no way to test the wiring except by posting.
+  for (const env of [{}, { DISCORD_ANALYZER_WEBHOOK: '' }, { DISCORD_ANALYZER_WEBHOOK: '  \n ' }]) {
+    assert.throws(() => resolveWebhook(env), /not set/i, 'accepted ' + JSON.stringify(env));
+  }
+});
+
+test('surrounding whitespace is trimmed off the URL', () => {
+  // A secret pasted with a trailing newline would otherwise become
+  // "...token\n?wait=true", which fails with a confusing error instead of a clear
+  // one.
+  const url = 'https://discord.test/api/webhooks/1/TOKEN';
+  assert.strictEqual(resolveWebhook({ DISCORD_ANALYZER_WEBHOOK: url + '\n' }), url);
+  assert.strictEqual(resolveWebhook({ DISCORD_ANALYZER_WEBHOOK: '  ' + url + ' \r\n' }), url);
 });
 
 console.log('\n=== discord-announce: what Discord answers ===');

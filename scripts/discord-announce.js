@@ -77,6 +77,17 @@ async function post(webhookUrl, payload) {
   return JSON.parse(text);
 }
 
+// resolveWebhook trims, because a secret pasted with a trailing newline would
+// otherwise become "...token\n?wait=true" and fail with a confusing error rather
+// than a clear one. The error never echoes the rejected value: it is the
+// credential, and a failing job's log is readable.
+function resolveWebhook(env) {
+  const raw = (env && env.DISCORD_ANALYZER_WEBHOOK) || '';
+  const url = String(raw).trim();
+  if (!url) throw new Error('DISCORD_ANALYZER_WEBHOOK is not set');
+  return url;
+}
+
 async function main(argv) {
   const tagIdx = argv.indexOf('--tag');
   const tag = tagIdx !== -1 ? argv[tagIdx + 1] : '';
@@ -86,18 +97,22 @@ async function main(argv) {
   const repoRoot = path.resolve(__dirname, '..');
   const payload = buildPayload(tag, readNote(noteFileFor(repoRoot, tag)));
 
+  // Resolved before the dry-run branch on purpose. A dry run that skipped this
+  // could not tell anyone whether the secret is wired, which would leave posting
+  // for real as the only way to find out.
+  const url = resolveWebhook(process.env);
+
   if (dryRun) {
-    console.log('DRY RUN, posting nothing. Payload:');
+    console.log('DRY RUN, posting nothing.');
+    console.log('Webhook resolved from DISCORD_ANALYZER_WEBHOOK: ' + url.length + ' characters. Payload:');
     console.log(JSON.stringify(payload, null, 2));
     return;
   }
-  const url = process.env.DISCORD_ANALYZER_WEBHOOK;
-  if (!url) throw new Error('DISCORD_ANALYZER_WEBHOOK is not set');
   const msg = await post(url, payload);
   console.log('Posted message ' + msg.id + ' to channel ' + msg.channel_id);
 }
 
-module.exports = { noteFileFor, readNote, buildPayload, post, EMBED_DESCRIPTION_LIMIT };
+module.exports = { noteFileFor, readNote, buildPayload, post, resolveWebhook, EMBED_DESCRIPTION_LIMIT };
 
 if (require.main === module) {
   main(process.argv.slice(2)).catch((err) => { console.error(err.message); process.exit(1); });
