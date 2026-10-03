@@ -528,8 +528,8 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 }
 
 /* === Touch Targets === */
-/* WCAG 2.5.5 / Apple HIG / Material: 48x48 CSS px minimum touch target for
-   all interactive controls. Targets are achieved with min-height/min-width
+/* House preference: 48x48 CSS px minimum for the controls below (#2052),
+   above WCAG 2.5.5's 44x44 minimum. Targets use min-height/min-width
    plus inline-flex centering so existing visual styling (font-size, padding,
    icon size) is preserved on desktop while the *hit area* grows for touch.
    Issue #1060.
@@ -618,8 +618,7 @@ button.ch-item {
 }
 
 /* Additional button-like controls discovered during PR #1067 review (Issue
-   #1060 follow-up). Same 48x48 minimums + touch-action so all interactive
-   surfaces meet WCAG 2.5.5. */
+   #1060 follow-up). Same 48x48 house minimums + touch-action. */
 .btn-link,
 .col-toggle-btn,
 .filter-toggle-btn,
@@ -900,7 +899,7 @@ img.brand-logo {
 .nav-btn {
   background: none; border: 1px solid var(--border); color: var(--nav-text-muted); padding: 6px 12px;
   border-radius: 6px; cursor: pointer; font-size: 14px; transition: all .15s;
-  min-width: 44px; min-height: 44px; display: inline-flex; align-items: center; justify-content: center;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .nav-btn:hover { background: var(--nav-bg2); color: var(--nav-text); }
 
@@ -1591,6 +1590,25 @@ body.scroll-locked { overflow: hidden; }
  * abbreviated 7-char chips + arrow. .path-hops already uses 11px font, so
  * no chip-level font change is needed here. */
 .data-table td.col-path, .data-table th.col-path { min-width: 140px; }
+/* Packets columns are sized to their widest cell (fitColumnsToContent in
+ * app.js). Proportional digits make "20m ago" wider than "13m ago", so a
+ * column measured on one row clipped the next; fixed-width digits keep
+ * same-length values the same width. */
+#pktTable td.col-time, #pktTable td.col-size { font-variant-numeric: tabular-nums; }
+/* fitColumnsToContent sets every #pktTable column width in px. The shared
+ * min-width rules on .col-time (clamp 72-108px), .col-path (140px),
+ * .col-observer (70px) and .col-scope (56px) are written for auto-layout
+ * tables; Chromium ignores cell min-width under table-layout: fixed, other
+ * engines need not. Clear them here so the JS widths are the only input. */
+#pktTable th, #pktTable td { min-width: 0; }
+/* "Full Names" toggle (packets.js): hop chips keep their whole name. The
+ * path stays on one line; hops past the edge go behind the "+N" overflow
+ * pill (_finalizePathOverflow). Wrapping would make rows taller than the
+ * fixed VSCROLL_ROW_HEIGHT the virtual scroller positions rows with. No cap
+ * at all, not even 100%: a single name longer than the column must overflow
+ * so the pill (and its full-path popover) appears, rather than ellipsise
+ * inside its chip with no way to read it. */
+#pktTable.pkt-full-names .path-hops .hop-named { max-width: none; }
 .data-table td.col-path { height: 28px; line-height: 22px; overflow: hidden; }
 
 /* === Modal === */
@@ -1828,6 +1846,8 @@ button.ch-item.selected { background: var(--selected-bg); }
 }
 .ch-item-body { flex: 1; min-width: 0; }
 .ch-item-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2px; }
+/* Keep both 48px actions inside narrow user-channel rows (#2052). */
+.ch-item.ch-user-added .ch-item-top { flex-wrap: wrap; }
 .ch-item-name { font-weight: 600; font-size: 14px; }
 .ch-item-time { font-size: 12px; font-weight: var(--fw-medium); color: var(--text-muted); white-space: nowrap; } /* #1668 M3 — was 11px/400 */
 .ch-unread-badge {
@@ -1844,12 +1864,12 @@ button.ch-item.selected { background: var(--selected-bg); }
   line-height: 1.4;
 }
 /* Shared icon button base for sidebar row controls (remove ✕, share ⤴). EMOJI-OK-COMMENT
-   WCAG 2.5.5 / Apple HIG: 44x44 CSS px minimum touch target. */
+   Inherits the shared 48x48 house minimum above. */
 .ch-icon-btn {
   display: inline-flex; align-items: center; justify-content: center;
   background: none; border: none; color: var(--text-muted);
   cursor: pointer; padding: 4px; margin-left: 2px;
-  min-width: 44px; min-height: 44px; box-sizing: border-box;
+  box-sizing: border-box;
   opacity: 0.55; transition: opacity 0.15s, color 0.15s;
   line-height: 1; user-select: none;
 }
@@ -2440,15 +2460,12 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   .ch-header-region .region-pill { padding: 2px 6px; font-size: 11px; }
   .ch-header-region .region-dropdown-trigger { padding: 3px 6px; font-size: 11px; }
 
-  /* Channel list row: name must dominate. The inline share/remove icons
-     were eating >88px because of their 44x44 touch target — push them
-     onto a per-row reveal pattern: show a single ⋮ trigger that toggles
-     the action set. Until then, shrink them to icon-only and let the
-     name grow via flex:1. */
+  /* Keep legacy channel rows compact without reducing the shared hit area.
+     The mobile chat-app renderer uses rows without inline action icons. */
   #chList .ch-item { padding: 10px 12px; gap: 10px; }
   #chList .ch-item-name { flex: 1 1 auto; min-width: 0; }
   #chList .ch-item-top { gap: 6px; }
-  #chList .ch-icon-btn { min-width: 32px; min-height: 32px; padding: 2px 4px; }
+  #chList .ch-icon-btn { padding: 2px 4px; }
   /* #1648 M5: share-btn now renders an inline <svg.ph-icon> from channels.js,
    * so the legacy `font-size: 0` + `::before { content: '<emoji>' }` shim is
    * obsolete. The icon-button class above already sets the touch target;
@@ -2569,11 +2586,15 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 
 /* === Grouped Packet Rows === */
 .group-header { cursor: pointer; font-weight: 600; }
-.group-header td:first-child::before { content: '▶ '; font-size: 10px; color: var(--link-color); transition: transform 0.15s; display: inline-block; }
-.group-header.expanded td:first-child::before { content: '▼ '; }
+/* The expand chevron is the SVG caret packets.js renders into td.col-expand;
+ * a text ::before glyph here drew a second arrow next to it. */
+.group-header td.col-expand { color: var(--link-color); }
 .group-header:hover { background: var(--row-hover); }
 .group-child { font-size: 12px; }
-.group-child td { padding-left: 20px; }
+/* Indent only the first data cell: indenting every cell pushed child rows
+ * out of line with the headers, and made each content-sized column measure
+ * 14px wider once a group was expanded. */
+.group-child td.col-time { padding-left: 20px; }
 .group-child.hidden { display: none; }
 
 /* === Reduced Motion === */
@@ -2703,6 +2724,10 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .col-resize-handle:hover::after, .col-resize-handle.active::after {
   background: var(--accent); opacity: 0.6;
 }
+/* fitColumnsToContent: the last visible column takes whatever width is left,
+ * so it has nothing to resize against, and its handle (right: -4px) would
+ * overhang the table and scroll the wrapper sideways. */
+th.fit-last > .col-resize-handle { display: none; }
 
 /* Encrypted channels de-emphasized */
 button.ch-item.ch-item-encrypted { opacity: 0.5; }
@@ -3084,6 +3109,20 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .hop-conflict-btn { background: var(--status-yellow, #f59e0b); color: #000; border: none; border-radius: 4px; font-size: 11px;
   font-weight: 700; padding: 1px 5px; cursor: pointer; vertical-align: middle; margin-left: 3px; line-height: 1.2; }
 .hop-conflict-btn:hover { background: var(--status-yellow, #d97706); filter: brightness(0.85); }
+
+/* #2097 — a badge is a sibling of its pill, so "A [8] -> B [6]" gave no clue
+   which name the 8 belonged to. The group ties the pair together and keeps the
+   separator outside it. Only hops that carry a badge are wrapped. */
+.hop-group { display: inline-flex; align-items: center; white-space: nowrap; }
+.hop-group .hop-conflict-btn,
+.hop-group .hop-unreliable-btn { margin-left: 2px; }
+
+/* One indicator for a whole path, used by the packets list. The detail pane
+   keeps a badge per hop, because that is where the candidates get read. */
+.hop-path-warn { display: inline-flex; align-items: center; gap: 2px; margin-right: 4px; flex: 0 0 auto;
+  background: var(--status-yellow, #f59e0b); color: #000; border-radius: 4px;
+  font-size: 11px; font-weight: 700; padding: 1px 5px; line-height: 1.2;
+  vertical-align: middle; white-space: nowrap; }
 .hop-conflict-popover { position: absolute; z-index: var(--z-popover); background: var(--surface-1); border: 1px solid var(--border);
   border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); width: 260px; max-height: 300px; overflow-y: auto; }
 .hop-conflict-header { padding: 10px 12px; font-size: 12px; font-weight: 700; border-bottom: 1px solid var(--border);
@@ -3440,6 +3479,11 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 }
 .analytics-chart-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: var(--space-sm); min-width: 0; }
 .analytics-chart-card.full { grid-column: 1 / -1; }
+/* Keep relay labels, percentage values and a visible track inside narrow cards. */
+.dumbbell-chart { container-type: inline-size; }
+@container (max-width: 480px) {
+  .dumbbell-row, .dumbbell-axis { --relay-airtime-columns: 70px minmax(20px, 1fr) 90px; }
+}
 /* Constrain chart media inside the card (svg/canvas at any depth). The
    `.analytics-chart-card svg, .analytics-chart-card canvas` descendant
    selector is robust to wrapper elements (legends, tooltips, axis
@@ -4425,7 +4469,6 @@ button.region-pill-active:hover { opacity: 0.85; color: var(--text-on-accent); }
   .tab-btn,
   .filter-bar input,
   .filter-bar select,
-  .nav-btn,
   .region-pill,
   .region-dropdown-trigger,
   .multi-select-trigger,
@@ -5013,18 +5056,32 @@ body[data-cb-preset="achromat"] {
   border-radius: 8px;
   cursor: pointer;
   user-select: none;
+  /* The pill is the last flex item after the chips that overflow, so on its
+   * own it sits past the clipped edge and never shows. Stick it to the
+   * right edge of .path-hops (overflow: hidden), over the last chip. */
+  position: sticky; right: 0; z-index: 1;
 }
-.path-overflow-pill:hover { color: var(--text); background: var(--bg-hover, var(--surface)); }
+/* Opaque on hover: the pill sits over the last chip, and --bg-hover is a
+ * translucent tint that let the chip show through. */
+.path-overflow-pill:hover { color: var(--text); background: var(--row-hover); border-color: var(--accent); }
 .path-popover {
   position: absolute; z-index: var(--z-popover);
   background: var(--surface); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px;
   box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-  padding: 8px 10px; max-width: min(360px, calc(100vw - 32px)); max-height: 240px; overflow: auto;
+  padding: 8px 10px; max-width: min(480px, calc(100vw - 32px)); max-height: min(420px, 60vh); overflow: auto;
   font-family: var(--mono); font-size: 12px;
 }
 .path-popover .path-popover-title { font-family: var(--font); font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
 .path-popover .hop, .path-popover .hop-named { white-space: nowrap; }
+/* Full path, one hop per line (packets.js _buildPathPopover). Each hop sits
+ * in its own .path-hops so chips keep their table styling, minus the 120px
+ * cap: the popover exists to show the names the table had to cut. */
+.path-popover-list { list-style: none; margin: 0; padding: 0; }
+.path-popover-list li { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.path-popover-idx { min-width: 2ch; text-align: right; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.path-popover .path-hops { max-width: none; }
+.path-popover .path-hops .hop-named { max-width: none; }
 .fux-popover-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); }
 .fux-popover-close { background: transparent; border: none; color: var(--text-muted); font-size: 16px; cursor: pointer; padding: 0 4px; }
 .fux-popover-close:hover { color: var(--text); }

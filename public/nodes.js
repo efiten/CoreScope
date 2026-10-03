@@ -781,13 +781,11 @@
         ${(n.role === 'repeater' || n.role === 'room') ? `<div class="node-full-card" id="node-scopes"></div>` : ''}
 
         ${observers.length || relayObserverCount ? `<div class="node-full-card" id="node-observers">
-          ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:8px"><strong>Regions:</strong> ${regions.map(r => '<span class="badge" style="margin:0 2px">' + escapeHtml(r) + '</span>').join(' ')}</div>` : ''; })()}
           <h4 title="Observers that received this node's own transmission off the air. An observer that only saw traffic relayed through this node is counted separately below.">Heard By &mdash; direct (${observers.length} observer${observers.length === 1 ? '' : 's'})</h4>
           ${observers.length ? '' : '<div class="text-muted" style="font-size:12px;padding:4px 0" title="Only flood-routed transmissions identify who was heard: a direct route removes the sender from the path before retransmitting (firmware Mesh.cpp, removeSelfFromPath), and an ambiguous relay hop is left unattributed rather than guessed. So an empty list is missing evidence, not proof of missing coverage.">No observation proves a direct reception here, which is not the same as being out of range.</div>'}
           ${observers.length ? `<table class="data-table observer-sort-table" style="font-size:12px">
             <thead><tr>
               <th scope="col" data-sort-key="observer">Observer</th>
-              <th scope="col" data-sort-key="region">Region</th>
               <th scope="col" data-sort-key="packets" data-type="numeric" data-sort-default="desc">Packets</th>
               <th scope="col" data-sort-key="snr" data-type="numeric" data-sort-default="desc">Avg SNR</th>
               <th scope="col" data-sort-key="rssi" data-type="numeric" data-sort-default="desc">Avg RSSI</th>
@@ -795,7 +793,6 @@
             <tbody>
               ${observers.map(o => `<tr>
                 <td data-value="${escapeHtml((o.observer_name || o.observer_id || '').toLowerCase())}" style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}${o.can_relay === false ? ' <span class="badge-listener" title="Firmware reported repeat:off — excluded from path-hop disambiguator (#1290)">listener</span>' : (o.can_relay === true ? ' <span class="badge-repeater" title="Firmware reported repeat:on — eligible as a path hop">repeater</span>' : '')}</td>
-                <td data-value="${escapeHtml((o.iata || '').toLowerCase())}">${o.iata ? escapeHtml(o.iata) : '—'}</td>
                 <td data-value="${o.packetCount || 0}">${o.packetCount}</td>
                 <td data-value="${o.avgSnr != null ? Number(o.avgSnr) : ''}">${o.avgSnr != null ? Number(o.avgSnr).toFixed(1) + ' dB' : '—'}</td>
                 <td data-value="${o.avgRssi != null ? Number(o.avgRssi) : ''}">${o.avgRssi != null ? Number(o.avgRssi).toFixed(0) + ' dBm' : '—'}</td>
@@ -1016,7 +1013,7 @@
               if (window.HopDisplay) {
                 const entry = { name: h.name, pubkey: h.pubkey, ambiguous: h.ambiguous, conflicts: h.conflicts, totalGlobal: h.totalGlobal, totalRegional: h.totalRegional, globalFallback: h.globalFallback, unreliable: h.unreliable };
                 const html = HopDisplay.renderHop(h.prefix, entry);
-                return isThis ? html.replace('class="', 'class="hop-current ') : html;
+                return isThis ? html.replace('class="hop ', 'class="hop-current hop ') : html;
               }
               const name = escapeHtml(h.name || h.prefix);
               const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}"${isThis ? ' class="hop-current"' : ''}>${name}</a>` : `<span>${name}</span>`;
@@ -1772,7 +1769,6 @@
         </div>
 
         ${observers.length || relayObserverCount ? `<div class="node-detail-section">
-          ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:6px;font-size:12px"><strong>Regions:</strong> ${regions.join(', ')}</div>` : ''; })()}
           <h4 title="Observers that received this node's own transmission off the air.">Heard By &mdash; direct (${observers.length} observer${observers.length === 1 ? '' : 's'})</h4>
           ${observers.length ? '' : '<div class="text-muted" style="font-size:12px;padding:4px 0" title="Only flood-routed transmissions identify who was heard: a direct route removes the sender from the path before retransmitting (firmware Mesh.cpp, removeSelfFromPath), and an ambiguous relay hop is left unattributed rather than guessed. So an empty list is missing evidence, not proof of missing coverage.">No observation proves a direct reception here, which is not the same as being out of range.</div>'}
           <div class="observer-list">
@@ -1781,7 +1777,7 @@
               if (o.avgSnr != null) stats.push('SNR ' + Number(o.avgSnr).toFixed(1) + 'dB');
               if (o.avgRssi != null) stats.push('RSSI ' + Number(o.avgRssi).toFixed(0));
               return `<div class="observer-row" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
-              <span style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}${o.iata ? ' <span class="badge" style="font-size:10px">' + escapeHtml(o.iata) + '</span>' : ''}</span>
+              <span style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}</span>
               <span style="color:var(--text-muted)">${stats.join(' · ')}</span>
             </div>`;
             }).join('')}

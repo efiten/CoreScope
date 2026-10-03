@@ -40,6 +40,41 @@ async function run() {
 
   console.log(`\nRunning observer-IATA E2E tests against ${BASE}\n`);
 
+  // #2054: row-dependent tests below opt into a fixture window. Keep the
+  // actual first-visit default covered independently of those preferences.
+  for (const width of [1400, 375]) {
+    await test(`Default 15-minute window renders an empty state at ${width}px`, async () => {
+      const emptyContext = await browser.newContext({ viewport: { width, height: 900 } });
+      try {
+        const emptyPage = await emptyContext.newPage();
+        const queries = [];
+        await emptyPage.route('**/api/packets?*', async route => {
+          queries.push(new URL(route.request().url()).searchParams);
+          await route.fulfill({ json: { packets: [], total: 0 } });
+        });
+        const started = Date.now();
+        await emptyPage.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
+        await emptyPage.locator('#pktBody').getByText('No packets found', { exact: true }).waitFor();
+        assert(await emptyPage.inputValue('#fTimeWindow') === '15', 'first visit must select 15 minutes');
+        assert(await emptyPage.evaluate(() => localStorage.getItem('meshcore-time-window')) === null,
+          'fresh context must not inherit a fixture window');
+        assert(queries.length > 0, 'empty state must follow an API request');
+        for (const query of queries) {
+          const since = Date.parse(query.get('since'));
+          assert(since >= started - 15 * 60000 && since <= Date.now() - 15 * 60000,
+            'default request must use the 15-minute cutoff');
+          assert(!query.has('hash'), 'default request must not bypass the cutoff with a hash');
+        }
+        assert(await emptyPage.locator('#pktBody tr[data-hash]').count() === 0,
+          'empty response must not render packet rows');
+        assert(await emptyPage.locator('#pktTable thead th').count() > 0,
+          'empty table must retain its column headings');
+      } finally {
+        await emptyContext.close();
+      }
+    });
+    }
+
   await test('Packets table renders an IATA badge in an observer cell', async () => {
     await page.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
     // Wide time window so fixture rows are in scope
@@ -97,9 +132,9 @@ async function run() {
     const mobile = await browser.newContext({ viewport: { width: 375, height: 812 } });
     const mpage = await mobile.newPage();
     mpage.setDefaultTimeout(15000);
+    // #2054: mobile clamps the desktop fixture window (525600) back to 15.
+    await mpage.addInitScript(() => localStorage.setItem('meshcore-time-window', '180'));
     await mpage.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
-    await mpage.evaluate(() => localStorage.setItem('meshcore-time-window', '525600'));
-    await mpage.reload({ waitUntil: 'load' });
     await mpage.waitForSelector('[data-loaded="true"]', { timeout: 20000 });
     await mpage.waitForSelector('table tbody tr:not([id^=vscroll])', { timeout: 15000 });
 
@@ -112,8 +147,8 @@ async function run() {
       'observer column should be hidden in rows at 375px (tier-3, desktop-only per #1415 spec)');
 
     // (b) tap first row → detail panel renders observer + IATA badge
-    const firstRow = await mpage.$('table tbody tr[data-hash]');
-    assert(firstRow, 'no packet row found to tap');
+    const firstRow = mpage.locator('#pktBody tr[data-hash]').first();
+    assert(await firstRow.count() > 0, 'no packet row found to tap');
     await firstRow.click();
     await mpage.waitForSelector('.detail-meta', { timeout: 10000 });
     const detailIata = await mpage.$('.detail-meta .badge-iata');

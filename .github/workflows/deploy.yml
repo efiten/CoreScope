@@ -452,6 +452,9 @@ jobs:
         # required shape before the server boots.
         run: ./corescope-migrate -db test-fixtures/e2e-fixture.db
 
+      - name: Seed deterministic Path Inspector routes (#2060)
+        run: sqlite3 test-fixtures/e2e-fixture.db < test-fixtures/path-inspector.sql
+
       - name: Start Go server with fixture DB
         run: |
           fuser -k 13581/tcp 2>/dev/null || true
@@ -702,6 +705,8 @@ jobs:
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node tests/e2e/test-marker-outline-weight.js 2>&1 | tee -a e2e-output.txt
           echo "=== E2E SUITE: test-node-reach-e2e.js ==="
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node tests/e2e/test-node-reach-e2e.js 2>&1 | tee -a e2e-output.txt
+          echo "=== E2E SUITE: test-packets-compact-columns-e2e.js ==="
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node tests/e2e/test-packets-compact-columns-e2e.js 2>&1 | tee -a e2e-output.txt
           echo "=== E2E SUITE: test-packets-scope-column.js ==="
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node tests/e2e/test-packets-scope-column.js 2>&1 | tee -a e2e-output.txt
           echo "=== E2E SUITE: test-path-inspector-e2e.js ==="
@@ -983,12 +988,38 @@ jobs:
           # here (the container image job exercises arm64 under QEMU).
           ./corescope-decrypt-linux-amd64 --version
 
+      - name: Locate the release notes for this tag
+        id: notes
+        run: |
+          set -euo pipefail
+          # docs/release-notes/<tag>.md is the convention: v3.10.1.md, v3.12.0.md.
+          F="docs/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$F" ]; then
+            echo "path=$F" >> "$GITHUB_OUTPUT"
+            echo "found $F ($(wc -c < "$F") bytes)"
+          else
+            # Not an error. A release without a notes file still gets the
+            # generated pull request list below, which is more than the empty
+            # body v3.10.1, v3.11.0 and v3.12.0 were published with.
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "::warning::no $F, publishing with generated notes only"
+          fi
+
       - name: Upload release assets
         # Standard releases upload both assets to a draft before publishing.
         # Keep one writer: published releases are immutable in this repository.
+        #
+        # body_path and generate_release_notes together: our own notes first,
+        # then GitHub's generated pull request list under them. Without either,
+        # this step publishes an empty release body, which is what happened to
+        # every release from v3.10.1 to v3.12.0 (v3.12.0's body was filled in by
+        # hand afterwards). The hand-written file is the substance; the generated
+        # list is the "what changed" index that a reader expects to find.
         uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: true
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: true
           files: |
             corescope-decrypt-linux-amd64
             corescope-decrypt-linux-arm64

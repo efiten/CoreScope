@@ -53,6 +53,8 @@ async function main() {
 
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await ctx.newPage();
+  // #2054: packet-detail icons need fixture rows even after the CI job passes 15 minutes.
+  await page.addInitScript(() => localStorage.setItem('meshcore-time-window', '1440'));
 
   // (a) /map — pane toggle + general sprite presence
   await gotoSpa(page, '/map');
@@ -104,16 +106,19 @@ async function main() {
 
   // (c) /packets — replay button renders Phosphor play sprite
   await gotoSpa(page, '/packets');
-  await page.waitForTimeout(1500);
-  // Click first packet row to render detail with replay button (if any).
-  await page.evaluate(() => {
-    const row = document.querySelector('table tbody tr, .pkt-row, .packet-row');
-    if (row) row.click();
-  });
-  await page.waitForTimeout(800);
+  await page.waitForSelector('#pktLeft[data-loaded="true"]', { state: 'attached' });
+  assert(await page.locator('#pktBody tr[data-hash]').count() > 0,
+    '(c) packet detail icons require a real packet row, not the empty-state row');
+  // View route is conditional on nonempty hops. Choose a single-observation
+  // row so the path shown in the table is also the path opened in detail.
+  const pathRow = page.locator('#pktBody tr[data-action="select-hash"]:has(.path-hops .hop)').first();
+  assert(await pathRow.count() > 0, '(c) fixture requires a packet with path hops');
+  await pathRow.locator('td.col-time').click();
+  await page.locator('#pktRight .replay-live-btn').waitFor();
+  await page.locator('#pktRight #viewRouteBtn').waitFor();
   const packets = await page.evaluate(() => {
     const replay = document.querySelector('.replay-live-btn');
-    const viewRoute = document.querySelector('#viewRouteBtn, .detail-map-link');
+    const viewRoute = document.querySelector('#viewRouteBtn');
     return {
       replaySprite: replay ? replay.querySelectorAll('svg.ph-icon use').length : null,
       replayText: replay ? replay.textContent : null,
@@ -121,18 +126,16 @@ async function main() {
       pageSprites: document.querySelectorAll('svg.ph-icon use').length,
     };
   });
-  if (packets.replaySprite === 0) {
-    fail('(c) /packets: replay button has no sprite');
-  } else if (packets.replaySprite > 0) {
-    pass(`(c) /packets: replay button has ${packets.replaySprite} sprite(s)`);
+  if (!(packets.replaySprite > 0)) {
+    fail('(c) /packets: replay button missing or has no sprite');
   } else {
-    console.warn('  ⚠ (c) /packets: replay button not present (no packet detail open)');
+    pass(`(c) /packets: replay button has ${packets.replaySprite} sprite(s)`);
   }
   if (packets.replayText && /[▶◀⏸]/.test(packets.replayText)) {
     fail(`(c) /packets: replay button still has play/pause char (${JSON.stringify(packets.replayText)})`);
   }
-  if (packets.viewRouteSprites === 0) fail('(c) /packets: View-route button missing sprite');
-  else if (packets.viewRouteSprites > 0) pass('(c) /packets: View-route button has sprite');
+  if (!(packets.viewRouteSprites > 0)) fail('(c) /packets: View-route button missing or has no sprite');
+  else pass('(c) /packets: View-route button has sprite');
   if (packets.pageSprites < 5) fail(`(c) /packets: only ${packets.pageSprites} sprite refs (expected ≥5)`);
   else pass(`(c) /packets: ${packets.pageSprites} sprite refs on page`);
 
