@@ -187,7 +187,7 @@ must therefore include the 16-hex prefix among their heard_key candidates.
 assumption they rest on. No hex cell is stored — binning is computed server-side from lat/lon.
 
 Indexes: a composite `(heard_key, heard_keylen, lat, lon)` and a `(lat, lon)` index back the coverage
-queries; the per-node query matches a sargable `heard_key IN (pubkey, prefix6, prefix4)` list so the
+queries; the per-node query matches a sargable `heard_key IN (pubkey, prefix16, prefix6, prefix4)` list so the
 composite is used instead of a table scan (see the benchmark in `cmd/ingestor`).
 
 Retention: the table grows on every submission, so set `retention.clientRxDays` (ingestor) to delete
