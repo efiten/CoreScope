@@ -5,6 +5,7 @@ const REPO_ROOT = require('path').resolve(__dirname, '..', '..');
  * Usage: node test-e2e-playwright.js
  */
 const { chromium } = require('playwright');
+const { doesNotReject } = require('node:assert/strict');
 
 const BASE = process.env.BASE_URL || 'http://localhost:3000';
 const GO_BASE = process.env.GO_BASE_URL || '';  // e.g. https://analyzer.00id.net:82
@@ -64,6 +65,89 @@ async function run() {
   page.setDefaultTimeout(10000);
 
   console.log(`\nRunning E2E tests against ${BASE}\n`);
+
+  // API contract fixtures exercise both real node renderers at desktop/mobile sizes.
+  for (const width of [1280, 375]) {
+    await test(`#2073 recent adverts grouped in both node views at ${width}px`, async () => {
+      const fixtureContext = await browser.newContext({ viewport: { width, height: 900 } });
+      const fixturePage = await fixtureContext.newPage();
+      const pubkey = 'a'.repeat(64);
+      const node = { public_key: pubkey, name: 'Advert fixture', role: 'repeater',
+        last_seen: new Date().toISOString(), advert_count: 900 };
+      const routes = [
+        { advert_kind: 'flood', route_type: 1, raw_hex: '110000' },
+        { advert_kind: 'zero_hop', route_type: 2, raw_hex: '120000' },
+        { advert_kind: 'flood', route_type: 0, raw_hex: '10010203040000' },
+        { advert_kind: 'zero_hop', route_type: 3, raw_hex: '13010203040000' },
+        { advert_kind: 'other', route_type: 2, raw_hex: '1201ab00', path_json: '[]' },
+        { route_type: null, raw_hex: null },
+        { route_type: 2, raw_hex: '1200zz' },
+        { advert_kind: 'mixed', route_type: 1, raw_hex: '110000' },
+        { advert_kind: 'mixed', route_type: 2, raw_hex: '120000' },
+        { route_type: 1, raw_hex: '110000' },
+        { advert_kind: 'future_kind', route_type: 2, raw_hex: '120000' },
+      ];
+      let adverts = routes.map((route, i) => ({ ...route, hash: String(i + 1).repeat(16),
+        timestamp: new Date(Date.now() - i * 60000).toISOString(), payload_type: 4,
+        observer_name: `Fixture observer ${i + 1}`, snr: 7 + i, rssi: -80 - i, observation_count: 2 }));
+      await fixturePage.route('**/api/nodes**', async route => {
+        const path = new URL(route.request().url()).pathname;
+        let body;
+        if (path === '/api/nodes') body = { nodes: [node], total: 1 };
+        else if (path === '/api/nodes/' + pubkey) body = { node, recentAdverts: adverts };
+        else if (path === '/api/nodes/' + pubkey + '/health') body = {};
+        else return route.continue();
+        await route.fulfill({ json: body });
+      });
+      try {
+        for (const empty of [false, true]) {
+          if (empty) adverts = [];
+          for (const full of [false, true]) {
+            await fixturePage.goto(`${BASE}/#/nodes${full ? '/' + pubkey : ''}`, { waitUntil: 'domcontentloaded' });
+            await fixturePage.reload({ waitUntil: 'domcontentloaded' });
+            if (!full) await fixturePage.locator(`tr[data-key="${pubkey}"]`).click();
+            // On phones a list click opens the full page; only desktop has a side pane.
+            const fullView = full || width <= 640;
+            const root = fullView ? '#node-packets' : '#advertTimeline';
+            await fixturePage.locator(root).waitFor();
+            const groups = await fixturePage.locator(root + ' [data-advert-kind]').evaluateAll(els => els.map(el => ({
+              kind: el.dataset.advertKind,
+              heading: el.querySelector('h5').textContent.trim(),
+              rows: Array.from(el.querySelectorAll('a.ch-analyze-link'), a => ({
+                href: a.getAttribute('href'),
+                text: a.closest('.node-activity-item, .advert-entry').textContent,
+              })),
+              text: el.textContent,
+              overflow: el.scrollWidth > el.clientWidth + 1,
+            })));
+            assert(groups.length === (empty ? 2 : 4), `Expected ${empty ? 2 : 4} advert groups, got ${groups.length}`);
+            const expected = empty ? [[], []] : [[0, 2], [7, 8], [1, 3], [4, 5, 6, 9, 10]];
+            const labels = empty ? ['Flood adverts', 'Direct adverts (empty path)'] : ['Flood adverts', 'Mixed flood / direct (empty path) adverts', 'Direct adverts (empty path)', 'Other / unknown adverts'];
+            assert(groups.reduce((count, group) => count + group.rows.length, 0) === adverts.length, 'Each advert must appear exactly once');
+            expected.forEach((indices, i) => {
+              assert(groups[i].heading === `${labels[i]} (${indices.length})`, `Wrong sample count: ${groups[i].heading}`);
+              assert(JSON.stringify(groups[i].rows.map(row => row.href)) === JSON.stringify(indices.map(j => '#/packets/' + adverts[j].hash)), 'Advert order or analyze links changed');
+              assert(!groups[i].overflow, `${labels[i]} overflows at ${width}px`);
+              if (empty) assert(groups[i].text.includes('None in this recent sample'), `${labels[i]} empty-state message missing`);
+              indices.forEach((j, rowIndex) => {
+                const advert = adverts[j];
+                const row = groups[i].rows[rowIndex];
+                assert(row.text.includes(advert.observer_name) && row.text.includes(`SNR ${advert.snr}dB`) && row.text.includes(`RSSI ${advert.rssi}dBm`), `RF/observer metadata changed for ${row.href}`);
+              });
+            });
+            const heading = fullView ? fixturePage.locator('#node-packets h4') : fixturePage.locator('#advertTimeline').locator('..').locator('h4');
+            assert(await heading.textContent() === `Recent Adverts (${adverts.length})`, 'Recent Adverts count must reflect sample, not lifetime');
+            assert((await heading.getAttribute('title')).includes('originated'), 'Existing origin tooltip lost');
+            const explanation = await heading.getAttribute('title');
+            assert(explanation.includes('available observations') && explanation.includes('older history may be incomplete'), 'Grouping must explain the available-evidence limit');
+            assert(explanation.includes('observed empty direct path') && explanation.includes('cannot prove an origin-local send or RF distance'), 'Both node views must distinguish an observed path from send origin and distance');
+          }
+        }
+      } finally {
+        await fixtureContext.close();
+      }
+    });
+  }
 
   // --- Group: Home page (tests 1, 6, 7) ---
 
@@ -2596,41 +2680,42 @@ async function run() {
 
   // Test: per-observation raw_hex — hex pane updates when switching observations (#881)
   await test('Packet detail hex pane updates per observation', async () => {
-    await gotoPackets(page);
-    await page.waitForTimeout(500);
+    // Reuse the real #1486 transmission, seeded with distinct raw bytes after
+    // migration in deploy.yml. Missing fixture data must fail, never skip.
+    const hash = 'fae0c9e6d357a814';
+    const expectedHex = [
+      '1501aa0102030405060708090a0b0c0d0e0f',
+      '1501bb0102030405060708090a0b0c0d0e0f'
+    ];
+    const response = await context.request.get(BASE + '/api/packets/' + hash);
+    assert(response.ok(), '#2104 requires the #1486 grouped-packet fixture');
+    const detail = await response.json();
+    assert(detail.packet && detail.packet.hash === hash && Array.isArray(detail.observations),
+      'fixture must expose the expected packet and observations');
+    const observations = expectedHex.map(hex => detail.observations.find(o => o.raw_hex === hex));
+    assert(observations.every(Boolean), 'fixture must include both distinct observation raw byte strings');
+    assert(String(observations[0].id) !== String(observations[1].id), 'observation IDs must differ');
 
-    // Try clicking packet rows to find one with multiple observations
-    const rows = await page.$$('table tbody tr[data-action]');
-    let obsRows = [];
-    for (let i = 0; i < Math.min(rows.length, 10); i++) {
-      await rows[i].click({ timeout: 3000 }).catch(() => null);
-      await page.waitForTimeout(600);
-      obsRows = await page.$$('.detail-obs-row');
-      if (obsRows.length >= 2) break;
-    }
+    // Start on B so selecting A must complete a render before selecting B again.
+    await page.goto(BASE + '/#/packets/' + hash + '?obs=' + observations[1].id + '&timeWindow=0',
+      { waitUntil: 'domcontentloaded' });
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForSelector('#pktRight .detail-obs-row.observation-current[data-obs-id="' + observations[1].id + '"]');
+    const obsRows = observations.map(o =>
+      page.locator('#pktRight .detail-obs-row[data-obs-id="' + o.id + '"]'));
 
-    if (obsRows.length < 2) {
-      console.log('    ⏭ Skipped: no packet with ≥2 observations found in first 10 rows');
-      return;
-    }
-
-    // Click first observation, capture hex dump
-    await obsRows[0].click({ timeout: 5000 });
-    await page.waitForTimeout(500);
-    const hex1 = await page.$eval('.hex-dump', el => el.textContent).catch(() => '');
-
-    // Click second observation, capture hex dump
-    await obsRows[1].click({ timeout: 5000 });
-    await page.waitForTimeout(500);
-    const hex2 = await page.$eval('.hex-dump', el => el.textContent).catch(() => '');
-
-    // If both have content and differ, the feature works
-    if (hex1 && hex2 && hex1 !== hex2) {
-      console.log('    ✓ Hex pane content differs between observations');
-    } else if (hex1 && hex2 && hex1 === hex2) {
-      console.log('    ⏭ Hex same for both observations (likely historical NULL raw_hex — OK)');
-    } else {
-      console.log('    ⏭ Could not capture hex content from both observations');
+    for (const index of [0, 1, 0]) {
+      const id = String(observations[index].id);
+      await doesNotReject(() => obsRows[index].click({ timeout: 5000 }),
+        'Observation ' + id + ' must remain selectable after the detail rerenders');
+      await page.waitForFunction(expectedId => {
+        const selected = document.querySelector('#pktRight .detail-obs-row.observation-current');
+        return selected && selected.dataset.obsId === expectedId;
+      }, id);
+      const selectedId = await page.locator('#pktRight .detail-obs-row.observation-current').getAttribute('data-obs-id');
+      assert(selectedId === id, 'expected selected observation ' + id + ', got ' + selectedId);
+      const hex = (await page.locator('#pktRight .hex-dump').textContent()).replace(/\s+/g, '').toLowerCase();
+      assert(hex === expectedHex[index], 'observation ' + id + ': expected hex ' + expectedHex[index] + ', got ' + hex);
     }
   });
 

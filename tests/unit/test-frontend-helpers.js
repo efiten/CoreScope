@@ -7013,6 +7013,115 @@ console.log('\n=== map.js: hash size fallback ===');
   });
 }
 
+// ===== Recent advert routing (#2073) =====
+console.log('\n=== roles.js: recent advert groups (#2073) ===');
+{
+  const ctx = makeSandbox();
+  loadInCtx(ctx, 'public/roles.js');
+  function classify(packet) {
+    assert.strictEqual(typeof ctx.classifyRecentAdvert, 'function', 'shared recent-advert classifier must exist');
+    return ctx.classifyRecentAdvert(packet);
+  }
+  test('accumulated mixed evidence wins for the same hash in either arrival order', () => {
+    for (const canonical of [{ route_type: 1, raw_hex: '110000' }, { route_type: 2, raw_hex: '120000' }]) {
+      const advert = { ...canonical, hash: 'same-advert', advert_kind: 'mixed', path_json: '[]' };
+      assert.strictEqual(classify(advert), 'mixed', 'first received frame must not override accumulated evidence');
+      const groups = ctx.groupRecentAdverts([advert]);
+      assert.strictEqual(groups.reduce((n, group) => n + group.adverts.length, 0), 1, 'mixed advert must not be counted twice');
+      const mixed = groups.find(group => group.kind === 'mixed');
+      assert.ok(mixed, 'mixed group must exist');
+      assert.strictEqual(mixed.adverts[0], advert, 'row metadata must be retained');
+      assert.deepStrictEqual(Array.from(groups, group => group.kind), ['flood', 'mixed', 'zero-hop']);
+      assert.strictEqual(mixed.label, 'Mixed flood / direct (empty path) adverts');
+    }
+  });
+  test('authoritative advert kind does not depend on canonical route or path', () => {
+    for (const [advert_kind, expected] of [['flood', 'flood'], ['zero_hop', 'zero-hop'], ['mixed', 'mixed'], ['other', 'other']]) {
+      assert.strictEqual(classify({ advert_kind }), expected);
+      assert.strictEqual(classify({ advert_kind, route_type: 1, raw_hex: '110000', path_json: '[]' }), expected);
+      assert.strictEqual(classify({ advert_kind, route_type: 2, raw_hex: '120000', path_json: '["ab"]' }), expected);
+    }
+  });
+  test('legacy and unrecognized advert evidence stays unknown despite known-looking frames', () => {
+    for (const advert_kind of [undefined, null, '', 'zero-hop', 'future_kind', 1, false, ['flood']]) {
+      for (const canonical of [{ route_type: 1, raw_hex: '110000' }, { route_type: 2, raw_hex: '120000' }]) {
+        assert.strictEqual(classify({ ...canonical, advert_kind, path_json: '[]', observations: [{ raw_hex: '110000' }, { raw_hex: '120000' }] }), 'other');
+      }
+    }
+  });
+  test('mixed groups preserve per-group order and hide only empty optional groups', () => {
+    const adverts = ['mixed', 'zero_hop', 'flood', 'mixed', 'other'].map((advert_kind, i) => ({ advert_kind, hash: String(i) }));
+    const before = JSON.stringify(adverts);
+    const groups = ctx.groupRecentAdverts(adverts);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(groups.map(group => [group.kind, group.adverts.map(advert => advert.hash)]))), [
+      ['flood', ['2']], ['mixed', ['0', '3']], ['zero-hop', ['1']], ['other', ['4']],
+    ]);
+    assert.strictEqual(groups.reduce((n, group) => n + group.adverts.length, 0), adverts.length);
+    assert.strictEqual(JSON.stringify(adverts), before);
+    assert.deepStrictEqual(Array.from(ctx.groupRecentAdverts([]), group => group.kind), ['flood', 'zero-hop']);
+  });
+  test('legacy flood routes without accumulated evidence stay unknown', () => {
+    for (const route of [0, 1, '0', '1']) {
+      assert.strictEqual(classify({ route_type: route, path_json: '[]' }), 'other');
+    }
+    assert.strictEqual(classify({ raw_hex: '110000' }), 'other');
+    assert.strictEqual(classify({ raw_hex: '10010203040000' }), 'other');
+  });
+  test('legacy direct routes cannot prove zero-hop from a selected empty path', () => {
+    for (const route of [2, 3, '2', '3']) {
+      assert.strictEqual(classify({ route_type: route, path_json: '[]' }), 'other');
+      assert.strictEqual(classify({ route_type: route, path_json: [] }), 'other');
+      assert.strictEqual(classify({ route_type: route }), 'other');
+      assert.strictEqual(classify({ route_type: route, path_json: '["ab"]' }), 'other');
+    }
+    assert.strictEqual(classify({ route_type: null, raw_hex: '120000' }), 'other');
+    assert.strictEqual(classify({ raw_hex: '13010203040000' }), 'other');
+  });
+  test('neither canonical transmission nor selected observation path fills missing evidence', () => {
+    assert.strictEqual(classify({ route_type: 2, raw_hex: '1201ab00', path_json: '[]' }), 'other');
+    assert.strictEqual(classify({ route_type: 2, raw_hex: '120000', path_json: '["ab"]' }), 'other');
+    assert.strictEqual(classify({ route_type: 3, raw_hex: '130002030401ab00', path_json: '[]' }), 'other');
+    assert.strictEqual(classify({ route_type: 1, raw_hex: '114000' }), 'other');
+    assert.strictEqual(classify({ route_type: 2, raw_hex: '124000' }), 'other');
+  });
+  test('unknown, malformed and contradictory routing is never guessed', () => {
+    for (const packet of [null, {}, { route_type: null }, { route_type: '' },
+      { route_type: false }, { route_type: [] }, { route_type: [2], path_json: '[]' },
+      { route_type: {} }, { route_type: 4 }, { route_type: -1 }, { route_type: 2.5 },
+      { route_type: 'flood' }, { route_type: 2, path_json: null },
+      { route_type: 2, path_json: '' }, { route_type: 2, path_json: 'null' },
+      { route_type: 2, path_json: '{}' }, { route_type: 2, path_json: '[' },
+      { route_type: 1, raw_hex: '120000' }, { route_type: 2, raw_hex: '110000' },
+      { route_type: 2, raw_hex: '12' }, { route_type: 2, raw_hex: '120' },
+      { route_type: 2, raw_hex: '1200zz' }, { route_type: 2, raw_hex: '12c000' },
+      { route_type: 2, raw_hex: '1202ab' }, { route_type: 3, raw_hex: '130000' }]) {
+      assert.strictEqual(classify(packet), 'other', JSON.stringify(packet));
+    }
+  });
+  test('grouping preserves every row, per-group order and sample counts without mutation', () => {
+    assert.strictEqual(typeof ctx.groupRecentAdverts, 'function', 'shared recent-advert grouping must exist');
+    const packets = [
+      { hash: 'a', advert_kind: 'zero_hop', route_type: 2, path_json: '[]' },
+      { hash: 'b', advert_kind: 'flood', route_type: 1 },
+      { hash: 'c', route_type: null },
+      { hash: 'd', advert_kind: 'flood', route_type: 0 },
+      { hash: 'e', advert_kind: 'zero_hop', route_type: 3, path_json: '[]' },
+      { hash: 'f', route_type: 2, path_json: '["ab"]' },
+    ];
+    const before = JSON.stringify(packets);
+    const groups = ctx.groupRecentAdverts(packets);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(groups.map(g => [g.kind, g.label, g.adverts.map(p => p.hash)]))), [
+      ['flood', 'Flood adverts', ['b', 'd']],
+      ['zero-hop', 'Direct adverts (empty path)', ['a', 'e']],
+      ['other', 'Other / unknown adverts', ['c', 'f']],
+    ]);
+    assert.strictEqual(groups.reduce((n, g) => n + g.adverts.length, 0), packets.length);
+    assert.strictEqual(groups[0].adverts[0], packets[1]);
+    assert.strictEqual(JSON.stringify(packets), before);
+    assert.strictEqual(ctx.groupRecentAdverts([]).reduce((n, g) => n + g.adverts.length, 0), 0);
+  });
+}
+
 // ===== SUMMARY =====
 Promise.allSettled(pendingTests).then(() => {
   console.log(`\n${'═'.repeat(40)}`);
