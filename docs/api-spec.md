@@ -11,6 +11,7 @@
 ## Table of Contents
 
 - [Conventions](#conventions)
+- [User management (optional)](#user-management-optional)
 - [GET /api/stats](#get-apistats)
 - [GET /api/health](#get-apihealth)
 - [GET /api/perf](#get-apiperf)
@@ -98,6 +99,60 @@ They return `total` (the unfiltered/filtered count before pagination).
 
 - `400` — Bad request (missing/invalid params)
 - `404` — Resource not found
+
+---
+
+## User management (optional)
+
+These routes are registered only when `userManagement.enabled` is true. When it is off they do not exist, and requests to them fall through to the SPA page (HTTP 200, HTML). The webhook route exists only when `mail.webhookSecret` is also set. Sessions use the `cs_session` cookie (HttpOnly, SameSite=Lax). Every state-changing request that authenticates with the cookie needs an `Origin` (or `Referer`) equal to `publicBaseUrl` and the header `X-CS-CSRF: <csrfToken from GET /api/auth/me>`. Errors are `{"error": "<message>"}`. Rate-limited calls answer `429` with `Retry-After`. Request bodies are JSON. On every route except the webhook and `PUT /api/account/settings` they are limited to 16 KiB and unknown fields are rejected with `400`; the webhook takes up to 256 KiB of Brevo's payload as is.
+
+| Method and path | Auth | Body and response |
+|---|---|---|
+| `POST /api/auth/register` | origin | `{email, displayName, password}` -> `{ok, message}`, identical for known addresses. Registering a pending address again replaces its password and name and mails a new link |
+| `POST /api/auth/activate` | origin | `{token, password}` -> me + session cookie. `410` expired, used or already activated; `401` "wrong password for this account" (the link stays usable); `409` "account changed, try again" when the account changed between the password check and the activation (for example a re-register) |
+| `POST /api/auth/login` | origin | `{email, password}` -> me + cookie. `401` "incorrect email or password" for every failure, including pending and disabled accounts |
+| `POST /api/auth/logout` | origin | -> `{ok}` |
+| `GET /api/auth/me` | session | -> `{id, email, displayName, role, csrfToken}`. `401` when not logged in |
+| `POST /api/auth/forgot` | origin | `{email}` -> `{ok, message}` |
+| `POST /api/auth/reset` | origin | `{token, password}` -> `{ok, message}`. Ends all sessions and any pending email-change link. `410` expired or used |
+| `PATCH /api/account` | session | `{displayName}` -> me |
+| `POST /api/account/password` | session | `{currentPassword, newPassword}` -> `{ok, message}`. Ends the other sessions and outstanding reset and email-change links |
+| `POST /api/account/email` | session | `{newEmail, currentPassword}` -> `{ok, message}`. Rate-limited. A confirmation goes to the new address and a notice to the old one; the answer is the same when the new address is already in use |
+| `POST /api/account/confirm-email` | origin | `{token}` -> `{ok, message}`. `410` expired or used; `409` address now in use |
+| `GET /api/account/sessions` | session | -> `[{id, createdAt, lastSeenAt, expiresAt, userAgent, current}]` |
+| `DELETE /api/account/sessions/{id}` | session | -> `{ok}`. `404` not your session |
+| `GET /api/account/settings` | session | -> `{revision, generation, doc, allowlist}`. `doc` is `{v: 1, keys: {<localStorage key>: <raw string>}}`, or `null` at revision 0. `generation` is a random id of the stored document (`""` at revision 0): revisions restart at 1 after a `DELETE`, the generation does not repeat. `allowlist` is `[{key, kind, id?}]`: `kind` is `set` (JSON array merged per item; `id` names the field that identifies an item, absent means the item itself) or `scalar` |
+| `PUT /api/account/settings` | session | `{baseRevision, baseGeneration, doc}` -> `{revision, generation}`. `409` `{revision, generation, doc}` when `baseRevision` is not the stored revision or, with a stored document, `baseGeneration` is not its generation; `baseRevision` 0 without a stored document starts a new generation; `400` for another shape, a key that is never synced (`corescope_channel_*`, `live-channel-colors`, `meshcore-api-key`) or a key not in the allowlist; `413` when `doc` is over 256 KiB (body cap 264 KiB); `429` above 60 PUT requests per hour per user |
+| `DELETE /api/account/settings` | session | -> `{ok}`. The next `PUT` with `baseRevision` 0 starts a new document in a new generation |
+| `DELETE /api/account` | session | `{currentPassword}` -> `{ok, message}`. `409` you are the last admin |
+| `GET /api/admin/users?status=&role=&q=` | admin | -> `[adminUser]`. `status` is `pending`, `active` or `disabled`; `role` is `user` or `admin` |
+| `GET /api/admin/users/{id}` | admin | -> `{user, sessions, mail, audit}` |
+| `POST /api/admin/users/{id}/disable` | admin | -> adminUser. Active accounts only; ends the user's sessions and links |
+| `POST /api/admin/users/{id}/enable` | admin | -> adminUser. Disabled accounts only |
+| `DELETE /api/admin/users/{id}` | admin | -> `{ok}` |
+| `POST /api/admin/users/{id}/role` | admin | `{role}` (`user` or `admin`) -> adminUser |
+| `POST /api/admin/users/{id}/resend-activation` | admin | -> adminUser. Pending accounts only |
+| `POST /api/admin/users/{id}/activate` | admin | -> adminUser. Pending accounts only; the address stays unverified |
+| `POST /api/admin/users/{id}/mail/{mailId}/refresh` | admin | -> mail record with `events`, pulled from the provider. `502` provider unavailable |
+| `POST /api/mail/brevo/webhook` | `Authorization: Bearer <webhookSecret>` | Brevo transactional event payload -> `{ok}`. `401` on a wrong secret |
+
+`adminUser` = `{id, email, displayName, role, status, createdAt, activatedAt, activatedManually, activatedBy, lastLoginAt, emailBouncing, configAdmin, lastMail}`. `status` is `pending`, `active` or `disabled`.
+
+Error codes you can get on the routes above:
+
+| Code | Meaning |
+|---|---|
+| `400` | Validation failed (email, display name, password, role, filter, id) |
+| `401` | Not logged in, or wrong password on activate or login |
+| `403` | `"CSRF check failed"`, `"request origin not allowed"`, `"admin role required"`, or `"current password is incorrect"` (password change, email change, account delete) |
+| `404` | `"user not found"` (admin `{id}` routes), `"mail not found"` (mail refresh), `"session not found"` (`DELETE /api/account/sessions/{id}`) |
+| `409` | A state guard: `"only active accounts can be disabled; ..."`, role change on a pending account, disable or delete of yourself, disable, delete or demotion of a config admin or the last admin, enable of a non-disabled account, `"this mail has no provider message id"` (mail refresh), `"account changed, try again"` (activate) |
+| `410` | Link expired, invalid or already used |
+| `429` | Rate limit; see `Retry-After` |
+| `502` | `"mail provider unavailable"` (mail refresh) |
+| `503` | `"mail could not be sent, try again later"` |
+
+With user management on, every endpoint that needs `X-API-Key` also accepts an admin session (plus the CSRF header for unsafe methods). A request that sends `X-API-Key` is judged on the key alone. `GET /api/config/client` gains `"userManagement": {"enabled": true}` only when the feature is on.
 
 ---
 
@@ -1400,14 +1455,12 @@ RF signal analytics.
 ## GET /api/rf-noise
 
 RF noise-floor map layer: where the LoRa band is quiet vs. busy, as measured
-by mobile companions' own radio counters along a driver's track. Fork-only,
-opt-in — gated by `config.json`'s `clientRfSamples.enabled` (mirrors the flag
-`cmd/ingestor` uses to decide whether to record the underlying
-`client_rf_samples` rows); the endpoint 404s when disabled. Response shape
-closely mirrors the `/api/rx-coverage` hex-grid GeoJSON (another fork-only,
-opt-in endpoint), but reports noise floor (dBm, negative; **lower is
-quieter** — the opposite direction from the SNR `rx-coverage` colours)
-instead of signal.
+by mobile companions' own radio counters along a driver's track. Opt-in, gated
+by `config.json`'s `clientRfSamples.enabled` (the same flag `cmd/ingestor` uses
+to decide whether to record the underlying `client_rf_samples` rows); the
+endpoint 404s when disabled. The response shape mirrors the `/api/rx-coverage`
+hex-grid GeoJSON, but reports noise floor (dBm, negative; **lower is quieter**,
+the opposite direction from the SNR `rx-coverage` colours) instead of signal.
 
 Stationary samples (a parked companion) are excluded from the aggregate
 entirely: a single parked driver can log hundreds of samples at one GPS
@@ -1417,16 +1470,16 @@ misrepresent what the band looks like from the road.
 **Deployment note:** this endpoint is gated only by `clientRfSamples.enabled`
 and has no dependency on `clientRxCoverage.enabled`. Enabling
 `clientRfSamples` without also enabling `clientRxCoverage` leaves
-`/api/rf-noise` live and returning data with no UI to reach it — the
-Coverage page (which hosts the Noise layer toggle) bails out at "Coverage is
-not enabled" before the toggle is ever rendered.
+`/api/rf-noise` live and returning data with no UI to reach it: the
+Coverage page (which hosts the Noise layer toggle) stops at "Coverage is
+not enabled" before the toggle is rendered.
 
 ### Query Parameters
 
 | Param  | Type   | Default | Description                                             |
 |--------|--------|---------|-----------------------------------------------------------|
-| `bbox` | string | —       | **Required.** `minLat,minLon,maxLat,maxLon`                |
-| `z`    | number | —       | Leaflet zoom level; selects the hex display resolution     |
+| `bbox` | string | -       | **Required.** `minLat,minLon,maxLat,maxLon`                |
+| `z`    | number | -       | Leaflet zoom level; selects the hex display resolution     |
 | `days` | number | `7`     | Lookback window by `sampled_at`, clamped to `[1,30]`        |
 
 ### Response `200`
@@ -2538,7 +2591,7 @@ Client-side configuration values.
   "externalUrls":       object | null,
   "propagationBufferMs": number,         // default: 5000
   "clientRxCoverage":   boolean,         // fork-only opt-in flag; gates /api/rx-coverage and friends
-  "clientRfSamples":    boolean          // fork-only opt-in flag; gates /api/rf-noise
+  "clientRfSamples":    boolean          // opt-in flag; gates /api/rf-noise
 }
 ```
 

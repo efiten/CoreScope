@@ -132,6 +132,7 @@ node tests/unit/test-issue-1849-trace-hashbytes.js
 node tests/unit/test-issue-1851-channel-message-scope.js
 node tests/unit/test-issue-1862-map-region-filter.js
 node tests/unit/test-issue-1868-control-decode.js
+node tests/unit/test-packet-detail-hash-size.js
 node tests/unit/test-issue-1890-og-url.js
 node tests/unit/test-issue-1956-release-routing.js
 node tests/unit/test-issue-1979-scope-adverts-by-role.js
@@ -187,12 +188,15 @@ node tests/unit/test-radio-band.js
 node tests/unit/test-repeater-metric-scatter.js
 node tests/unit/test-rx-coverage-config-race.js
 node tests/unit/test-rx-coverage-escape.js
+node tests/unit/test-rx-coverage-noise.js
 node tests/unit/test-rx-coverage-viewport.js
 node tests/unit/test-scope-audit-styles-linked.js
+node tests/unit/test-settings-sync.js
 node tests/unit/test-slideover-1056-rowsel-strict.js
 node tests/unit/test-top-routes-overlay.js
 node tests/unit/test-traces.js
 node tests/unit/test-url-state.js
+node tests/unit/test-user-management-ui.js
 node tests/unit/test-warmup-banner.js
 node tests/unit/test-ws-stale-watchdog-1074.js
 node tests/unit/test-xss-escape-sinks.js

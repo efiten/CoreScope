@@ -12,6 +12,29 @@ function payloadTypeColor(n) { return PAYLOAD_COLORS[n] || 'unknown'; }
 function isTransportRoute(rt) { return rt === 0 || rt === 3; }
 /** Byte offset of path_len in raw_hex: 5 for transport routes (4 bytes of next/last hop codes precede it), 1 otherwise. */
 function getPathLenOffset(routeType) { return isTransportRoute(routeType) ? 5 : 1; }
+/**
+ * Path hash size (1-3 bytes) the originator chose, from raw_hex's path byte, or
+ * 0 when the packet carries none. Same rule as packetpath.HashSize on the
+ * server; both run test-fixtures/path-hash-size-cases.json. A flood packet
+ * always encodes it (firmware sendFlood sets it before the first hop), a direct
+ * packet with no hops does not (sendZeroHop writes 0x00, and an exhausted
+ * direct path has no hash left to size), and TRACE path bytes are SNR readings.
+ */
+function pathHashSize(rawHex) {
+  // Names as in internal/packetpath/route.go.
+  const PAYLOAD_TRACE = 9, ROUTE_DIRECT = 2, ROUTE_TRANSPORT_DIRECT = 3;
+  if (typeof rawHex !== 'string' || !/^[0-9a-f]{2}/i.test(rawHex)) return 0;
+  const header = parseInt(rawHex.slice(0, 2), 16);
+  if (((header >> 2) & 0x0F) === PAYLOAD_TRACE) return 0;
+  const routeType = header & 0x03;
+  const off = getPathLenOffset(routeType) * 2;
+  const pathHex = rawHex.slice(off, off + 2);
+  if (!/^[0-9a-f]{2}$/i.test(pathHex)) return 0;
+  const pathByte = parseInt(pathHex, 16);
+  if ((pathByte & 0x3F) === 0 && (routeType === ROUTE_DIRECT || routeType === ROUTE_TRANSPORT_DIRECT)) return 0;
+  const size = (pathByte >> 6) + 1;
+  return size > 3 ? 0 : size;
+}
 function transportBadge(rt) { return isTransportRoute(rt) ? ' <span class="badge badge-transport" title="' + routeTypeName(rt) + '">T</span>' : ''; }
 
 /**

@@ -8,7 +8,7 @@
 (function () {
   var map = null, covLayer = null, days = 7, selectedRx = '', selectedName = '', boardCache = [], destroyed = false, generation = 0;
   // layer: 'signal' (default, per-cell best SNR of directly-heard nodes) or
-  // 'noise' (RF noise-floor layer, fork-only opt-in — see MC_CLIENT_RF_SAMPLES).
+  // 'noise' (RF noise-floor layer, opt-in — see MC_CLIENT_RF_SAMPLES).
   var layer = 'signal';
 
   function cssColor(varName) {

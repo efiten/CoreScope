@@ -104,6 +104,19 @@ function loadInCtx(ctx, file) {
   }
 }
 
+// The real pathHashSize from app.js, for sandboxes that stub app.js piece by
+// piece (loading app.js into them would replace their api/registerPage stubs).
+let _appPathHashSize = null;
+function realPathHashSize() {
+  if (!_appPathHashSize) {
+    const appCtx = makeSandbox();
+    loadInCtx(appCtx, 'public/roles.js');
+    loadInCtx(appCtx, 'public/app.js');
+    _appPathHashSize = appCtx.pathHashSize;
+  }
+  return _appPathHashSize;
+}
+
 // ===== APP.JS TESTS =====
 console.log('\n=== app.js: timeAgo ===');
 {
@@ -234,6 +247,25 @@ console.log('\n=== app.js: routeTypeName / payloadTypeName ===');
   test('getPathLenOffset: transport route (3) → 5', () => assert.strictEqual(ctx.getPathLenOffset(3), 5));
   test('getPathLenOffset: flood route (1) → 1', () => assert.strictEqual(ctx.getPathLenOffset(1), 1));
   test('getPathLenOffset: direct route (2) → 1', () => assert.strictEqual(ctx.getPathLenOffset(2), 1));
+}
+
+console.log('\n=== app.js: pathHashSize ===');
+{
+  const ctx = makeSandbox();
+  loadInCtx(ctx, 'public/roles.js');
+  loadInCtx(ctx, 'public/app.js');
+
+  // Cases shared with packetpath.HashSize (internal/packetpath/path_test.go,
+  // cmd/server/path_hash_size_agreement_test.go): the two implementations
+  // cannot drift apart without one of the suites failing. 0 = no size.
+  const shared = JSON.parse(fs.readFileSync('test-fixtures/path-hash-size-cases.json', 'utf8')).cases;
+  test('pathHashSize: shared cases file is not empty', () => assert.ok(shared.length > 0));
+  for (const c of shared) {
+    test('pathHashSize: ' + c.name, () => assert.strictEqual(ctx.pathHashSize(c.raw), c.want));
+  }
+  // Inputs only JavaScript can be handed: a message without raw_hex.
+  test('pathHashSize: null → 0', () => assert.strictEqual(ctx.pathHashSize(null), 0));
+  test('pathHashSize: undefined → 0', () => assert.strictEqual(ctx.pathHashSize(undefined), 0));
 }
 
 console.log('\n=== app.js: scopeCellHtml ===');
@@ -2699,6 +2731,7 @@ console.log('\n=== channels.js: WS batch + region snapshot integration ===');
     ctx.atob = (s) => Buffer.from(String(s), 'base64').toString('utf8');
 
     ctx.crypto = { subtle: require('crypto').webcrypto.subtle }; ctx.TextEncoder = TextEncoder; ctx.TextDecoder = TextDecoder; ctx.Uint8Array = Uint8Array;
+    ctx.pathHashSize = realPathHashSize();
     loadInCtx(ctx, 'public/channel-decrypt.js');
     loadInCtx(ctx, 'public/channels.js');
     ctx._pageHandlers.init(appEl);
@@ -5694,6 +5727,7 @@ console.log('\n=== packets.js: buildFieldTable transport offsets (#765) ===');
   ftCtx.window.isTransportRoute = ftCtx.isTransportRoute;
   ftCtx.getPathLenOffset = (rt) => ftCtx.isTransportRoute(rt) ? 5 : 1;
   ftCtx.window.getPathLenOffset = ftCtx.getPathLenOffset;
+  ftCtx.pathHashSize = ftCtx.window.pathHashSize = realPathHashSize();
   loadInCtx(ftCtx, 'public/packets.js');
   const { buildFieldTable, fieldRow } = ftCtx.window._packetsTestAPI;
 
@@ -5784,6 +5818,7 @@ console.log('\n=== packets.js: buildFieldTable hop count from path_len (#844) ==
   ftCtx.window.isTransportRoute = ftCtx.isTransportRoute;
   ftCtx.getPathLenOffset = (rt) => ftCtx.isTransportRoute(rt) ? 5 : 1;
   ftCtx.window.getPathLenOffset = ftCtx.getPathLenOffset;
+  ftCtx.pathHashSize = ftCtx.window.pathHashSize = realPathHashSize();
   loadInCtx(ftCtx, 'public/packets.js');
   const { buildFieldTable } = ftCtx.window._packetsTestAPI;
 
@@ -5816,13 +5851,14 @@ console.log('\n=== packets.js: buildFieldTable hop count from path_len (#844) ==
       'Public Key should be at offset 6');
   });
 
-  test('#844: hashCountVal=0 (direct advert) skips Path section', () => {
-    // path_len = 0x00 → hash_size=1, hash_count=0
+  test('#844: hashCountVal=0 skips Path section', () => {
+    // path_len = 0x00 on a FLOOD (header 0x11) → hash_size=1, hash_count=0:
+    // the sender's size is still encoded, there are just no hops to list.
     const raw = '1100' + '0'.repeat(200);
     const pkt = { raw_hex: raw, route_type: 1, payload_type: 0 };
     const html = buildFieldTable(pkt, {}, [], {});
-    assert.ok(!html.includes('section-path'), 'Should not render Path section for direct advert');
-    assert.ok(html.includes('direct advert'), 'Should note direct advert in path_length description');
+    assert.ok(!html.includes('section-path'), 'Should not render Path section with no hops');
+    assert.ok(html.includes('hash_size=1 byte, hash_count=0'), 'a 0-hop flood still encodes its hash size');
   });
 }
 

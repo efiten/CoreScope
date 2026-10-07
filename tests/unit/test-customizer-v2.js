@@ -580,6 +580,125 @@ test('validateShape rejects non-array myNodes', () => {
   assert.ok(!result.valid, 'non-array myNodes should be invalid');
 });
 
+// ── geofilter editor access (optional user management) ──
+console.log('_gfCanEdit:');
+test('_gfCanEdit: writeEnabled key allows edit', () => {
+  const { api } = loadCustomizer();
+  assert.strictEqual(api._gfCanEdit({ writeEnabled: true }, undefined), true);
+});
+test('_gfCanEdit: admin session allows edit without writeEnabled', () => {
+  const { api } = loadCustomizer();
+  assert.strictEqual(api._gfCanEdit({ writeEnabled: false }, { isAdmin: () => true }), true);
+});
+test('_gfCanEdit: non-admin session and no key denies edit', () => {
+  const { api } = loadCustomizer();
+  assert.strictEqual(api._gfCanEdit({ writeEnabled: false }, { isAdmin: () => false }), false);
+  assert.strictEqual(api._gfCanEdit(null, undefined), false);
+});
+
+
+// _gfAuthHeaders: an admin session replaces the API key (CSRF header, no key).
+function gfContainer(apiKey) {
+  return { querySelector: (sel) => (sel === '#cv2-gf-apikey' ? { value: apiKey } : null) };
+}
+const ADMIN = { isAdmin: () => true, adminHeaders: () => ({ 'X-CS-CSRF': 'csrf1' }) };
+const USER = { isAdmin: () => false, adminHeaders: () => ({}) };
+console.log('_gfAuthHeaders:');
+test('_gfAuthHeaders: admin session sends X-CS-CSRF and no X-API-Key', () => {
+  const { api } = loadCustomizer();
+  const h = api._gfAuthHeaders(gfContainer('typed-key'), { 'Content-Type': 'application/json' }, ADMIN);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(h)), { 'Content-Type': 'application/json', 'X-CS-CSRF': 'csrf1' });
+});
+test('_gfAuthHeaders: non-admin with a typed key sends X-API-Key', () => {
+  const { api } = loadCustomizer();
+  const h = api._gfAuthHeaders(gfContainer('typed-key'), {}, USER);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(h)), { 'X-API-Key': 'typed-key' });
+});
+test('_gfAuthHeaders: no feature and a typed key sends X-API-Key', () => {
+  const { api } = loadCustomizer();
+  const h = api._gfAuthHeaders(gfContainer('typed-key'), {}, undefined);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(h)), { 'X-API-Key': 'typed-key' });
+});
+test('_gfAuthHeaders: neither session nor key returns null', () => {
+  const { api } = loadCustomizer();
+  assert.strictEqual(api._gfAuthHeaders(gfContainer(''), {}, USER), null);
+  assert.strictEqual(api._gfAuthHeaders(gfContainer(''), {}, undefined), null);
+});
+
+// _gfApplyAuth: edit controls, prune section and key field follow the
+// current auth state, so a later login or logout is picked up.
+function gfPanel() {
+  const els = {
+    '#cv2-gf-edit': { style: { display: 'none' } },
+    '#cv2-gf-prune-section': { style: { display: 'none' } },
+    '#cv2-gf-apikey-field': { hidden: false },
+  };
+  return { els, querySelector: (sel) => els[sel] || null };
+}
+console.log('_gfApplyAuth:');
+test('_gfApplyAuth: a login after load shows the editor and hides the key field', () => {
+  const { api } = loadCustomizer();
+  const c = gfPanel();
+  api._gfApplyAuth(c, { writeEnabled: false }, USER, 0);
+  assert.strictEqual(c.els['#cv2-gf-edit'].style.display, 'none');
+  assert.strictEqual(c.els['#cv2-gf-apikey-field'].hidden, false);
+  api._gfApplyAuth(c, { writeEnabled: false }, ADMIN, 4);
+  assert.strictEqual(c.els['#cv2-gf-edit'].style.display, '');
+  assert.strictEqual(c.els['#cv2-gf-prune-section'].style.display, '');
+  assert.strictEqual(c.els['#cv2-gf-apikey-field'].hidden, true);
+});
+test('_gfApplyAuth: a logout hides the editor again when the server has no write key', () => {
+  const { api } = loadCustomizer();
+  const c = gfPanel();
+  api._gfApplyAuth(c, { writeEnabled: false }, ADMIN, 4);
+  api._gfApplyAuth(c, { writeEnabled: false }, USER, 4);
+  assert.strictEqual(c.els['#cv2-gf-edit'].style.display, 'none');
+  assert.strictEqual(c.els['#cv2-gf-prune-section'].style.display, 'none');
+  assert.strictEqual(c.els['#cv2-gf-apikey-field'].hidden, false);
+});
+test('_gfApplyAuth: a write key keeps the editor without a session; prune needs 3 points', () => {
+  const { api } = loadCustomizer();
+  const c = gfPanel();
+  api._gfApplyAuth(c, { writeEnabled: true }, undefined, 2);
+  assert.strictEqual(c.els['#cv2-gf-edit'].style.display, '');
+  assert.strictEqual(c.els['#cv2-gf-prune-section'].style.display, 'none');
+  assert.strictEqual(c.els['#cv2-gf-apikey-field'].hidden, false);
+});
+
+// _gfReapply: the cached re-render and later auth changes. Feature off it
+// does nothing (master kept the controls hidden until a reload); feature on
+// it sizes the prune section from the saved server polygon.
+const ADMIN_ON = { isEnabled: () => true, isAdmin: () => true, adminHeaders: () => ({}) };
+const OFF = { isEnabled: () => false, isAdmin: () => false, adminHeaders: () => ({}) };
+const SAVED4 = { writeEnabled: true, polygon: [[1, 1], [1, 2], [2, 2], [2, 1]] };
+console.log('_gfReapply:');
+test('_gfReapply: feature off leaves edit controls and prune hidden on a cached re-render', () => {
+  const { api } = loadCustomizer();
+  const c = gfPanel();
+  assert.strictEqual(api._gfReapply(c, SAVED4, OFF), false);
+  assert.strictEqual(api._gfReapply(c, SAVED4, undefined), false);
+  assert.strictEqual(c.els['#cv2-gf-edit'].style.display, 'none');
+  assert.strictEqual(c.els['#cv2-gf-prune-section'].style.display, 'none');
+  assert.strictEqual(c.els['#cv2-gf-apikey-field'].hidden, false);
+});
+test('_gfReapply: feature on with an admin shows edit controls and prune for a saved polygon', () => {
+  const { api } = loadCustomizer();
+  const c = gfPanel();
+  assert.strictEqual(api._gfReapply(c, { writeEnabled: false, polygon: SAVED4.polygon }, ADMIN_ON), true);
+  assert.strictEqual(c.els['#cv2-gf-edit'].style.display, '');
+  assert.strictEqual(c.els['#cv2-gf-prune-section'].style.display, '');
+  assert.strictEqual(c.els['#cv2-gf-apikey-field'].hidden, true);
+});
+test('_gfReapply: prune follows the saved polygon, not unsaved drawing', () => {
+  const { api } = loadCustomizer();
+  const c = gfPanel();
+  api._gfReapply(c, { writeEnabled: false, polygon: null }, ADMIN_ON);
+  assert.strictEqual(c.els['#cv2-gf-edit'].style.display, '');
+  assert.strictEqual(c.els['#cv2-gf-prune-section'].style.display, 'none');
+  api._gfReapply(c, { writeEnabled: false, polygon: [[1, 1], [1, 2]] }, ADMIN_ON);
+  assert.strictEqual(c.els['#cv2-gf-prune-section'].style.display, 'none');
+});
+
 // ── Summary ──
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

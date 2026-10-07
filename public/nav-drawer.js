@@ -73,13 +73,33 @@
   // point MeshConfigReady has resolved window.MC_CLIENT_RX_COVERAGE.
   var COVERAGE_ROUTE = { route: 'rx-coverage', hash: '#/rx-coverage', label: 'Coverage', ph: 'broadcast' };
 
+  // Optional user management (config `userManagement.enabled`): the top-nav
+  // account control is hidden on touch layouts, so the entry lives here too.
+  // !! Keep in sync with public/bottom-nav.js accountRoute().
+  function accountRoute() {
+    return window.CS_USER
+      ? { route: 'account', hash: '#/account', label: 'My account', ph: 'user-circle' }
+      : { route: 'account', hash: '#/account/login', label: 'Log in', ph: 'user-circle' };
+  }
+
   function routes() {
-    if (!window.MC_CLIENT_RX_COVERAGE) return ROUTES;
     var out = ROUTES.slice();
-    var after = out.findIndex(function (r) { return r.route === 'analytics'; }) + 1;
-    out.splice(after, 0, COVERAGE_ROUTE);
+    if (window.MC_CLIENT_RX_COVERAGE) {
+      var after = out.findIndex(function (r) { return r.route === 'analytics'; }) + 1;
+      out.splice(after, 0, COVERAGE_ROUTE);
+    }
+    if (window.MC_USER_MGMT) out.push(accountRoute());
     return out;
   }
+
+  window.addEventListener('cs-auth-changed', function () {
+    var a = document.querySelector('[data-nav-drawer-item="account"]');
+    if (!a) return;
+    var r = accountRoute();
+    a.setAttribute('href', escapeHtml(r.hash));
+    var lb = a.querySelector('.nav-drawer-label');
+    if (lb) lb.textContent = r.label;
+  });
 
   function phIconHTML(name) {
     return '<svg class="ph-icon" aria-hidden="true" focusable="false">' +
@@ -167,7 +187,7 @@
     routes().forEach(function (r) {
       var a = document.createElement('a');
       a.className = 'nav-drawer-item';
-      a.setAttribute('href', r.hash);
+      a.setAttribute('href', escapeHtml(r.hash));
       a.setAttribute('data-nav-drawer-item', r.route);
       a.setAttribute('data-route', r.route);
 

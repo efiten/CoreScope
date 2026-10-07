@@ -127,6 +127,10 @@ type Server struct {
 	// Known-channels catalogue cache (issue #1323). Nil until configured;
 	// when nil the /api/known-channels endpoint returns an empty snapshot.
 	knownChannels *knownChannelsCache
+
+	// Optional user management (docs/specs/2026-10-06-user-management-design.md).
+	// Nil unless userManagement.enabled; see initUserManagement.
+	auth *authService
 }
 
 // PerfStats tracks request performance.
@@ -242,6 +246,11 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	// for /api/* — see docs/deployment-behind-cdn.md.
 	r.Use(cdnDetectionMiddleware)
 
+	// Optional user management: routes exist only when the feature is on.
+	if s.auth != nil {
+		s.registerAuthRoutes(r)
+	}
+
 	// Config endpoints
 	r.HandleFunc("/api/config/cache", s.handleConfigCache).Methods("GET")
 	r.HandleFunc("/api/config/client", s.handleConfigClient).Methods("GET")
@@ -251,7 +260,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/config/geo-filter", s.handleConfigGeoFilter).Methods("GET")
 	r.HandleFunc("/api/config/areas", s.handleConfigAreas).Methods("GET")
 	r.HandleFunc("/api/config/areas/polygons", s.handleConfigAreasPolygons).Methods("GET")
-	r.Handle("/api/config/geo-filter", s.requireAPIKey(http.HandlerFunc(s.handlePutConfigGeoFilter))).Methods("PUT")
+	r.Handle("/api/config/geo-filter", s.requireAdmin(http.HandlerFunc(s.handlePutConfigGeoFilter))).Methods("PUT")
 
 	// Readiness endpoint (gated on background init completion)
 	r.HandleFunc("/api/healthz", s.handleHealthz).Methods("GET")
@@ -266,7 +275,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/perf/sqlite", s.handlePerfSqlite).Methods("GET")
 	r.HandleFunc("/api/perf/write-sources", s.handlePerfWriteSources).Methods("GET")
 	r.HandleFunc("/api/mqtt/status", s.handleMqttStatus).Methods("GET")
-	r.Handle("/api/perf/reset", s.requireAPIKey(http.HandlerFunc(s.handlePerfReset))).Methods("POST")
+	r.Handle("/api/perf/reset", s.requireAdmin(http.HandlerFunc(s.handlePerfReset))).Methods("POST")
 	// /api/admin/prune removed in #1283 — pruning is owned by the
 	// ingestor process (scheduled tickers + startup pass). Operators
 	// who want an ad-hoc prune can restart the ingestor.
@@ -274,11 +283,11 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	// /api/admin/prune-geo-filter (#669 M4 / PR #738): server enqueues a
 	// marker file; the ingestor (which holds the writable DB handle)
 	// runs the DELETE. /status reports completion.
-	r.Handle("/api/admin/prune-geo-filter", s.requireAPIKey(http.HandlerFunc(s.handlePruneGeoFilter))).Methods("POST")
-	r.Handle("/api/admin/prune-geo-filter/status", s.requireAPIKey(http.HandlerFunc(s.handlePruneGeoFilterStatus))).Methods("GET")
-	r.Handle("/api/debug/affinity", s.requireAPIKey(http.HandlerFunc(s.handleDebugAffinity))).Methods("GET")
-	r.Handle("/api/dropped-packets", s.requireAPIKey(http.HandlerFunc(s.handleDroppedPackets))).Methods("GET")
-	r.Handle("/api/backup", s.requireAPIKey(http.HandlerFunc(s.handleBackup))).Methods("GET")
+	r.Handle("/api/admin/prune-geo-filter", s.requireAdmin(http.HandlerFunc(s.handlePruneGeoFilter))).Methods("POST")
+	r.Handle("/api/admin/prune-geo-filter/status", s.requireAdmin(http.HandlerFunc(s.handlePruneGeoFilterStatus))).Methods("GET")
+	r.Handle("/api/debug/affinity", s.requireAdmin(http.HandlerFunc(s.handleDebugAffinity))).Methods("GET")
+	r.Handle("/api/dropped-packets", s.requireAdmin(http.HandlerFunc(s.handleDroppedPackets))).Methods("GET")
+	r.Handle("/api/backup", s.requireAdmin(http.HandlerFunc(s.handleBackup))).Methods("GET")
 
 	// Packet endpoints
 	r.HandleFunc("/api/packets/observations", s.handleBatchObservations).Methods("POST")
@@ -454,6 +463,26 @@ func (s *Server) requireAPIKey(next http.Handler) http.Handler {
 	})
 }
 
+// requireAdmin gates operator endpoints. It accepts a strong X-API-Key
+// (exactly requireAPIKey's rules) or, when user management is on, the
+// session of an admin; a cookie-authenticated unsafe method must also pass
+// the CSRF check. A request that sends X-API-Key is judged on the key alone.
+// With user management off this is requireAPIKey.
+func (s *Server) requireAdmin(next http.Handler) http.Handler {
+	keyGate := s.requireAPIKey(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.auth != nil && r.Header.Get("X-API-Key") == "" {
+			if u, sess := s.auth.currentUser(w, r); u != nil {
+				if s.auth.adminSessionOK(w, r, u, sess) {
+					next.ServeHTTP(w, r)
+				}
+				return
+			}
+		}
+		keyGate.ServeHTTP(w, r)
+	})
+}
+
 // --- Config Handlers ---
 
 func (s *Server) handleConfigCache(w http.ResponseWriter, r *http.Request) {
@@ -497,7 +526,15 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		ClientRxCoverage:    s.cfg.ClientRxCoverageEnabled(),
 		ClientRfSamples:     s.cfg.ClientRfSamplesEnabled(),
 		PathTrust:           &pathTrust,
+		UserManagement:      s.clientUserManagement(),
 	})
+}
+
+func (s *Server) clientUserManagement() *ClientUserManagement {
+	if s.auth == nil {
+		return nil
+	}
+	return &ClientUserManagement{Enabled: true}
 }
 
 func (s *Server) handleConfigAreas(w http.ResponseWriter, r *http.Request) {
@@ -1342,11 +1379,19 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit := queryLimit(r, 50, s.cfg.ListLimits.NodesMax)
 	offset := queryInt(r, "offset", 0)
-	nodes, total, counts, err := s.db.GetNodes(
-		limit, offset,
-		q.Get("role"), q.Get("search"), q.Get("before"),
-		q.Get("lastHeard"), q.Get("sortBy"), q.Get("region"),
-	)
+	nq := NodeQuery{
+		Limit: limit, Offset: offset,
+		Role: q.Get("role"), Search: q.Get("search"), Before: q.Get("before"),
+		LastHeard: q.Get("lastHeard"), SortBy: q.Get("sortBy"), Region: q.Get("region"),
+	}
+	// #2101: resolve the region from the store's in-memory adverts. The SQL
+	// region subquery scans every advert's observations and saturated the
+	// reader pool on large databases; it remains only for a server without
+	// a packet store.
+	if keys, ok := s.regionNodeKeys(nq.Region); ok {
+		nq.RegionPubkeys = keys
+	}
+	nodes, total, counts, err := s.db.GetNodes(nq)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -3067,7 +3112,13 @@ func (s *Server) handleAudioLabBuckets(w http.ResponseWriter, r *http.Request) {
 // --- Helpers ---
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
+	writeJSONStatus(w, http.StatusOK, v)
+}
+
+// writeJSONStatus writes v as JSON with the given status code.
+func writeJSONStatus(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("[routes] JSON encode error: %v", err)
 	}

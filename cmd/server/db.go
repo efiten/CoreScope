@@ -1104,8 +1104,29 @@ func (db *DB) ObservationRawHexForHash(hash string) map[int]string {
 	return out
 }
 
+// NodeQuery selects and orders nodes for GetNodes. Region filters by the SQL
+// subquery over adverts and observers; RegionPubkeys, when non-nil, is that
+// filter already resolved to a set of node pubkeys (#2101, see
+// PacketStore.RegionNodePubkeys) and takes its place. An empty, non-nil
+// RegionPubkeys matches no node.
+type NodeQuery struct {
+	Limit, Offset int
+	Role          string
+	Search        string
+	Before        string
+	LastHeard     string
+	SortBy        string
+	Region        string
+	RegionPubkeys []string
+}
+
 // GetNodes returns filtered, paginated node list.
-func (db *DB) GetNodes(limit, offset int, role, search, before, lastHeard, sortBy, region string) ([]map[string]interface{}, int, map[string]int, error) {
+func (db *DB) GetNodes(nq NodeQuery) ([]map[string]interface{}, int, map[string]int, error) {
+	limit, offset := nq.Limit, nq.Offset
+	role, search, before, lastHeard, sortBy, region := nq.Role, nq.Search, nq.Before, nq.LastHeard, nq.SortBy, nq.Region
+	if nq.RegionPubkeys != nil {
+		region = ""
+	}
 	var where []string
 	var args []interface{}
 
@@ -1159,6 +1180,21 @@ func (db *DB) GetNodes(limit, offset int, role, search, before, lastHeard, sortB
 			)`, joinCond, strings.Join(placeholders, ","))
 			where = append(where, subq)
 			args = append(args, regionArgs...)
+		}
+	}
+	if nq.RegionPubkeys != nil {
+		if len(nq.RegionPubkeys) == 0 {
+			where = append(where, "0")
+		} else {
+			// One JSON parameter rather than one placeholder per key: a region
+			// can hold thousands of nodes, and the IN list stays a primary-key
+			// lookup.
+			keysJSON, err := json.Marshal(nq.RegionPubkeys)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			where = append(where, "public_key IN (SELECT value FROM json_each(?))")
+			args = append(args, string(keysJSON))
 		}
 	}
 
@@ -2236,9 +2272,11 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 	if db.hasScopeName {
 		scopeNameCol = ", t.scope_name"
 	}
+	// substr(t.raw_hex, 1, 12): packetpath.HashSize only reads the header,
+	// transport codes and path byte (6 bytes), not the whole packet.
 	var obsSQL string
 	if db.isV3 {
-		obsSQL = `SELECT o.id, t.id, t.hash, t.decoded_json, t.first_seen,
+		obsSQL = `SELECT o.id, t.id, t.hash, t.decoded_json, t.first_seen, substr(t.raw_hex, 1, 12),
 				obs.id, obs.name, o.snr, o.path_json, o.timestamp` + scopeNameCol + `
 			FROM observations o
 			JOIN transmissions t ON t.id = o.transmission_id
@@ -2246,7 +2284,7 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 			WHERE t.id IN (` + strings.Join(idPlaceholders, ",") + `)
 			ORDER BY o.id ASC`
 	} else {
-		obsSQL = `SELECT o.id, t.id, t.hash, t.decoded_json, t.first_seen,
+		obsSQL = `SELECT o.id, t.id, t.hash, t.decoded_json, t.first_seen, substr(t.raw_hex, 1, 12),
 				o.observer_id, o.observer_name, o.snr, o.path_json, o.timestamp` + scopeNameCol + `
 			FROM observations o
 			JOIN transmissions t ON t.id = o.transmission_id
@@ -2269,11 +2307,11 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 
 	for rows.Next() {
 		var pktID, txID int
-		var pktHash, dj, fs, obsID, obsName, pathJSON sql.NullString
+		var pktHash, dj, fs, rawHexHead, obsID, obsName, pathJSON sql.NullString
 		var snr sql.NullFloat64
 		var obsTs sql.NullInt64
 		var scopeName sql.NullString
-		scanArgs := []interface{}{&pktID, &txID, &pktHash, &dj, &fs, &obsID, &obsName, &snr, &pathJSON, &obsTs}
+		scanArgs := []interface{}{&pktID, &txID, &pktHash, &dj, &fs, &rawHexHead, &obsID, &obsName, &snr, &pathJSON, &obsTs}
 		if db.hasScopeName {
 			scanArgs = append(scanArgs, &scopeName)
 		}
@@ -2329,6 +2367,7 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 				"hops":             hops,
 				"snr":              nullFloat(snr),
 				"scope_name":       nullStr(scopeName),
+				"path_hash_size":   packetpath.HashSize(rawHexHead.String),
 			},
 			Repeats: 1,
 		}
