@@ -108,20 +108,20 @@ async function until(fn, label) {
   admin.setDefaultTimeout(8000);
   admin.on('dialog', (d) => d.accept());
   admin.on('pageerror', (e) => console.error('[pageerror admin]', e.message));
-  await step('config admin registers, activates with a password, sees the Users entry', async () => {
+  await step('config admin registers, activates with a password, sees the Admin entry', async () => {
     await registerAndActivate(admin, 'admin@e2e.test', 'E2E Admin');
     await admin.click('#accountToggle');
-    assert(await admin.locator('#accountMenu a[href="#/admin/users"]').isVisible(), 'no Users menu entry');
+    assert(await admin.locator('#accountMenu a[href="#/admin"]').isVisible(), 'no Admin menu entry');
   });
 
   const user = await (await browser.newContext()).newPage();
   user.setDefaultTimeout(8000);
   user.on('pageerror', (e) => console.error('[pageerror user]', e.message));
-  await step('second user registers and activates; no Users entry for a non-admin', async () => {
+  await step('second user registers and activates; no Admin entry for a non-admin', async () => {
     await registerAndActivate(user, 'user@e2e.test', 'E2E User');
     await user.click('#accountToggle');
     assert(await user.locator('#accountMenu').isVisible(), 'account menu did not open');
-    assert(await user.locator('#accountMenu a[href="#/admin/users"]').count() === 0, 'non-admin sees Users');
+    assert(await user.locator('#accountMenu a[href="#/admin"]').count() === 0, 'non-admin sees Admin');
   });
 
   await step('user logs out from the account page (phone width) and logs in again', async () => {
@@ -221,11 +221,56 @@ async function until(fn, label) {
     assert(await user.evaluate(() => window.CS_USER === null), 'CS_USER is not null');
   });
 
+  await step('admin overview: user figures and a failed-login burst under Needs attention, followed to the audit tab', async () => {
+    // Five wrong passwords for an existing account (user@e2e.test: 1 earlier login + 5 stays under the 10-per-address limit).
+    const guess = await (await browser.newContext()).newPage();
+    guess.setDefaultTimeout(8000);
+    await guess.goto(BASE + '/#/home', { waitUntil: 'domcontentloaded' });
+    await authReady(guess);
+    const codes = await guess.evaluate(async () => {
+      const out = [];
+      for (let i = 0; i < 5; i++) {
+        const r = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'user@e2e.test', password: 'not the password' }) });
+        out.push(r.status);
+      }
+      return out;
+    });
+    assert(codes.every((c) => c === 401), 'failed logins answered ' + codes.join(','));
+    await guess.context().close();
+    await admin.goto(BASE + '/#/admin');
+    await admin.waitForSelector('#aoUsers [data-stat="total"]');
+    // admin, user and sync are the three accounts at this point.
+    assert((await admin.textContent('#aoUsers [data-stat="total"]')) === '3', 'total accounts');
+    const link = admin.locator('#adminAttention a[href*="action=user.login.failed"]');
+    await link.waitFor();
+    await link.click();
+    await admin.waitForSelector('#auditBody tr[data-action="user.login.failed"]');
+    assert((await admin.evaluate(() => location.hash)).indexOf('tab=audit') !== -1, 'not on the audit tab');
+  });
+
+  await step('the old #/admin/users link lands on the Users tab with its filter', async () => {
+    await admin.goto(BASE + '/#/admin/users?status=disabled');
+    await admin.waitForSelector('tr[data-email="user@e2e.test"]');
+    assert((await admin.evaluate(() => location.hash)) === '#/admin?tab=users&status=disabled', 'hash not rewritten');
+  });
+
+  await step('axe: no serious or critical violations on the three admin tabs', async () => {
+    for (const [route, sel] of [['/#/admin', '#aoUsers [data-stat="total"]'], ['/#/admin?tab=users', '.um-table'], ['/#/admin?tab=audit', '#auditBody tr']]) {
+      await admin.goto(BASE + route);
+      await admin.waitForSelector(sel);
+      await admin.mouse.move(0, 0); // parked to avoid hover noise; status text on the hover tint is AA (contrast unit test)
+      await admin.waitForTimeout(1500);
+      await axeClean(admin, '#app');
+    }
+  });
+
   await step('axe: no serious or critical violations on the new views', async () => {
     for (const [pg, route, sel] of [[user, '/#/account/login', '#loginForm'], [admin, '/#/admin/users', '.um-table']]) {
       await pg.goto(BASE + route);
       await pg.waitForSelector(sel);
       await authReady(pg);
+      await pg.mouse.move(0, 0);
       await pg.waitForTimeout(1500);
       await axeClean(pg, '#app');
     }

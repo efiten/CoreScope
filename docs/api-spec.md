@@ -125,7 +125,7 @@ These routes are registered only when `userManagement.enabled` is true. When it 
 | `PUT /api/account/settings` | session | `{baseRevision, baseGeneration, doc}` -> `{revision, generation}`. `409` `{revision, generation, doc}` when `baseRevision` is not the stored revision or, with a stored document, `baseGeneration` is not its generation; `baseRevision` 0 without a stored document starts a new generation; `400` for another shape, a key that is never synced (`corescope_channel_*`, `live-channel-colors`, `meshcore-api-key`) or a key not in the allowlist; `413` when `doc` is over 256 KiB (body cap 264 KiB); `429` above 60 PUT requests per hour per user |
 | `DELETE /api/account/settings` | session | -> `{ok}`. The next `PUT` with `baseRevision` 0 starts a new document in a new generation |
 | `DELETE /api/account` | session | `{currentPassword}` -> `{ok, message}`. `409` you are the last admin |
-| `GET /api/admin/users?status=&role=&q=` | admin | -> `[adminUser]`. `status` is `pending`, `active` or `disabled`; `role` is `user` or `admin` |
+| `GET /api/admin/users?status=&role=&q=&bouncing=` | admin | -> `[adminUser]`, at most 1000, newest first. `status` is `pending`, `active` or `disabled`; `role` is `user` or `admin`; `bouncing=1` keeps only addresses whose mail bounces (any other value is `400`) |
 | `GET /api/admin/users/{id}` | admin | -> `{user, sessions, mail, audit}` |
 | `POST /api/admin/users/{id}/disable` | admin | -> adminUser. Active accounts only; ends the user's sessions and links |
 | `POST /api/admin/users/{id}/enable` | admin | -> adminUser. Disabled accounts only |
@@ -134,6 +134,8 @@ These routes are registered only when `userManagement.enabled` is true. When it 
 | `POST /api/admin/users/{id}/resend-activation` | admin | -> adminUser. Pending accounts only |
 | `POST /api/admin/users/{id}/activate` | admin | -> adminUser. Pending accounts only; the address stays unverified |
 | `POST /api/admin/users/{id}/mail/{mailId}/refresh` | admin | -> mail record with `events`, pulled from the provider. `502` provider unavailable |
+| `GET /api/admin/audit?action=&user=&from=&to=&before=&limit=` | admin | -> `{entries, next}`, newest first. `action` is one action or a group ending in `.*` (`user.login.*`); `user` matches actor or target; `from`/`to` are RFC 3339 and inclusive; pass `next` as `before` for the next page (`null` on the last page); `limit` defaults to 100, capped at 500. Entry: `{id, at, action, actor, target, detail}`, with actor and target `{id, displayName, email}`, `{id, deleted: true}` or `null` (system). Login rows are kept 90 days. `400` on an invalid parameter |
+| `GET /api/admin/stats` | admin | -> `{total, active, pending, disabled, admins, stuckPending, bouncing, new7d, new30d, newPerDay, active7d, active30d, logins24h, failedLogins24h, mail7d, guessing}`. `newPerDay` is `[{day, count}]` for 30 UTC days, oldest first; registrations count `user.register` audit rows. `stuckPending` counts pending accounts older than 24 hours. `mail7d` is `{delivered, bounced, blocked, spam, pending, other}` by latest delivery event. `guessing` is `[{userId, displayName, failed}]`: accounts with 5 or more failed logins in 24 hours |
 | `POST /api/mail/brevo/webhook` | `Authorization: Bearer <webhookSecret>` | Brevo transactional event payload -> `{ok}`. `401` on a wrong secret |
 
 `adminUser` = `{id, email, displayName, role, status, createdAt, activatedAt, activatedManually, activatedBy, lastLoginAt, emailBouncing, configAdmin, lastMail}`. `status` is `pending`, `active` or `disabled`.
