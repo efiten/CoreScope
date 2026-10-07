@@ -31,12 +31,14 @@ node tests/unit/test-channel-issue-1101.js
 node tests/unit/test-channel-live-decrypt-userprefix.js
 node tests/unit/test-channel-live-decrypt.js
 node tests/unit/test-channel-modal-ux.js
+node tests/unit/test-channel-proposals-ui.js
 node tests/unit/test-channel-psk-ux.js
 node tests/unit/test-channel-qr-wiring.js
 node tests/unit/test-channel-qr.js
 node tests/unit/test-channel-sidebar-layout.js
 node tests/unit/test-channel-ux-followup.js
 node tests/unit/test-channel-ux-round2.js
+node tests/unit/test-channels-approved-ui.js
 node tests/unit/test-channels-merge-1498-unit.js
 node tests/unit/test-clear-filters.js
 node tests/unit/test-color-picker-ux.js
@@ -133,6 +135,7 @@ node tests/unit/test-issue-1849-trace-hashbytes.js
 node tests/unit/test-issue-1851-channel-message-scope.js
 node tests/unit/test-issue-1862-map-region-filter.js
 node tests/unit/test-issue-1868-control-decode.js
+node tests/unit/test-packet-detail-channel-escape.js
 node tests/unit/test-packet-detail-hash-size.js
 node tests/unit/test-issue-1890-og-url.js
 node tests/unit/test-issue-1956-release-routing.js
