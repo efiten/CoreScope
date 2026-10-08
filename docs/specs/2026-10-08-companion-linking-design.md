@@ -120,8 +120,9 @@ the rest of A–E. Rate limits use the existing token buckets (per IP and per us
      already there. This is a server-side read-modify-write of the settings document
      that bumps its revision, so open web clients pick it up through the normal
      B conflict flow. If the document is at the size cap, the link still succeeds
-     and the response says `myNodes: "full"`.
-  5. `200 {pubkey, name, linkedAt, myNodes: "added" | "present" | "full"}`.
+     and the response says `myNodes: "full"`. If the merge fails for any other
+     reason, the link also still succeeds and the response says `myNodes: "failed"`.
+  5. `200 {pubkey, name, linkedAt, myNodes: "added" | "present" | "full" | "failed"}`.
 - `GET /api/account/companions` → `[{pubkey, name, linkedAt, lastSeenAt}]`.
 - `DELETE /api/account/companions/{pubkey}` → 204. Leaves `meshcore-my-nodes` alone.
 - Admin: `GET /api/admin/users/{id}` gains `companions`. The audit kinds are
@@ -195,7 +196,7 @@ Tokens, challenges and signatures are never logged.
     the message, reused challenge, a challenge bound to another pubkey.
   - Transfer between two users: the audit rows and the mail.
   - The `meshcore-my-nodes` merge: keeps existing items, skips duplicates, reports
-    `full` at the cap.
+    `full` at the cap and `failed` on any other merge error.
   - `rx-coverage?mine=1`.
   - CORS headers only for allowlisted origins and only on scoped routes.
   - Everything answers 404 with the feature off.
