@@ -26,7 +26,7 @@
 | `GET /api/account/companions` | `[{pubkey, name, linkedAt, lastSeenAt}]`, newest link first; `lastSeenAt` is `client_receptions.rx_at` as stored, or `null`. Always an array. |
 | `DELETE /api/account/companions/{pubkey}` | `204`; `400` bad pubkey; `404` not linked to the caller. |
 | Admin `GET /api/admin/users/{id}` | Gains `companions: [{pubkey, name, linkedAt, lastSeenAt}]`. |
-| Audit actions | `companion_link`, `companion_unlink`, `companion_transfer` (two rows, targets: new and previous owner; detail `{pubkey, from, to}`); device login is `user.login` with detail `{via: "device", device: <label>}`. |
+| Audit actions | `companion.link`, `companion.unlink`, `companion.transfer` (two rows, targets: new and previous owner; detail `{pubkey, from, to}`); device login is `user.login` with detail `{via: "device", device: <label>}`. |
 | `GET /api/rx-coverage?mine=1` | Same GeoJSON as without; filtered to the caller's linked companions (empty collection when none). Cookie session only: `401` without one, `403` with a bearer header, `404` when user management is off. |
 | Config | `clientRxCoverage.requireLinkedCompanion` (bool, default false). |
 | `/api/config/client` | `clientRxRequireLinkedCompanion: true` only when that is set **and** user management is on; otherwise the field is absent. |
@@ -1359,8 +1359,8 @@ func TestCompanionLinkFlow(t *testing.T) {
 	if l, err := f.st.GetCompanionLink(pk); err != nil || l.UserID != alice.me.ID {
 		t.Fatalf("stored link = %+v, %v", l, err)
 	}
-	if !hasCompanionAudit(t, f, alice.me.ID, "companion_link", pk) {
-		t.Fatal("no companion_link audit row")
+	if !hasCompanionAudit(t, f, alice.me.ID, "companion.link", pk) {
+		t.Fatal("no companion.link audit row")
 	}
 
 	// The browser lists it; no analyzer data, so lastSeenAt is null.
@@ -1381,8 +1381,8 @@ func TestCompanionLinkFlow(t *testing.T) {
 	if raw, _, _ := f.st.GetSettings(alice.me.ID); !strings.Contains(raw, pk) {
 		t.Fatal("unlink removed the companion from my nodes")
 	}
-	if !hasCompanionAudit(t, f, alice.me.ID, "companion_unlink", pk) {
-		t.Fatal("no companion_unlink audit row")
+	if !hasCompanionAudit(t, f, alice.me.ID, "companion.unlink", pk) {
+		t.Fatal("no companion.unlink audit row")
 	}
 	expectStatus(t, f.do("DELETE", "/api/account/companions/"+pk, nil, as(alice)), http.StatusNotFound)
 	expectStatus(t, f.do("DELETE", "/api/account/companions/nothex", nil, as(alice)), http.StatusBadRequest)
@@ -1626,7 +1626,7 @@ func (s *Server) handleCompanionLink(w http.ResponseWriter, r *http.Request, u *
 
 // companionLinked writes the audit row of a link.
 func (a *authService) companionLinked(u *users.User, link *users.CompanionLink, _ int64) {
-	a.auditAsync(idPtr(u.ID), "companion_link", idPtr(u.ID), map[string]string{"pubkey": link.Pubkey})
+	a.auditAsync(idPtr(u.ID), "companion.link", idPtr(u.ID), map[string]string{"pubkey": link.Pubkey})
 }
 
 func (s *Server) handleCompanionList(w http.ResponseWriter, _ *http.Request, u *users.User, _ *users.Session) {
@@ -1655,7 +1655,7 @@ func (s *Server) handleCompanionDelete(w http.ResponseWriter, r *http.Request, u
 		return
 	}
 	pk, _ := users.NormalizePubkey(raw)
-	s.auth.auditAsync(idPtr(u.ID), "companion_unlink", idPtr(u.ID), map[string]string{"pubkey": pk})
+	s.auth.auditAsync(idPtr(u.ID), "companion.unlink", idPtr(u.ID), map[string]string{"pubkey": pk})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1725,7 +1725,7 @@ In `cmd/server/openapi.go`, after the `"DELETE /api/account/settings"` entry, ad
 
 ```go
 		"POST /api/account/companions/challenge":           {Summary: "Start linking a companion", Description: "Body {pubkey} (64 hex). 200 {challenge, expiresAt}: 32 random bytes as hex, single use, valid 5 minutes, bound to the caller and the pubkey. 400 malformed pubkey; 429 above 60 challenge + link requests per hour per user and per IP. Accepts a device token (Authorization: Bearer).", Tag: "users", Session: true},
-		"POST /api/account/companions":                     {Summary: "Link a companion", Description: "Body {pubkey, challenge, signature, name}. signature is the companion's Ed25519 signature (64 bytes, hex) over the UTF-8 string \"corescope-link:\" + host of userManagement.publicBaseUrl + \":\" + challenge. The challenge is consumed in every case. 200 {pubkey, name, linkedAt, myNodes}: myNodes is added, present, or full (not added: the synced settings would exceed 256 KiB or could not be updated; the link stands). The pubkey is added to meshcore-my-nodes with a revision bump. A companion linked to another account moves to the caller (the newest proof wins); both get a companion_transfer audit row and the previous owner a mail when notifications are on for them. 400 malformed pubkey or signature, or a signature that does not verify; 410 challenge missing, expired, used, or bound to another user or pubkey; 429 rate limited. Accepts a device token.", Tag: "users", Session: true},
+		"POST /api/account/companions":                     {Summary: "Link a companion", Description: "Body {pubkey, challenge, signature, name}. signature is the companion's Ed25519 signature (64 bytes, hex) over the UTF-8 string \"corescope-link:\" + host of userManagement.publicBaseUrl + \":\" + challenge. The challenge is consumed in every case. 200 {pubkey, name, linkedAt, myNodes}: myNodes is added, present, or full (not added: the synced settings would exceed 256 KiB or could not be updated; the link stands). The pubkey is added to meshcore-my-nodes with a revision bump. A companion linked to another account moves to the caller (the newest proof wins); both get a companion.transfer audit row and the previous owner a mail when notifications are on for them. 400 malformed pubkey or signature, or a signature that does not verify; 410 challenge missing, expired, used, or bound to another user or pubkey; 429 rate limited. Accepts a device token.", Tag: "users", Session: true},
 		"GET /api/account/companions":                      {Summary: "List own linked companions", Description: "[{pubkey, name, linkedAt, lastSeenAt}], newest link first. lastSeenAt is the newest client reception of that companion (rx_at as stored) or null. Accepts a device token.", Tag: "users", Session: true},
 		"DELETE /api/account/companions/{pubkey}":          {Summary: "Unlink an own companion", Description: "204. meshcore-my-nodes and stored coverage stay. 400 malformed pubkey, 404 not linked to the caller. Accepts a device token.", Tag: "users", Session: true},
 ```
@@ -1793,8 +1793,8 @@ func TestCompanionTransfer(t *testing.T) {
 		t.Fatalf("after transfer: %+v, %v", l, err)
 	}
 	for _, uid := range []int64{alice.me.ID, bob.me.ID} {
-		if !hasCompanionAudit(t, f, uid, "companion_transfer", pk) {
-			t.Fatalf("no companion_transfer audit row for user #%d", uid)
+		if !hasCompanionAudit(t, f, uid, "companion.transfer", pk) {
+			t.Fatalf("no companion.transfer audit row for user #%d", uid)
 		}
 	}
 	msgs := f.fake.Sent()
@@ -1835,7 +1835,7 @@ func TestCompanionTransferMailNeedsNotifications(t *testing.T) {
 			if n := len(f.fake.Sent()) - sent; n != 0 {
 				t.Fatalf("%d transfer mail(s) sent", n)
 			}
-			if !hasCompanionAudit(t, f, alice.me.ID, "companion_transfer", pubHex(companionKey)) {
+			if !hasCompanionAudit(t, f, alice.me.ID, "companion.transfer", pubHex(companionKey)) {
 				t.Fatal("audit row missing without a mail")
 			}
 		})
@@ -1846,7 +1846,7 @@ func TestCompanionTransferMailNeedsNotifications(t *testing.T) {
 - [ ] **Step 2: Run them and watch them fail**
 
 Run: `cd cmd/server && go test -run 'TestCompanionTransfer' .`
-Expected: FAIL with `no companion_transfer audit row for user #1` (the link writes `companion_link` only).
+Expected: FAIL with `no companion.transfer audit row for user #1` (the link writes `companion.link` only).
 
 - [ ] **Step 3: Implement**
 
@@ -1854,20 +1854,20 @@ In `cmd/server/companion_handlers.go`, add `"context"` and `"github.com/meshcore
 
 ```go
 // companionTransferMailPurpose labels the transfer mail in mail_log.
-const companionTransferMailPurpose = "companion_transfer"
+const companionTransferMailPurpose = "companion.transfer"
 
 // companionLinked writes the audit rows of a link. For a transfer (prev is
-// the previous owner) both users get a companion_transfer row and the
+// the previous owner) both users get a companion.transfer row and the
 // previous owner a mail. Everything runs in the background, tracked by
 // auditWG so waitAudits (tests, shutdown) covers the mail too.
 func (a *authService) companionLinked(u *users.User, link *users.CompanionLink, prev int64) {
 	if prev == 0 {
-		a.auditAsync(idPtr(u.ID), "companion_link", idPtr(u.ID), map[string]string{"pubkey": link.Pubkey})
+		a.auditAsync(idPtr(u.ID), "companion.link", idPtr(u.ID), map[string]string{"pubkey": link.Pubkey})
 		return
 	}
 	detail := map[string]string{"pubkey": link.Pubkey, "from": strconv.FormatInt(prev, 10), "to": strconv.FormatInt(u.ID, 10)}
-	a.auditAsync(idPtr(u.ID), "companion_transfer", idPtr(u.ID), detail)
-	a.auditAsync(idPtr(u.ID), "companion_transfer", idPtr(prev), detail)
+	a.auditAsync(idPtr(u.ID), "companion.transfer", idPtr(u.ID), detail)
+	a.auditAsync(idPtr(u.ID), "companion.transfer", idPtr(prev), detail)
 	a.auditWG.Add(1)
 	go func() {
 		defer a.auditWG.Done()
@@ -1931,7 +1931,7 @@ git commit -F - <<'EOF'
 feat(server): audit and mail a companion transfer
 
 When a newer proof moves a companion to another account, both users get
-a companion_transfer audit row, and the previous owner a mail when node
+a companion.transfer audit row, and the previous owner a mail when node
 notifications are on for the instance and for them.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
@@ -2455,7 +2455,7 @@ EOF
 ## Self-review against the spec
 
 - *Device token*: issue with the login's constant-cost path, rate limits (same buckets) and `user.login` audit row, `deviceName` cleaned by F1's `CleanLabel` (Task 3); bearer in `withUser` with no CSRF and a scope check, 403 outside it (also `withAdmin`, Task 4); logout with a bearer revokes the device row (Task 4); sessions list `kind` and `label` (Task 2). The cookie path refuses device sessions and the bearer path refuses web sessions (Tasks 2 and 4, both tested).
-- *Companions*: challenge 32 bytes hex, 5 minutes, single use, bound (F1, exposed in Task 7); link steps 1–5 in order, the challenge consumed in every case, 410 for missing/expired/mismatch, 400 for bad signature or pubkey, signature over `"corescope-link:" + host + ":" + challenge` via `internal/sigvalidate` (Tasks 1 and 7); upsert and transfer audit rows for both users, mail to the previous owner only with notifications on (Task 8); `meshcore-my-nodes` merge with revision bump, `added`/`present`/`full`, link succeeds at the cap (Tasks 6–7); list with `lastSeenAt` from `client_receptions` (Task 7); delete leaves my nodes alone (Task 7); admin detail `companions` (Task 9); audit kinds `companion_link`, `companion_unlink`, `companion_transfer` (Tasks 7–8).
+- *Companions*: challenge 32 bytes hex, 5 minutes, single use, bound (F1, exposed in Task 7); link steps 1–5 in order, the challenge consumed in every case, 410 for missing/expired/mismatch, 400 for bad signature or pubkey, signature over `"corescope-link:" + host + ":" + challenge` via `internal/sigvalidate` (Tasks 1 and 7); upsert and transfer audit rows for both users, mail to the previous owner only with notifications on (Task 8); `meshcore-my-nodes` merge with revision bump, `added`/`present`/`full`, link succeeds at the cap (Tasks 6–7); list with `lastSeenAt` from `client_receptions` (Task 7); delete leaves my nodes alone (Task 7); admin detail `companions` (Task 9); audit kinds `companion.link`, `companion.unlink`, `companion.transfer` (Tasks 7–8).
 - *Coverage attribution*: `?mine=1` filters by a read-time join, 401 without a session, shape unchanged (Task 10).
 - *Linked-only ingest* (server part): config field, client-config flag only when in effect, startup warning (Task 5). The ingestor filter is F3.
 - *CORS*: only allowlisted origins, only bearer routes, POST/PUT/DELETE and Authorization/Content-Type, no credentials (Task 11).
