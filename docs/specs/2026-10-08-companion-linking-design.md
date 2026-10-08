@@ -125,7 +125,7 @@ the rest of A–E. Rate limits use the existing token buckets (per IP and per us
 - `GET /api/account/companions` → `[{pubkey, name, linkedAt, lastSeenAt}]`.
 - `DELETE /api/account/companions/{pubkey}` → 204. Leaves `meshcore-my-nodes` alone.
 - Admin: `GET /api/admin/users/{id}` gains `companions`. The audit kinds are
-  `companion_link`, `companion_unlink` and `companion_transfer`.
+  `companion.link`, `companion.unlink` and `companion.transfer`.
 
 ### Coverage attribution
 
