@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Finish sub-project F on top of F1 (store) and F2 (server): the ingestor's opt-in linked-only filter (`clientRxCoverage.requireLinkedCompanion`), the account page's device rows and Companions section, the coverage page's "My coverage" toggle, an e2e test, and the operator/user docs and release note.
+**Goal:** Finish sub-project F on top of F1 (store) and F2 (server): the ingestor's opt-in linked-only filter (`clientRxCoverage.requireLinkedCompanion`), the account page's device rows and Companions section, the coverage page's "My coverage" toggle, an e2e test, and the operator/user docs. The Dutch release note is drafted in Task 9 but only added and published once the version is live.
 
 **Architecture:** The ingestor reads `companion_links` from `users.db` read-only with raw SQL, exactly like the approved hashtag channels (`approved_channels.go`): a lazily opened `mode=ro` handle, an atomically swapped snapshot, and a failed read that keeps the last good set. The new `linkedCompanionSet` adds a miss path: a pubkey not in the snapshot re-reads `users.db` at most once per 5 s before it is dropped, so a companion linked a moment ago is accepted within seconds while a flood of unknown pubkeys costs one read per 5 s. The set hangs off `Store` (`store.linkedCompanions`, nil = off), so `handleMessage`'s signature and its 92 test call sites do not change; the check sits right after the client-topic blacklist check, before the `packets`/`rf`/`regions` switch. Drops are an atomic counter in `DBStats`, published in the stats file as `client_unlinked_dropped`. The frontend changes follow the existing patterns: `account.js` string-built HTML through `escapeHtml`, `CSAuth.request`, `msgBox`/`CSAuth.say`, and a `load*` function per list; `rx-coverage.js` gains three small pure helpers exported on `window.CSRxCoverage._test`.
 
@@ -29,7 +29,7 @@
 - **The ingestor never imports `internal/users` and never writes `users.db`** (AGENTS.md). It opens `users.db` with `usersDBReadOnlyDSN` (`mode=ro`) and runs one raw query, `SELECT pubkey FROM companion_links`. `TestLinkedCompanionSetIsReadOnly` pins this.
 - **The filter applies before every client handler** (`packets`, `rf`, `regions`), after the existing client-topic blacklist check, whatever `clientRxCoverage.enabled` says.
 - **Drops are counted, never logged per message.** The only log lines are startup, a missing table (once), and a failing/recovered read (once per streak).
-- **A missing `companion_links` table (older `users.db`) is an empty set plus one warning, never a crash.** A failed read keeps the last good set (the initial set is empty, so a deployment whose `users.db` cannot be read drops client data rather than letting it through).
+- **Until the first successful read of `companion_links`, all client data passes.** A missing table (older `users.db`) or an unreadable `users.db` warns once and never crashes. After the first success, a failed read keeps the last good set.
 - **The setting is ignored with a startup warning when `userManagement.enabled` is off.** The filter is then not installed at all.
 - **It is a filter, not a security boundary.** Every doc that mentions it says so, and says to upgrade the RX clients first.
 - The account page and coverage page never show another user's companions; they only call the caller's own `/api/account/*` routes and `?mine=1`.
@@ -58,7 +58,6 @@
 | `docs/client-rx-coverage.md` | Section "Linked companions only (optional)". |
 | `docs/user-guide/accounts.md` | Operator section "Companion linking (CoreDrive RX)" (device tokens, CORS, linked-only); user bullet "Companions" and "My coverage". |
 | `config.example.json` | `_comment_corsAllowedOrigins` names the bearer-route exception. |
-| `docs/release-notes/nl/v3.13.1-on8ar.4.md` | New Dutch release note (the fork's convention: one short `nl` note per `-on8ar.N` tag; rename the file if the tag differs). |
 
 `cmd/ingestor` commands run from `C:\dev\corescope\CoreScope\cmd\ingestor`; Node commands and git commands from the repo root `C:\dev\corescope\CoreScope`. After every Go code step run `gofmt -w` on the touched Go files (struct fields and literals realign when a longer field is added).
 
@@ -341,8 +340,8 @@ func TestLinkedCompanionSetMissingTableIsEmptyAndWarnsOnce(t *testing.T) {
 	defer s.Close()
 	s.refresh()
 	s.refresh()
-	if s.Allow(testCompanionPK) {
-		t.Fatal("allowed without a companion_links table")
+	if !s.Allow(testCompanionPK) {
+		t.Fatal("dropped before the list was ever read; want pass-through")
 	}
 	if n := strings.Count(buf.String(), "no companion_links table"); n != 1 {
 		t.Fatalf("warned %d times; want once:\n%s", n, buf.String())
@@ -351,6 +350,9 @@ func TestLinkedCompanionSetMissingTableIsEmptyAndWarnsOnce(t *testing.T) {
 	s.refresh()
 	if !s.Allow(testCompanionPK) {
 		t.Fatal("the table appearing later is not picked up")
+	}
+	if s.Allow(testUnlinkedPK) {
+		t.Fatal("an unlinked pubkey passed once the list was read")
 	}
 }
 
@@ -363,8 +365,8 @@ func TestLinkedCompanionSetMissingFileLogsOnceAndRecovers(t *testing.T) {
 	defer s.Close()
 	s.refresh()
 	s.refresh()
-	if s.Allow(testCompanionPK) {
-		t.Fatal("allowed without users.db")
+	if !s.Allow(testCompanionPK) {
+		t.Fatal("dropped before users.db was ever read; want pass-through")
 	}
 	if n := strings.Count(buf.String(), "linked companions unavailable"); n != 1 {
 		t.Fatalf("logged %d times; want once:\n%s", n, buf.String())
@@ -379,6 +381,29 @@ func TestLinkedCompanionSetMissingFileLogsOnceAndRecovers(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "linked companions readable again") {
 		t.Fatalf("no recovery line:\n%s", buf.String())
+	}
+}
+
+// Pass-through holds only until the first successful read: after that a
+// failed read keeps the last good set, so it fails closed.
+func TestLinkedCompanionSetFailsClosedOnlyAfterFirstRead(t *testing.T) {
+	s, path, clock := newTestLinkedSet(t, testCompanionPK)
+	s.refresh()
+	if s.Allow(testUnlinkedPK) {
+		t.Fatal("an unlinked pubkey passed after a successful read")
+	}
+	s.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	clock.add(linkedCompanionsMissGap)
+	s.refresh() // fails: users.db is gone
+	if !s.Allow(testCompanionPK) {
+		t.Fatal("the last good set was dropped on a failed read")
+	}
+	clock.add(linkedCompanionsMissGap)
+	if s.Allow(testUnlinkedPK) {
+		t.Fatal("a failed read after the first success let an unlinked pubkey through")
 	}
 }
 
@@ -451,10 +476,13 @@ type linkedCompanionSet struct {
 	lastRead time.Time  // last read attempt, for the miss gap
 	reads    int        // read attempts (tests)
 	failing  bool       // the last read failed; logged once per failure streak
+	loaded   atomic.Bool // a read of companion_links has succeeded at least once
 	noTable  bool       // warned that companion_links is missing
 }
 
-// newLinkedCompanionSet starts empty: nothing passes until a read succeeds.
+// newLinkedCompanionSet starts unloaded: until the first successful read of
+// companion_links, every pubkey passes. A users.db that is missing, unreadable
+// or older than companion linking must not cost the data of linked companions.
 func newLinkedCompanionSet(usersDBPath string) *linkedCompanionSet {
 	s := &linkedCompanionSet{path: usersDBPath, now: time.Now}
 	empty := map[string]struct{}{}
@@ -477,9 +505,12 @@ func (s *linkedCompanionSet) Allow(pubkey string) bool {
 		return true
 	}
 	if s.now().Sub(s.lastRead) < linkedCompanionsMissGap {
-		return false
+		return !s.loaded.Load()
 	}
 	s.readLocked()
+	if !s.loaded.Load() {
+		return true
+	}
 	_, ok := (*s.cur.Load())[pk]
 	return ok
 }
@@ -497,19 +528,21 @@ func (s *linkedCompanionSet) readCount() int {
 	return s.reads
 }
 
-// readLocked swaps in a fresh snapshot. A missing companion_links table (a
-// server older than companion linking) is an empty set, warned once. Any
-// other failure keeps the current snapshot and is logged once per streak.
+// readLocked swaps in a fresh snapshot and marks the set loaded. A missing
+// companion_links table (a server older than companion linking) is warned once
+// and leaves the set unloaded, so data still passes. Any other failure keeps
+// the current snapshot (or pass-through, before the first success) and is
+// logged once per streak.
 func (s *linkedCompanionSet) readLocked() {
 	s.lastRead = s.now()
 	s.reads++
 	keys, err := s.query()
 	if err != nil && strings.Contains(err.Error(), "no such table") {
 		if !s.noTable {
-			log.Printf("[companions] %s has no companion_links table (a server older than companion linking); no companion counts as linked", s.path)
+			log.Printf("[companions] %s has no companion_links table (a server older than companion linking); passing client data until it appears", s.path)
 			s.noTable = true
 		}
-		keys, err = nil, nil
+		return
 	}
 	if err != nil {
 		if !s.failing {
@@ -527,6 +560,7 @@ func (s *linkedCompanionSet) readLocked() {
 		next[strings.ToLower(strings.TrimSpace(k))] = struct{}{}
 	}
 	s.cur.Store(&next)
+	s.loaded.Store(true)
 }
 
 func (s *linkedCompanionSet) query() ([]string, error) {
@@ -587,9 +621,9 @@ feat(ingestor): read linked companions from users.db
 
 A read-only set of companion_links pubkeys, refreshed on demand. A miss
 re-reads at most once per 5 s, so a fresh link is accepted within
-seconds and a flood of unknown pubkeys costs one read per 5 s. A missing
-table is an empty set with one warning; a failed read keeps the last
-good set.
+seconds and a flood of unknown pubkeys costs one read per 5 s. Until the
+first successful read every pubkey passes (a missing table warns once);
+after it, a failed read keeps the last good set.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 EOF
@@ -1678,7 +1712,6 @@ EOF
 
 **Files:**
 - Modify: `docs/client-rx-coverage.md`, `docs/user-guide/accounts.md`, `config.example.json`
-- Create: `docs/release-notes/nl/v3.13.1-on8ar.4.md`
 
 - [ ] **Step 1: Write the failing check**
 
@@ -1794,9 +1827,9 @@ and Access-Control-Allow-Methods is limited to GET, HEAD, OPTIONS (the cross-dom
 Run: `node -e "JSON.parse(require('fs').readFileSync('config.example.json','utf8'))"`
 Expected: no output, exit code 0.
 
-- [ ] **Step 5: Release note**
+- [ ] **Step 5: Release note draft (do NOT create the file)**
 
-The fork writes one short Dutch note per `-on8ar.N` tag in `docs/release-notes/nl/` (latest: `v3.13.1-on8ar.3.md`). Create `docs/release-notes/nl/v3.13.1-on8ar.4.md` (rename it if the release gets another tag):
+The fork writes one short Dutch note per `-on8ar.N` tag in `docs/release-notes/nl/` (latest: `v3.13.1-on8ar.3.md`). **This note may only be added and published once the version runs on the LIVE environment** (user decision, 2026-10-08). So this plan does not create it: keep the draft below here, and when the release is live, save it as `docs/release-notes/nl/<live tag>.md` and publish it then.
 
 ```markdown
 Je account en CoreDrive RX horen nu bij elkaar.
@@ -1816,14 +1849,14 @@ Run: `grep -c "requireLinkedCompanion" docs/client-rx-coverage.md docs/user-guid
 Expected: both counts at least 1.
 
 ```bash
-git add docs/client-rx-coverage.md docs/user-guide/accounts.md config.example.json docs/release-notes/nl/v3.13.1-on8ar.4.md
+git add docs/client-rx-coverage.md docs/user-guide/accounts.md config.example.json
 git commit -F - <<'EOF'
 docs: companion linking, linked-only ingest and the CORS exception
 
 Operator and user docs for device tokens, companions and My coverage;
 requireLinkedCompanion with the filter-not-boundary note and the
 upgrade-RX-first warning; the corsAllowedOrigins comment names the
-bearer routes; Dutch release note.
+bearer routes. The Dutch release note waits until the version is live.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 EOF
@@ -1865,11 +1898,11 @@ Expected: PASS (F3 adds no route; F2's entries stay complete).
 
 ## Self-review against the spec
 
-- *Linked-only ingest, ingestor part*: setting read from `clientRxCoverage.requireLinkedCompanion` and in effect only with `userManagement.enabled`, ignored with a startup warning otherwise (Tasks 1, 4); in-memory set from `companion_links`, read-only raw SQL, refreshed every 60 s (Tasks 2, 4); a miss re-reads at most once per 5 s (Task 2); the check runs before the `packets`, `rf` and `regions` handlers (Task 3); drops counted as `client_unlinked_dropped` in the stats file, never logged per message (Task 3); an old `users.db` without the table is an empty set with one warning (Task 2).
+- *Linked-only ingest, ingestor part*: setting read from `clientRxCoverage.requireLinkedCompanion` and in effect only with `userManagement.enabled`, ignored with a startup warning otherwise (Tasks 1, 4); in-memory set from `companion_links`, read-only raw SQL, refreshed every 60 s (Tasks 2, 4); a miss re-reads at most once per 5 s (Task 2); the check runs before the `packets`, `rf` and `regions` handlers (Task 3); drops counted as `client_unlinked_dropped` in the stats file, never logged per message (Task 3); pass-through until the first successful read, an old `users.db` without the table warns once (Task 2).
 - *Testing → cmd/ingestor*: off changes nothing (`TestLinkedOnlyFilterOffChangesNothing`); linked passes (`…PassesLinked`, `TestLinkedCompanionSetAllowsLinkedOnly`); unlinked dropped and counted (`…DropsUnlinkedBeforeEveryHandler`, `TestStatsFileCarriesClientUnlinkedDropped`); link after the last refresh accepted through the miss refresh (`…MissRefreshAcceptsNewLink`); 5 s cap under a flood (`…MissRefreshCapHoldsUnderFlood`); unlink honoured after the periodic refresh (`…UnlinkHonouredAfterPeriodicRefresh`); user management off ignored with a warning (`TestLinkedCompanionFilterStartup`).
 - *Account page*: device tokens with label and marker, nothing else changes (Task 5); Companions below Devices with name, short pubkey, linked since, last seen, Unlink, and the empty-state text (Task 6).
 - *Coverage attribution*: "My coverage" toggle only for logged-in users, fetching `?mine=1` (Task 7).
 - *CORS*: documented for operators and in the `corsAllowedOrigins` comment (Task 9); the behaviour is F2's.
-- *Rollout*: opt-in; "upgrade RX clients first" in both docs and the release note (Task 9). "Filter, not a security boundary" in both docs, the release note and the code comment (Tasks 2, 9).
+- *Rollout*: opt-in; "upgrade RX clients first" in both docs and the release-note draft (Task 9). "Filter, not a security boundary" in both docs, the release note and the code comment (Tasks 2, 9).
 - *e2e*: seeded device token under Devices, linked companion under Companions, unlink (Task 8).
-- Deviations, resolved here: the spec says drops are counted "per reason"; the stats file has no per-reason map, so the one reason is a top-level field `client_unlinked_dropped` next to `sig_drops`. The filter lives on `Store` rather than as a `handleMessage` parameter, so the 92 existing test call sites stay as they are. The spec does not say what a failed `users.db` read means for the filter; it keeps the last good set (the initial set is empty, so it fails closed), like the approved channels. "My coverage" applies to the signal layer only, since only `/api/rx-coverage` has `mine`. The release-note file name assumes the next fork tag is `v3.13.1-on8ar.4`.
+- Deviations, resolved here: the spec says drops are counted "per reason"; the stats file has no per-reason map, so the one reason is a top-level field `client_unlinked_dropped` next to `sig_drops`. The filter lives on `Store` rather than as a `handleMessage` parameter, so the 92 existing test call sites stay as they are. The spec does not say what a failed `users.db` read means for the filter; everything passes until the first successful read (decided with the user, 2026-10-08), and after that a failed read keeps the last good set. "My coverage" applies to the signal layer only, since only `/api/rx-coverage` has `mine`. The Dutch release note is a draft in Task 9; it is added and published only once the version runs on LIVE.
