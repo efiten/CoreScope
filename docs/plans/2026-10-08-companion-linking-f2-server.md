@@ -20,7 +20,7 @@
 | Bearer use | `Authorization: Bearer <token>`. Allowed: `GET /api/auth/me`, `POST /api/auth/logout`, `GET/PUT/DELETE /api/account/settings`, `/api/account/companions*`. Elsewhere under `withUser`/`withAdmin`: `403`. Unknown, expired, revoked or web token: `401 {error: "invalid or expired token"}` (RX clears the token). Sliding 90 days. `GET /api/auth/me` with a bearer answers `csrfToken: ""`. |
 | `POST /api/auth/logout` (bearer) | Revokes that device token, `200 {ok: true}`. |
 | `GET /api/account/sessions` | Each item gains `kind` (`"web"` \| `"device"`) and `label` (device name, `""` for web). Same in admin user detail `sessions`. |
-| `POST /api/account/companions/challenge` | `{pubkey}` → `200 {challenge, expiresAt}`; `challenge` is 64 lowercase hex. `400` bad pubkey, `429`. |
+| `POST /api/account/companions/challenge` | `{pubkey}` → `200 {challenge, expiresAt, host}`; `challenge` is 64 lowercase hex; `host` is the host of `userManagement.publicBaseUrl`, the one the client must sign (so RX never guesses it). `400` bad pubkey, `429`. |
 | Signed message | UTF-8 `"corescope-link:" + <host of userManagement.publicBaseUrl> + ":" + <challenge as sent>`; signature = 64-byte Ed25519 as hex. |
 | `POST /api/account/companions` | `{pubkey, challenge, signature, name}` → `200 {pubkey, name, linkedAt, myNodes}`, `myNodes` ∈ `"added"`, `"present"`, `"full"`, `"failed"` (`"full"` = not added because the document would exceed 256 KiB; `"failed"` = not added because the merge failed for another reason, e.g. a stored list that does not decode or a settings write error; the link stands in both cases). `400` bad pubkey/signature, `410` challenge missing/expired/used/mismatched, `429`. |
 | `GET /api/account/companions` | `[{pubkey, name, linkedAt, lastSeenAt}]`, newest link first; `lastSeenAt` is `client_receptions.rx_at` as stored, or `null`. Always an array. |
@@ -1338,7 +1338,11 @@ func (f *authFixture) companionChallenge(t *testing.T, tok, pk string) string {
 	t.Helper()
 	w := f.do("POST", "/api/account/companions/challenge", companionChallengeRequest{Pubkey: pk}, bearer(tok), header("Origin", rxOrigin))
 	expectStatus(t, w, http.StatusOK)
-	return decode[companionChallengeResponse](t, w).Challenge
+	resp := decode[companionChallengeResponse](t, w)
+	if resp.Host != testHost {
+		t.Fatalf("challenge host = %q; want %q (the host the server verifies against)", resp.Host, testHost)
+	}
+	return resp.Challenge
 }
 
 // linkCompanion runs the RX flow: challenge, sign with the companion key, link.
@@ -1519,6 +1523,9 @@ type companionChallengeRequest struct {
 type companionChallengeResponse struct {
 	Challenge string `json:"challenge"`
 	ExpiresAt string `json:"expiresAt"`
+	// Host is what the client signs: the host of userManagement.publicBaseUrl,
+	// the same one linkMessage verifies against.
+	Host string `json:"host"`
 }
 
 type companionLinkRequest struct {
@@ -1609,7 +1616,7 @@ func (s *Server) handleCompanionChallenge(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	writeJSON(w, companionChallengeResponse{Challenge: ch, ExpiresAt: rfc3339(exp)})
+	writeJSON(w, companionChallengeResponse{Challenge: ch, ExpiresAt: rfc3339(exp), Host: a.set.baseURL.Host})
 }
 
 func (s *Server) handleCompanionLink(w http.ResponseWriter, r *http.Request, u *users.User, _ *users.Session) {
@@ -1764,7 +1771,7 @@ In `cmd/server/auth_routes.go`, after the `/api/account/settings` DELETE line, a
 In `cmd/server/openapi.go`, after the `"DELETE /api/account/settings"` entry, add:
 
 ```go
-		"POST /api/account/companions/challenge":           {Summary: "Start linking a companion", Description: "Body {pubkey} (64 hex). 200 {challenge, expiresAt}: 32 random bytes as hex, single use, valid 5 minutes, bound to the caller and the pubkey. 400 malformed pubkey; 429 above 60 challenge + link requests per hour per user and per IP. Accepts a device token (Authorization: Bearer).", Tag: "users", Session: true},
+		"POST /api/account/companions/challenge":           {Summary: "Start linking a companion", Description: "Body {pubkey} (64 hex). 200 {challenge, expiresAt, host}: host is what to sign (the host of userManagement.publicBaseUrl); challenge is 32 random bytes as hex, single use, valid 5 minutes, bound to the caller and the pubkey. 400 malformed pubkey; 429 above 60 challenge + link requests per hour per user and per IP. Accepts a device token (Authorization: Bearer).", Tag: "users", Session: true},
 		"POST /api/account/companions":                     {Summary: "Link a companion", Description: "Body {pubkey, challenge, signature, name}. signature is the companion's Ed25519 signature (64 bytes, hex) over the UTF-8 string \"corescope-link:\" + host of userManagement.publicBaseUrl + \":\" + challenge. The challenge is consumed in every case. 200 {pubkey, name, linkedAt, myNodes}: myNodes is added, present, full (not added: the synced settings would exceed 256 KiB) or failed (not added: the merge failed for another reason); the link stands in both cases. The pubkey is added to meshcore-my-nodes with a revision bump. A companion linked to another account moves to the caller (the newest proof wins); both get a companion.transfer audit row and the previous owner a mail when notifications are on for them. 400 malformed pubkey or signature, or a signature that does not verify; 410 challenge missing, expired, used, or bound to another user or pubkey; 429 rate limited. Accepts a device token.", Tag: "users", Session: true},
 		"GET /api/account/companions":                      {Summary: "List own linked companions", Description: "[{pubkey, name, linkedAt, lastSeenAt}], newest link first. lastSeenAt is the newest client reception of that companion (rx_at as stored) or null. Accepts a device token.", Tag: "users", Session: true},
 		"DELETE /api/account/companions/{pubkey}":          {Summary: "Unlink an own companion", Description: "204. meshcore-my-nodes and stored coverage stay. 400 malformed pubkey, 404 not linked to the caller. Accepts a device token.", Tag: "users", Session: true},
