@@ -22,7 +22,7 @@
 | `GET /api/account/sessions` | Each item gains `kind` (`"web"` \| `"device"`) and `label` (device name, `""` for web). Same in admin user detail `sessions`. |
 | `POST /api/account/companions/challenge` | `{pubkey}` → `200 {challenge, expiresAt}`; `challenge` is 64 lowercase hex. `400` bad pubkey, `429`. |
 | Signed message | UTF-8 `"corescope-link:" + <host of userManagement.publicBaseUrl> + ":" + <challenge as sent>`; signature = 64-byte Ed25519 as hex. |
-| `POST /api/account/companions` | `{pubkey, challenge, signature, name}` → `200 {pubkey, name, linkedAt, myNodes}`, `myNodes` ∈ `"added"`, `"present"`, `"full"` (`"full"` = not added: the document would exceed 256 KiB or could not be updated; the link stands). `400` bad pubkey/signature, `410` challenge missing/expired/used/mismatched, `429`. |
+| `POST /api/account/companions` | `{pubkey, challenge, signature, name}` → `200 {pubkey, name, linkedAt, myNodes}`, `myNodes` ∈ `"added"`, `"present"`, `"full"`, `"failed"` (`"full"` = not added because the document would exceed 256 KiB; `"failed"` = not added because the merge failed for another reason, e.g. a stored list that does not decode or a settings write error; the link stands in both cases). `400` bad pubkey/signature, `410` challenge missing/expired/used/mismatched, `429`. |
 | `GET /api/account/companions` | `[{pubkey, name, linkedAt, lastSeenAt}]`, newest link first; `lastSeenAt` is `client_receptions.rx_at` as stored, or `null`. Always an array. |
 | `DELETE /api/account/companions/{pubkey}` | `204`; `400` bad pubkey; `404` not linked to the caller. |
 | Admin `GET /api/admin/users/{id}` | Gains `companions: [{pubkey, name, linkedAt, lastSeenAt}]`. |
@@ -38,7 +38,7 @@
 - **A bearer header is judged alone.** With `Authorization: Bearer` present, the cookie is not consulted.
 - **The challenge is consumed before anything else can fail** (also for a malformed pubkey or signature), so a refused attempt never leaves a usable challenge.
 - **Tokens, challenges and signatures are never logged.** Log lines name user ids and session ids only.
-- **The link never fails because of `meshcore-my-nodes`.** Merge errors are logged and reported as `myNodes: "full"`.
+- **The link never fails because of `meshcore-my-nodes`.** A document at the size cap is reported as `myNodes: "full"`; any other merge error is logged and reported as `myNodes: "failed"`. Neither turns the link into an error.
 - `/api/rx-coverage` is in `openapi_known_gaps.json`; do **not** add it to `routeDescriptions` here (the ratchet would then demand removing the gap entry; that backfill is not part of F).
 
 ## File Structure
@@ -1128,12 +1128,31 @@ func TestAddToMyNodesFullAtCap(t *testing.T) {
 		t.Fatal("document changed at the cap")
 	}
 }
+
+func TestAddToMyNodesErrorIsNotFull(t *testing.T) {
+	f := newAuthFixture(t)
+	alice := f.registerAndActivate(t, "alice@example.org", "Alice", pw)
+	a, uid := f.srv.auth, alice.me.ID
+	// A stored my-nodes value that is not a JSON array cannot be merged.
+	doc, _ := encodeSettingsDoc(&settingsDoc{V: 1, Keys: map[string]string{myNodesKey: `{"not":"a list"}`}})
+	v, err := f.st.PutSettings(uid, users.SettingsVersion{}, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.addToMyNodes(uid, strings.Repeat("a1", 32), "Car", time.Now())
+	if err == nil || got == myNodesFull {
+		t.Fatalf("bad list = %q, %v; want an error, not full", got, err)
+	}
+	if raw, v2, _ := f.st.GetSettings(uid); v2 != v || raw != doc {
+		t.Fatal("document changed on a merge error")
+	}
+}
 ```
 
 - [ ] **Step 2: Run them and watch them fail**
 
 Run: `cd cmd/server && go test -run 'TestAddToMyNodes' .`
-Expected: FAIL, build error `a.addToMyNodes undefined`, `undefined: myNodesKey`, `undefined: myNodesAdded`.
+Expected: FAIL, build error `a.addToMyNodes undefined`, `undefined: myNodesKey`, `undefined: myNodesAdded`, `undefined: myNodesFull`.
 
 - [ ] **Step 3: Implement**
 
@@ -1159,7 +1178,8 @@ const myNodesKey = "meshcore-my-nodes"
 const (
 	myNodesAdded   = "added"
 	myNodesPresent = "present"
-	myNodesFull    = "full"
+	myNodesFull    = "full"   // strictly: the document would exceed settingsDocMaxBytes
+	myNodesFailed  = "failed" // any other merge error (the handler maps a returned error to this)
 )
 
 // myNodeItem is the item shape public/home.js writes: {pubkey, name, addedAt}.
@@ -1175,7 +1195,8 @@ type myNodeItem struct {
 // and open browsers pick the change up through the normal conflict flow;
 // a concurrent write is retried. Existing items are kept as they are
 // (compacted). A document that would exceed settingsDocMaxBytes is left
-// alone and the result is "full".
+// alone and the result is "full". Any other failure is returned as an
+// error; the link handler logs it and reports "failed".
 func (a *authService) addToMyNodes(uid int64, pubkey, name string, now time.Time) (string, error) {
 	if name == "" {
 		name = pubkey[:12] // what home.js shows for an unnamed node
@@ -1460,6 +1481,25 @@ func TestCompanionListLastSeen(t *testing.T) {
 		t.Fatalf("list = %s", w.Body.String())
 	}
 }
+
+// A merge error other than the size cap answers myNodes "failed", and the link stands.
+func TestCompanionLinkMyNodesFailed(t *testing.T) {
+	f := newAuthFixture(t)
+	alice := f.registerAndActivate(t, "alice@example.org", "Alice", pw)
+	doc, _ := encodeSettingsDoc(&settingsDoc{V: 1, Keys: map[string]string{myNodesKey: `"not a list"`}})
+	if _, err := f.st.PutSettings(alice.me.ID, users.SettingsVersion{}, doc); err != nil {
+		t.Fatal(err)
+	}
+	tok := f.deviceToken(t, "alice@example.org", pw, "Pixel").Token
+	w := f.linkCompanion(t, tok, companionKey, "Car")
+	expectStatus(t, w, http.StatusOK)
+	if got := decode[companionLinkResponse](t, w); got.MyNodes != myNodesFailed {
+		t.Fatalf("myNodes = %q, want %q", got.MyNodes, myNodesFailed)
+	}
+	if l, err := f.st.GetCompanionLink(pubHex(companionKey)); err != nil || l.UserID != alice.me.ID {
+		t.Fatalf("link did not stand: %+v, %v", l, err)
+	}
+}
 ```
 
 - [ ] **Step 2: Run them and watch them fail**
@@ -1492,7 +1532,7 @@ type companionLinkResponse struct {
 	Pubkey   string `json:"pubkey"`
 	Name     string `json:"name"`
 	LinkedAt string `json:"linkedAt"`
-	MyNodes  string `json:"myNodes"` // myNodesAdded, myNodesPresent or myNodesFull
+	MyNodes  string `json:"myNodes"` // myNodesAdded, myNodesPresent, myNodesFull or myNodesFailed
 }
 
 type companionJSON struct {
@@ -1619,7 +1659,7 @@ func (s *Server) handleCompanionLink(w http.ResponseWriter, r *http.Request, u *
 	myNodes, err := a.addToMyNodes(u.ID, link.Pubkey, link.Name, time.Now())
 	if err != nil {
 		log.Printf("[users] add linked companion to my nodes for user #%d: %v", u.ID, err)
-		myNodes = myNodesFull
+		myNodes = myNodesFailed
 	}
 	writeJSON(w, companionLinkResponse{Pubkey: link.Pubkey, Name: link.Name, LinkedAt: rfc3339(link.LinkedAt), MyNodes: myNodes})
 }
@@ -1725,7 +1765,7 @@ In `cmd/server/openapi.go`, after the `"DELETE /api/account/settings"` entry, ad
 
 ```go
 		"POST /api/account/companions/challenge":           {Summary: "Start linking a companion", Description: "Body {pubkey} (64 hex). 200 {challenge, expiresAt}: 32 random bytes as hex, single use, valid 5 minutes, bound to the caller and the pubkey. 400 malformed pubkey; 429 above 60 challenge + link requests per hour per user and per IP. Accepts a device token (Authorization: Bearer).", Tag: "users", Session: true},
-		"POST /api/account/companions":                     {Summary: "Link a companion", Description: "Body {pubkey, challenge, signature, name}. signature is the companion's Ed25519 signature (64 bytes, hex) over the UTF-8 string \"corescope-link:\" + host of userManagement.publicBaseUrl + \":\" + challenge. The challenge is consumed in every case. 200 {pubkey, name, linkedAt, myNodes}: myNodes is added, present, or full (not added: the synced settings would exceed 256 KiB or could not be updated; the link stands). The pubkey is added to meshcore-my-nodes with a revision bump. A companion linked to another account moves to the caller (the newest proof wins); both get a companion.transfer audit row and the previous owner a mail when notifications are on for them. 400 malformed pubkey or signature, or a signature that does not verify; 410 challenge missing, expired, used, or bound to another user or pubkey; 429 rate limited. Accepts a device token.", Tag: "users", Session: true},
+		"POST /api/account/companions":                     {Summary: "Link a companion", Description: "Body {pubkey, challenge, signature, name}. signature is the companion's Ed25519 signature (64 bytes, hex) over the UTF-8 string \"corescope-link:\" + host of userManagement.publicBaseUrl + \":\" + challenge. The challenge is consumed in every case. 200 {pubkey, name, linkedAt, myNodes}: myNodes is added, present, full (not added: the synced settings would exceed 256 KiB) or failed (not added: the merge failed for another reason); the link stands in both cases. The pubkey is added to meshcore-my-nodes with a revision bump. A companion linked to another account moves to the caller (the newest proof wins); both get a companion.transfer audit row and the previous owner a mail when notifications are on for them. 400 malformed pubkey or signature, or a signature that does not verify; 410 challenge missing, expired, used, or bound to another user or pubkey; 429 rate limited. Accepts a device token.", Tag: "users", Session: true},
 		"GET /api/account/companions":                      {Summary: "List own linked companions", Description: "[{pubkey, name, linkedAt, lastSeenAt}], newest link first. lastSeenAt is the newest client reception of that companion (rx_at as stored) or null. Accepts a device token.", Tag: "users", Session: true},
 		"DELETE /api/account/companions/{pubkey}":          {Summary: "Unlink an own companion", Description: "204. meshcore-my-nodes and stored coverage stay. 400 malformed pubkey, 404 not linked to the caller. Accepts a device token.", Tag: "users", Session: true},
 ```
@@ -2455,7 +2495,7 @@ EOF
 ## Self-review against the spec
 
 - *Device token*: issue with the login's constant-cost path, rate limits (same buckets) and `user.login` audit row, `deviceName` cleaned by F1's `CleanLabel` (Task 3); bearer in `withUser` with no CSRF and a scope check, 403 outside it (also `withAdmin`, Task 4); logout with a bearer revokes the device row (Task 4); sessions list `kind` and `label` (Task 2). The cookie path refuses device sessions and the bearer path refuses web sessions (Tasks 2 and 4, both tested).
-- *Companions*: challenge 32 bytes hex, 5 minutes, single use, bound (F1, exposed in Task 7); link steps 1–5 in order, the challenge consumed in every case, 410 for missing/expired/mismatch, 400 for bad signature or pubkey, signature over `"corescope-link:" + host + ":" + challenge` via `internal/sigvalidate` (Tasks 1 and 7); upsert and transfer audit rows for both users, mail to the previous owner only with notifications on (Task 8); `meshcore-my-nodes` merge with revision bump, `added`/`present`/`full`, link succeeds at the cap (Tasks 6–7); list with `lastSeenAt` from `client_receptions` (Task 7); delete leaves my nodes alone (Task 7); admin detail `companions` (Task 9); audit kinds `companion.link`, `companion.unlink`, `companion.transfer` (Tasks 7–8).
+- *Companions*: challenge 32 bytes hex, 5 minutes, single use, bound (F1, exposed in Task 7); link steps 1–5 in order, the challenge consumed in every case, 410 for missing/expired/mismatch, 400 for bad signature or pubkey, signature over `"corescope-link:" + host + ":" + challenge` via `internal/sigvalidate` (Tasks 1 and 7); upsert and transfer audit rows for both users, mail to the previous owner only with notifications on (Task 8); `meshcore-my-nodes` merge with revision bump, `added`/`present`/`full`/`failed` (`full` strictly for the size cap, `failed` for any other merge error, both tested), link succeeds either way (Tasks 6–7); list with `lastSeenAt` from `client_receptions` (Task 7); delete leaves my nodes alone (Task 7); admin detail `companions` (Task 9); audit kinds `companion.link`, `companion.unlink`, `companion.transfer` (Tasks 7–8).
 - *Coverage attribution*: `?mine=1` filters by a read-time join, 401 without a session, shape unchanged (Task 10).
 - *Linked-only ingest* (server part): config field, client-config flag only when in effect, startup warning (Task 5). The ingestor filter is F3.
 - *CORS*: only allowlisted origins, only bearer routes, POST/PUT/DELETE and Authorization/Content-Type, no credentials (Task 11).
