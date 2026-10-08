@@ -27,6 +27,7 @@ func (s *Server) registerAuthRoutes(r *mux.Router) {
 	r.HandleFunc("/api/account/settings", s.withUser(s.handleSettingsGet)).Methods("GET")
 	r.HandleFunc("/api/account/settings", s.withUser(s.handleSettingsPut)).Methods("PUT")
 	r.HandleFunc("/api/account/settings", s.withUser(s.handleSettingsDelete)).Methods("DELETE")
+	r.HandleFunc("/api/account/export", s.withUser(s.handleAccountExport)).Methods("GET")
 	r.HandleFunc("/api/admin/users", s.withAdmin(s.handleAdminUsers)).Methods("GET")
 	r.HandleFunc("/api/admin/users/{id}", s.withAdmin(s.handleAdminUserDetail)).Methods("GET")
 	r.HandleFunc("/api/admin/users/{id}", s.withAdmin(s.handleAdminDelete)).Methods("DELETE")
@@ -38,6 +39,7 @@ func (s *Server) registerAuthRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/users/{id}/mail/{mailId}/refresh", s.withAdmin(s.handleAdminMailRefresh)).Methods("POST")
 	r.HandleFunc("/api/admin/audit", s.withAdmin(s.handleAdminAudit)).Methods("GET")
 	r.HandleFunc("/api/admin/stats", s.withAdmin(s.handleAdminStats)).Methods("GET")
+	r.HandleFunc("/api/admin/users-backup", s.withAdmin(s.handleAdminUsersBackup)).Methods("GET")
 	if s.auth.set.proposals.enabled {
 		s.registerProposalRoutes(r)
 	}

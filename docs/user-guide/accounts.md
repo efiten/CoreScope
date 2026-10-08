@@ -191,8 +191,82 @@ watched node changes state. Admins can also watch the instance.
 
 ### Backups
 
-`users.db` holds password hashes and addresses. Back it up together with the analyzer
-database, and protect it the same way. Deleting it removes all accounts and nothing else.
+`users.db` holds password hashes and addresses. The server keeps its own snapshots of
+it: at startup when the newest snapshot is older than 24 hours (or there is none), then
+about every 24 hours (the check runs hourly). A snapshot is a complete copy named `users-<YYYYMMDD-HHMMSS>.db` (UTC),
+readable by the server's user only, in `backups/` next to `users.db`. After each new
+snapshot the oldest ones beyond `keep` are deleted, never the one just written.
+Temporary files of an interrupted snapshot (`users-<YYYYMMDD-HHMMSS>.db.tmp`) are
+deleted once they are older than 24 hours; other files in that directory are never
+touched. A failed snapshot is logged (`[users] backup failed: ...`) and the next run
+tries again.
+
+The server creates the default directory, or a `backup.dir` that does not exist yet,
+with mode 0700. An existing `backup.dir` is not tightened: make it readable by the
+server's user only yourself (`chmod 700 <dir>`).
+
+A deleted account, including one the user deleted themselves, stays in the snapshots
+for up to `keep` days (one snapshot a day), and in every downloaded copy until you
+delete that copy.
+
+```json
+"userManagement": {
+  "backup": { "enabled": true, "dir": "", "keep": 7 }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `backup.enabled` | Default `true`, also when the block is absent. `false` turns the snapshots off. |
+| `backup.dir` | Where snapshots go. Empty: `backups/` next to `users.db`. A relative path is relative to the server's working directory. |
+| `backup.keep` | How many snapshots are kept. Default 7, also for 0 or less. |
+
+Snapshots on the same disk are lost with that disk. To keep a copy elsewhere, log in as
+an admin and open `/api/admin/users-backup` in the same browser: it downloads a fresh
+snapshot (`corescope-users-<YYYYMMDD-HHMMSS>.db`) and records it in the audit log
+(`user.backup`). Store the download encrypted: it holds every password hash and address.
+The analyzer database has its own backup route, `GET /api/backup`.
+
+**What a restore brings back.** `users.db` returns to the moment of the snapshot:
+
+- accounts deleted after it, including accounts users deleted themselves;
+- old passwords of users who changed them since;
+- sessions that were logged out or revoked since (valid again until they expire, for
+  anyone who still holds the cookie);
+- activation, reset and email change links used since (valid again until they expire).
+
+The audit log is replaced too, so note the deletions before you overwrite it.
+
+**Restore** (not automated). The commands use the `sqlite3` command-line tool; replace
+`2026-10-08 12:00:00` with the snapshot's time from its file name (UTC).
+
+1. Stop the server.
+2. List the accounts deleted since the snapshot, from the current `users.db`:
+
+   ```sh
+   sqlite3 users.db "SELECT target_user_id, action, datetime(at, 'unixepoch') FROM audit_log
+     WHERE action IN ('user.delete', 'user.delete.self')
+       AND at >= CAST(strftime('%s', '2026-10-08 12:00:00') AS INTEGER);"
+   ```
+
+3. Copy the snapshot over `users.db`, and delete `users.db-wal` and `users.db-shm` if
+   they exist.
+4. Still with the server stopped, disable the accounts from step 2 (replace `12, 34`
+   with their ids) and clear all sessions and links, so everyone logs in again:
+
+   ```sh
+   sqlite3 users.db "UPDATE users SET status = 'disabled' WHERE id IN (12, 34);
+     DELETE FROM sessions; DELETE FROM tokens;"
+   ```
+
+5. Start the server.
+6. Delete the accounts from step 2 again in the admin area. Deleting there, not in
+   `sqlite3`, also replaces the addresses in the mail history with a hash and records
+   the deletion in the audit log.
+
+A snapshot made by a newer CoreScope version is refused at startup ("database schema
+version N is newer than this binary supports"): run that version or newer. Deleting
+`users.db` removes all accounts and nothing else.
 
 ## For users
 
@@ -205,6 +279,15 @@ database, and protect it the same way. Deleting it removes all accounts and noth
 - **My account:** change your display name, password or address, see your logged-in
   devices, or delete your account. A new address is confirmed from a link sent to it, and
   your old address gets a notice. Changing your password logs out your other devices.
+- **Download my data:** *My account, My data, Download my data* saves one JSON file with
+  your profile (including when and by whom the account was activated), logged-in devices,
+  synced settings, proposals, notification settings and watched nodes, and the history of
+  your account and of the mail sent to you (including the address each mail went to).
+  An address change you have not confirmed yet is included as `pendingEmail`. Password
+  hashes and login, link and unsubscribe tokens are not in it, and neither is the
+  server's internal bookkeeping of which notifications it already sent. Other accounts
+  in your history appear as a number only. Each download is recorded in the audit log
+  (`user.export`).
 - **Settings sync:** while you are logged in, your settings follow you: your nodes,
   favorites, theme and customizer settings, saved packet filters, and the filter, sort
   and view choices of each page. Log in on another browser or phone and they are
