@@ -11,6 +11,7 @@
  *
  * Usage: BASE_URL=http://localhost:39966 node test-filter-ux-e2e.js
  */
+process.exit(1); // TEMP: deliberate failure
 'use strict';
 const { chromium } = require('playwright');
 

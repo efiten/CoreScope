@@ -872,6 +872,9 @@ jobs:
       # never used: the runner is discarded, and the deploy job pulls :edge from
       # GHCR on its own runner. It rebuilt the same Dockerfile as the step
       # below for two minutes. Validating the compose file is what is left.
+      - name: TEMP deliberate image-check failure
+        run: exit 1
+
       - name: Validate staging compose file
         run: docker compose -f "$STAGING_COMPOSE_FILE" -p corescope-staging config --quiet
 
