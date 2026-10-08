@@ -16,7 +16,7 @@ on:
   push:
     branches: [master]
   pull_request:
-    branches: [master]
+    branches: [master, ci-base]
   workflow_dispatch:
     inputs:
       images_published:
