@@ -10,6 +10,9 @@
   // layer: 'signal' (default, per-cell best SNR of directly-heard nodes) or
   // 'noise' (RF noise-floor layer, opt-in — see MC_CLIENT_RF_SAMPLES).
   var layer = 'signal';
+  // mine: "My coverage": the signal layer only shows coverage collected by
+  // companions linked to the logged-in user (/api/rx-coverage?mine=1).
+  var mine = false;
 
   function cssColor(varName) {
     try { return getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || '#888'; }
@@ -28,6 +31,26 @@
   function dayBtn(d) { return '<button data-days="' + d + '"' + (d === days ? ' class="active"' : '') + ' aria-pressed="' + (d === days ? 'true' : 'false') + '">' + (d === 1 ? '24h' : d + 'd') + '</button>'; }
 
   function layerBtn(k, label) { return '<button data-layer="' + k + '"' + (k === layer ? ' class="active"' : '') + ' aria-pressed="' + (k === layer ? 'true' : 'false') + '">' + label + '</button>'; }
+
+  // mineBtnHtml renders the "My coverage" toggle, or nothing for a visitor
+  // who is not logged in (?mine=1 needs a session).
+  function mineBtnHtml(user, on) {
+    if (!user) return '';
+    return '<button data-mine="1"' + (on ? ' class="active"' : '') + ' aria-pressed="' + (on ? 'true' : 'false') + '"' +
+      ' title="Only coverage collected by companions linked to your account">My coverage</button>';
+  }
+
+  // coverageUrl builds the signal-layer request.
+  function coverageUrl(bbox, z, d, rx, mineOn) {
+    return '/api/rx-coverage?bbox=' + bbox + '&z=' + z + '&days=' + d +
+      (rx ? '&rx=' + encodeURIComponent(rx) : '') + (mineOn ? '&mine=1' : '');
+  }
+
+  // authUser is the logged-in user, or null (accounts off, logged out, or
+  // auth.js not loaded).
+  function authUser(auth) {
+    return auth && auth.isEnabled && auth.isEnabled() && auth.user ? (auth.user() || null) : null;
+  }
 
   // NOISE_QUIET_MAX / NOISE_BUSY_MIN (dBm) bucket the noise layer into 3 tiers.
   // Fitted to observed data (#4): 1241 production moving samples
@@ -82,6 +105,7 @@
       '<h2 style="margin:4px 0 2px;font-size:18px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Mobile RX coverage</h2>' +
       '<div style="color:var(--text-muted);font-size:11px" id="rxSubtitle">' + subtitleHtml() + '</div>' +
       '<div class="analytics-time-range" id="rxDays" style="margin:8px 0">' + dayBtn(1) + dayBtn(7) + dayBtn(14) + dayBtn(30) + '</div>' +
+      '<div class="analytics-time-range" id="rxMineBar" style="margin:8px 0" hidden></div>' +
       layerBar +
       legendHtml() +
       '<div style="position:relative">' +
@@ -153,7 +177,8 @@
   }
 
   function drawSignalLayer(bbox) {
-    var url = '/api/rx-coverage?bbox=' + bbox + '&z=' + map.getZoom() + '&days=' + days + (selectedRx ? '&rx=' + encodeURIComponent(selectedRx) : '');
+    // Until auth.js has answered, mine is never sent (it would answer 401).
+    var url = coverageUrl(bbox, map.getZoom(), days, selectedRx, mine && !!authUser(window.CSAuth));
     fetch(url).then(function (r) { return r.json(); }).then(function (fc) {
       if (destroyed || !covLayer || layer !== 'signal') return;
       covLayer.clearLayers();
@@ -364,7 +389,7 @@
   }
 
   function syncHash() {
-    var q = 'days=' + days + (selectedRx ? '&rx=' + encodeURIComponent(selectedRx) : '') + (layer !== 'signal' ? '&layer=' + layer : '');
+    var q = 'days=' + days + (selectedRx ? '&rx=' + encodeURIComponent(selectedRx) : '') + (layer !== 'signal' ? '&layer=' + layer : '') + (mine ? '&mine=1' : '');
     if (map) {
       var c = map.getCenter();
       q += '&lat=' + c.lat.toFixed(5) + '&lon=' + c.lng.toFixed(5) + '&zoom=' + map.getZoom();
@@ -388,13 +413,14 @@
       container.innerHTML = '<div class="nq-msg">Coverage is not enabled on this deployment.</div>';
       return;
     }
-    selectedRx = ''; selectedName = ''; days = 7; boardCache = []; layer = 'signal';
+    selectedRx = ''; selectedName = ''; days = 7; boardCache = []; layer = 'signal'; mine = false;
     try {
       var p = (typeof getHashParams === 'function') ? getHashParams() : null;
       if (p) {
         var dd = parseInt(p.get('days'), 10); if ([1, 7, 14, 30].indexOf(dd) >= 0) days = dd;
         selectedRx = (p.get('rx') || '').toLowerCase();
         if (window.MC_CLIENT_RF_SAMPLES && p.get('layer') === 'noise') layer = 'noise';
+        mine = p.get('mine') === '1';
       }
     } catch (e) {}
     container.innerHTML = pageHtml();
@@ -437,8 +463,44 @@
     if (bar) bar.addEventListener('click', function (e) { var b = e.target.closest('button[data-days]'); if (b) setDays(+b.dataset.days); });
     var layerBar = document.getElementById('rxLayerBar');
     if (layerBar) layerBar.addEventListener('click', function (e) { var b = e.target.closest('button[data-layer]'); if (b) setLayer(b.dataset.layer); });
+    var mineBar = document.getElementById('rxMineBar');
+    if (mineBar) mineBar.addEventListener('click', function (e) { var b = e.target.closest('button[data-mine]'); if (b) setMine(!mine); });
+    // The toggle waits for auth.js's first /api/auth/me; a mine=1 link from a
+    // logged-in user then redraws with the filter.
+    Promise.resolve(window.CSAuth && window.CSAuth.ready ? window.CSAuth.ready() : null).then(function () {
+      if (destroyed || current !== generation) return;
+      renderMine();
+      if (mine && map) drawCoverage();
+    });
     setTimeout(function () { if (!destroyed && current === generation && map) { map.invalidateSize(); if (selectedRx && !explicitViewport) fitToObserver(); else drawCoverage(); } }, 150);
     loadBoard();
+  }
+
+  // renderMine shows the toggle to a logged-in user only; without one the
+  // toggle is off (a mine=1 link opened while logged out is ignored).
+  function renderMine() {
+    var user = authUser(window.CSAuth);
+    if (!user) mine = false;
+    var bar = document.getElementById('rxMineBar');
+    if (!bar) return;
+    bar.innerHTML = mineBtnHtml(user, mine);
+    bar.hidden = !user;
+  }
+
+  function setMine(on) {
+    if (on === mine) return;
+    mine = on;
+    renderMine();
+    drawCoverage(); syncHash();
+  }
+
+  // Logging in or out while the page is open shows or hides the toggle; a
+  // logout with the toggle on redraws everyone's coverage.
+  function onAuthChanged() {
+    if (destroyed || !map) return;
+    var was = mine;
+    renderMine();
+    if (was !== mine) { drawCoverage(); syncHash(); }
   }
 
   function destroy() {
@@ -448,5 +510,7 @@
     covLayer = null;
   }
 
+  if (window.addEventListener) window.addEventListener('cs-auth-changed', onAuthChanged);
+  window.CSRxCoverage = { _test: { coverageUrl: coverageUrl, mineBtnHtml: mineBtnHtml, authUser: authUser } };
   registerPage('rx-coverage', { init: init, destroy: destroy });
 })();
