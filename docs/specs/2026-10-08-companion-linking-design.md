@@ -1,7 +1,7 @@
 # Companion Linking (User Management, Sub-project F), Design Spec
 
 **Date:** 2026-10-08
-**Status:** Approved (design). Not implemented.
+**Status:** Implemented in three PRs: users store, server, ingestor + frontend.
 **Scope:** sub-project **F** of the optional user-management track. Builds on A
 (accounts, sessions), B (settings sync, `meshcore-my-nodes`) and E (notifications).
 The client side lives in CoreDrive RX (`efiten/coredrive-rx`,
@@ -127,7 +127,7 @@ the rest of A–E. Rate limits use the existing token buckets (per IP and per us
 - `GET /api/account/companions` → `[{pubkey, name, linkedAt, lastSeenAt}]`.
 - `DELETE /api/account/companions/{pubkey}` → 204.
 - Admin: `GET /api/admin/users/{id}` gains `companions`. The audit kinds are
-  `companion.link`, `companion.unlink` and `companion.transfer`.
+  `companion_link`, `companion_unlink` and `companion_transfer`.
 
 ### Coverage attribution
 

@@ -10,11 +10,6 @@
   // layer: 'signal' (default, per-cell best SNR of directly-heard nodes) or
   // 'noise' (RF noise-floor layer, opt-in — see MC_CLIENT_RF_SAMPLES).
   var layer = 'signal';
-  // mine: "My coverage": the signal layer only shows coverage collected by
-  // companions linked to the logged-in user (/api/rx-coverage?mine=1).
-  var mine = false;
-  // signalSeq numbers signal-layer requests; only the newest reply is drawn.
-  var signalSeq = 0;
   // showGaps: on the signal layer, also draw cells a companion drove through
   // with nothing received (/api/rx-coverage?gaps=1). Needs the RF sample
   // track, so only offered with MC_CLIENT_RF_SAMPLES. Default on.
@@ -24,6 +19,11 @@
   var gapRenderer = null;
 
   function gapsAvailable() { return !!window.MC_CLIENT_RF_SAMPLES; }
+  // mine: "My coverage": the signal layer only shows coverage collected by
+  // companions linked to the logged-in user (/api/rx-coverage?mine=1).
+  var mine = false;
+  // signalSeq numbers signal-layer requests; only the newest reply is drawn.
+  var signalSeq = 0;
 
   function cssColor(varName) {
     try { return getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || '#888'; }
@@ -106,7 +106,7 @@
       '<span><i style="background:var(--nq-cov-mid)"></i>medium</span>' +
       '<span><i style="background:var(--nq-cov-weak)"></i>weak</span>' +
       '<span><i style="background:var(--nq-cov-grey)"></i>no signal</span>' +
-      (gapsAvailable() && showGaps ? '<span><i class="nq-cov-gap-swatch"></i>driven, nothing received</span>' : '') +
+      (gapsAvailable() && showGaps && !mine ? '<span><i class="nq-cov-gap-swatch"></i>driven, nothing received</span>' : '') +
       '</div>';
   }
 
@@ -241,6 +241,7 @@
   function drawSignalLayer(bbox) {
     // Until auth.js has answered, mine is never sent (it would answer 401).
     var mineSent = mine && !!authUser(window.CSAuth);
+    // Gaps need a single companion's track, so not with mine (the server omits them too).
     var wantGaps = gapsAvailable() && showGaps && !mineSent;
     var url = coverageUrl(bbox, map.getZoom(), days, selectedRx, mineSent) + (wantGaps ? '&gaps=1' : '');
     var seq = ++signalSeq;
@@ -516,8 +517,8 @@
         var dd = parseInt(p.get('days'), 10); if ([1, 7, 14, 30].indexOf(dd) >= 0) days = dd;
         selectedRx = (p.get('rx') || '').toLowerCase();
         if (window.MC_CLIENT_RF_SAMPLES && p.get('layer') === 'noise') layer = 'noise';
-        mine = p.get('mine') === '1';
         if (p.get('gaps') === '0') showGaps = false;
+        mine = p.get('mine') === '1';
       }
     } catch (e) {}
     container.innerHTML = pageHtml();
@@ -560,6 +561,8 @@
     if (bar) bar.addEventListener('click', function (e) { var b = e.target.closest('button[data-days]'); if (b) setDays(+b.dataset.days); });
     var layerBar = document.getElementById('rxLayerBar');
     if (layerBar) layerBar.addEventListener('click', function (e) { var b = e.target.closest('button[data-layer]'); if (b) setLayer(b.dataset.layer); });
+    var gapsBtn = document.getElementById('rxGapsBtn');
+    if (gapsBtn) gapsBtn.addEventListener('click', function () { setGaps(!showGaps); });
     var mineBar = document.getElementById('rxMineBar');
     if (mineBar) mineBar.addEventListener('click', function (e) { var b = e.target.closest('button[data-mine]'); if (b) setMine(!mine); });
     // The toggle waits for auth.js's first /api/auth/me; a mine=1 link from a
@@ -569,8 +572,6 @@
       renderMine();
       if (mine && map) drawCoverage();
     });
-    var gapsBtn = document.getElementById('rxGapsBtn');
-    if (gapsBtn) gapsBtn.addEventListener('click', function () { setGaps(!showGaps); });
     setTimeout(function () { if (!destroyed && current === generation && map) { map.invalidateSize(); if (selectedRx && !explicitViewport) fitToObserver(); else drawCoverage(); } }, 150);
     loadBoard();
   }
@@ -590,6 +591,8 @@
     if (on === mine) return;
     mine = on;
     renderMine();
+    var legend = document.getElementById('rxLegend');
+    if (legend) legend.outerHTML = legendHtml();
     drawCoverage(); syncHash();
   }
 

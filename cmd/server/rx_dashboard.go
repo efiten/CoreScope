@@ -244,8 +244,9 @@ func (s *Server) handleRxCoverage(w http.ResponseWriter, r *http.Request) {
 	fc := aggregateCoverage(rows, zoomToHexRes(z), s.heardKeyResolverFor(rows))
 	// "Nothing received" cells need the track, so only with the RF sample
 	// stream on; with ?node= the question would be "this node not heard",
-	// which these cells do not answer.
-	if r.URL.Query().Get("gaps") == "1" && node == "" && r.URL.Query().Get("mine") != "1" && s.cfg.ClientRfSamplesEnabled() {
+	// which these cells do not answer. Not with ?mine=1 either: the track
+	// query cannot narrow to a set of companions yet.
+	if r.URL.Query().Get("gaps") == "1" && node == "" && mine == nil && s.cfg.ClientRfSamplesEnabled() {
 		track, err := s.queryTrackPoints(rx, days, b)
 		if err != nil {
 			http.Error(w, "query failed", http.StatusInternalServerError)
