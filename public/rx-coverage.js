@@ -15,6 +15,15 @@
   var mine = false;
   // signalSeq numbers signal-layer requests; only the newest reply is drawn.
   var signalSeq = 0;
+  // showGaps: on the signal layer, also draw cells a companion drove through
+  // with nothing received (/api/rx-coverage?gaps=1). Needs the RF sample
+  // track, so only offered with MC_CLIENT_RF_SAMPLES. Default on.
+  var showGaps = true;
+  // gapRenderer: an SVG renderer of its own, added before the coverage
+  // polygons so gap cells sit underneath them and it can hold the hatch <defs>.
+  var gapRenderer = null;
+
+  function gapsAvailable() { return !!window.MC_CLIENT_RF_SAMPLES; }
 
   function cssColor(varName) {
     try { return getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || '#888'; }
@@ -97,7 +106,48 @@
       '<span><i style="background:var(--nq-cov-mid)"></i>medium</span>' +
       '<span><i style="background:var(--nq-cov-weak)"></i>weak</span>' +
       '<span><i style="background:var(--nq-cov-grey)"></i>no signal</span>' +
+      (gapsAvailable() && showGaps ? '<span><i class="nq-cov-gap-swatch"></i>driven, nothing received</span>' : '') +
       '</div>';
+  }
+
+  function gapsBtnHtml() {
+    return '<button id="rxGapsBtn" data-gaps="1"' + (showGaps ? ' class="active"' : '') + ' aria-pressed="' + (showGaps ? 'true' : 'false') + '"' +
+      ' title="Cells a companion drove through in this period without receiving anything. This is not proof of no coverage: at the edge of a node\'s range, another drive may well receive something.">Nothing received</button>';
+  }
+
+  // gapFillOpacity: denser hatch for cells driven through more often (1 / 2-3 / 4+ samples).
+  function gapFillOpacity(p) {
+    var n = p ? Number(p.samples) : 0;
+    return n >= 4 ? 0.95 : n >= 2 ? 0.75 : 0.55;
+  }
+
+  function gapCellHtml(p) {
+    if (!p) return '';
+    return '<div style="font-weight:600;margin-bottom:4px">Nothing received here in this period</div>' +
+      '<div style="font-size:12px;color:var(--text-muted)">' + p.samples + (p.samples === 1 ? ' track sample' : ' track samples') + ' while driving</div>';
+  }
+
+  // ensureGapHatch creates the gap renderer once per map and puts the 45-degree
+  // hatch pattern in its <svg>, coloured by --nq-cov-gap so themes follow.
+  function ensureGapHatch() {
+    if (gapRenderer || !map) return;
+    gapRenderer = L.svg({ padding: 0.5 }).addTo(map);
+    var svg = gapRenderer._container;
+    if (!svg) return;
+    var ns = 'http://www.w3.org/2000/svg';
+    var defs = document.createElementNS(ns, 'defs');
+    var pat = document.createElementNS(ns, 'pattern');
+    pat.setAttribute('id', 'rxGapHatch');
+    pat.setAttribute('patternUnits', 'userSpaceOnUse');
+    pat.setAttribute('width', '6');
+    pat.setAttribute('height', '6');
+    pat.setAttribute('patternTransform', 'rotate(45)');
+    var line = document.createElementNS(ns, 'line');
+    line.setAttribute('x1', '0'); line.setAttribute('y1', '0'); line.setAttribute('x2', '0'); line.setAttribute('y2', '6');
+    line.setAttribute('style', 'stroke:var(--nq-cov-gap);stroke-width:2');
+    pat.appendChild(line);
+    defs.appendChild(pat);
+    svg.insertBefore(defs, svg.firstChild);
   }
 
   // subtitleHtml reflects the active layer (#7): the "Colour = ..." clause
@@ -110,7 +160,8 @@
 
   function pageHtml() {
     var layerBar = window.MC_CLIENT_RF_SAMPLES
-      ? '<div class="analytics-time-range" id="rxLayerBar" style="margin:8px 0">' + layerBtn('signal', 'Signal') + layerBtn('noise', 'Noise') + '</div>'
+      ? '<div class="analytics-time-range" id="rxLayerBar" style="margin:8px 0">' + layerBtn('signal', 'Signal') + layerBtn('noise', 'Noise') + '</div>' +
+        '<div class="analytics-time-range" id="rxGapsBar" style="margin:8px 0' + (layer === 'signal' ? '' : ';display:none') + '">' + gapsBtnHtml() + '</div>'
       : '';
     return '<div style="max-width:1100px;margin:0 auto;padding:12px 16px">' +
       '<h2 style="margin:4px 0 2px;font-size:18px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Mobile RX coverage</h2>' +
@@ -190,7 +241,8 @@
   function drawSignalLayer(bbox) {
     // Until auth.js has answered, mine is never sent (it would answer 401).
     var mineSent = mine && !!authUser(window.CSAuth);
-    var url = coverageUrl(bbox, map.getZoom(), days, selectedRx, mineSent);
+    var wantGaps = gapsAvailable() && showGaps && !mineSent;
+    var url = coverageUrl(bbox, map.getZoom(), days, selectedRx, mineSent) + (wantGaps ? '&gaps=1' : '');
     var seq = ++signalSeq;
     fetch(url).then(function (r) {
       var verdict = coverageReply(seq, signalSeq, r.status, mineSent);
@@ -205,6 +257,15 @@
       if (!fc || destroyed || !covLayer || layer !== 'signal') return;
       covLayer.clearLayers();
       setNoiseEmpty(false);
+      if (wantGaps && showGaps) {
+        ensureGapHatch();
+        var gapCol = cssColor('--nq-cov-gap');
+        (fc.gaps || []).forEach(function (f) {
+          var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
+          L.polygon(ring, { renderer: gapRenderer, color: gapCol, weight: 0.5, opacity: 0.6, fillColor: 'url(#rxGapHatch)', fillOpacity: gapFillOpacity(f.properties), className: 'rx-gap-cell' })
+            .addTo(covLayer).bindTooltip(gapCellHtml(f.properties));
+        });
+      }
       (fc.features || []).forEach(function (f) {
         var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
         var col = cssColor(colorVar(f.properties));
@@ -406,12 +467,25 @@
     if (legend) legend.outerHTML = legendHtml();
     var subtitle = document.getElementById('rxSubtitle');
     if (subtitle) subtitle.innerHTML = subtitleHtml();
+    var gapsBar = document.getElementById('rxGapsBar');
+    if (gapsBar) gapsBar.style.display = l === 'signal' ? '' : 'none';
     setNoiseEmpty(false);
     drawCoverage(); syncHash();
   }
 
+  // setGaps toggles the "nothing received" cells on the signal layer.
+  function setGaps(on) {
+    showGaps = on;
+    var btn = document.getElementById('rxGapsBtn');
+    if (btn) { btn.classList.toggle('active', on); btn.setAttribute('aria-pressed', on ? 'true' : 'false'); }
+    var legend = document.getElementById('rxLegend');
+    if (legend) legend.outerHTML = legendHtml();
+    if (covLayer) covLayer.clearLayers();
+    drawCoverage(); syncHash();
+  }
+
   function syncHash() {
-    var q = 'days=' + days + (selectedRx ? '&rx=' + encodeURIComponent(selectedRx) : '') + (layer !== 'signal' ? '&layer=' + layer : '') + (mine ? '&mine=1' : '');
+    var q = 'days=' + days + (selectedRx ? '&rx=' + encodeURIComponent(selectedRx) : '') + (layer !== 'signal' ? '&layer=' + layer : '') + (mine ? '&mine=1' : '') + (gapsAvailable() && !showGaps ? '&gaps=0' : '');
     if (map) {
       var c = map.getCenter();
       q += '&lat=' + c.lat.toFixed(5) + '&lon=' + c.lng.toFixed(5) + '&zoom=' + map.getZoom();
@@ -435,7 +509,7 @@
       container.innerHTML = '<div class="nq-msg">Coverage is not enabled on this deployment.</div>';
       return;
     }
-    selectedRx = ''; selectedName = ''; days = 7; boardCache = []; layer = 'signal'; mine = false;
+    selectedRx = ''; selectedName = ''; days = 7; boardCache = []; layer = 'signal'; mine = false; showGaps = true;
     try {
       var p = (typeof getHashParams === 'function') ? getHashParams() : null;
       if (p) {
@@ -443,6 +517,7 @@
         selectedRx = (p.get('rx') || '').toLowerCase();
         if (window.MC_CLIENT_RF_SAMPLES && p.get('layer') === 'noise') layer = 'noise';
         mine = p.get('mine') === '1';
+        if (p.get('gaps') === '0') showGaps = false;
       }
     } catch (e) {}
     container.innerHTML = pageHtml();
@@ -494,6 +569,8 @@
       renderMine();
       if (mine && map) drawCoverage();
     });
+    var gapsBtn = document.getElementById('rxGapsBtn');
+    if (gapsBtn) gapsBtn.addEventListener('click', function () { setGaps(!showGaps); });
     setTimeout(function () { if (!destroyed && current === generation && map) { map.invalidateSize(); if (selectedRx && !explicitViewport) fitToObserver(); else drawCoverage(); } }, 150);
     loadBoard();
   }
@@ -530,6 +607,7 @@
     generation++;
     if (map) { try { map.remove(); } catch (e) {} map = null; }
     covLayer = null;
+    gapRenderer = null;
   }
 
   if (window.addEventListener) window.addEventListener('cs-auth-changed', onAuthChanged);
