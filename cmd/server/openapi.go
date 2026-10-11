@@ -41,12 +41,13 @@ type paramMeta struct {
 func routeDescriptions() map[string]routeMeta {
 	return map[string]routeMeta{
 		// Config
-		"GET /api/config/cache":      {Summary: "Get cache configuration", Tag: "config"},
-		"GET /api/config/client":     {Summary: "Get client configuration", Tag: "config"},
-		"GET /api/config/regions":    {Summary: "Get configured regions", Tag: "config"},
-		"GET /api/config/theme":      {Summary: "Get theme configuration", Description: "Returns color maps, CSS variables, and theme defaults.", Tag: "config"},
-		"GET /api/config/map":        {Summary: "Get map configuration", Tag: "config"},
-		"GET /api/config/geo-filter": {Summary: "Get geo-filter configuration", Tag: "config"},
+		"GET /api/config/cache":              {Summary: "Get cache configuration", Tag: "config"},
+		"GET /api/config/client":             {Summary: "Get client configuration", Tag: "config"},
+		"GET /api/config/regions":            {Summary: "Get configured regions", Tag: "config"},
+		"GET /api/config/region-quick-picks": {Summary: "Get region quick picks", Description: "Named groups of region (IATA) codes from config regionQuickPicks, offered as one-tap choices by the region filter. Always a list; empty when none are configured.", Tag: "config"},
+		"GET /api/config/theme":              {Summary: "Get theme configuration", Description: "Returns color maps, CSS variables, and theme defaults.", Tag: "config"},
+		"GET /api/config/map":                {Summary: "Get map configuration", Tag: "config"},
+		"GET /api/config/geo-filter":         {Summary: "Get geo-filter configuration", Tag: "config"},
 
 		// Admin / system
 		"GET /api/health":      {Summary: "Health check", Description: "Returns server health, uptime, and memory stats.", Tag: "admin"},
@@ -100,7 +101,8 @@ func routeDescriptions() map[string]routeMeta {
 		"POST /api/admin/proposals/{id}/approve":           {Summary: "Approve a proposal (admin)", Description: "Body {note} (at most 500 characters). Pending only (409 otherwise). The ingestor decrypts the channel from its next refresh (at most a minute) and /api/channels lists it in approvedChannels. 409 when userManagement.channelProposals.maxApproved channels are approved.", Tag: "users", Session: true},
 		"POST /api/admin/proposals/{id}/reject":            {Summary: "Reject a proposal (admin)", Description: "Body {note}. Pending only (409 otherwise). The name cannot be proposed again until the row is pruned, 90 days after the decision.", Tag: "users", Session: true},
 		"POST /api/admin/proposals/{id}/revoke":            {Summary: "Revoke an approved proposal (admin)", Description: "Body {note}. Approved only (409 otherwise). The ingestor stops decrypting the channel from its next refresh unless the channel is configured; stored messages stay. The name can be proposed again.", Tag: "users", Session: true},
-		"POST /api/mail/brevo/webhook":                     {Summary: "Brevo delivery-event webhook", Description: "Authenticated with Authorization: Bearer <userManagement.mail.webhookSecret>. Registered only when the secret is set.", Tag: "users"},
+		"POST /api/mail/brevo/webhook":                     {Summary: "Brevo delivery-event webhook", Description: "Authenticated with Authorization: Bearer <userManagement.mail.webhookSecret>. Registered only when mail.provider is brevo and the secret is set.", Tag: "users"},
+		"POST /api/mail/postal/webhook":                    {Summary: "Postal message-event webhook", Description: "Authenticated with HTTP Basic auth whose password is userManagement.mail.webhookSecret (put it in the webhook URL: https://postal:<secret>@host/api/mail/postal/webhook). Registered only when mail.provider is postal and the secret is set.", Tag: "users"},
 
 		// Node notifications (user management, part E)
 		"GET /api/account/notifications":                     {Summary: "Get own notification settings", Description: "Returns {enabled, events, availableEvents, externalLabel, watches: [{pubkey, name, known, createdAt}], limits: {maxWatches, perUserPerDay, mailsLast24h}}. node.external and externalLabel appear only when notifications.externalAlerts is configured. Creates the default settings (on, node.offline and node.battery) on first use. known is false once the node left the analyzer database. Registered only when userManagement.notifications.enabled.", Tag: "users", Session: true},
@@ -169,6 +171,9 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/scope-audit": {Summary: "Network-wide scope audit", Description: "For every repeater that has answered a declared-regions request: the regions it declares, which of those it has NOT been observed forwarding in the window, which scopes it forwards without declaring, and whether it forwards unscoped floods while omitting the '*' wildcard. '*' is never listed as a region — it governs unscoped floods, not a scope. Repeaters never successfully asked are absent rather than shown as declaring nothing. Rows with missing regions sort first; a short window is weak evidence, since a quiet region simply has no traffic.", Tag: "analytics",
 			QueryParams: []paramMeta{
 				{Name: "window", Description: "Time window: 1h, 24h, or 7d (default 24h)", Type: "string"},
+				{Name: "mode", Description: "declared (default) or transport", Type: "string"},
+				{Name: "scope", Description: "mode=transport only: region scope to split the fleet by", Type: "string"},
+				{Name: "region", Description: "Observer IATA codes, comma-separated: count only forwarding heard by observers there. All means no filter", Type: "string"},
 			}},
 		"GET /api/nodes/{pubkey}/scopes": {Summary: "Get node scope conformance and declared regions", Description: "Returns the region scopes this repeater has been observed forwarding (matched/unmatched/unscoped, plus route-type mix) alongside its most recently declared region list, if any. declared is null when the repeater has never successfully answered a declared-regions request.", Tag: "nodes",
 			QueryParams: []paramMeta{

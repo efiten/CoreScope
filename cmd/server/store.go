@@ -64,9 +64,10 @@ type StoreTx struct {
 	AdvertRouteEvidence uint8                  // union of known flood/direct-empty-path evidence
 	decodedOnce         sync.Once              // guards parsedDecoded
 	parsedDecoded       map[string]interface{} // cached json.Unmarshal of DecodedJSON
-	// Dedup map: "observerID|pathJSON" → true for O(1) duplicate checks
-	obsKeys     map[string]bool
-	observerSet map[string]bool // unique observer IDs (for UniqueObserverCount)
+	// Dedup maps, built only once a transmission passes obsIndexThreshold
+	// observations (see obs_dedup.go); nil below it.
+	obsKeys     map[obsDedupKey]struct{}
+	observerSet map[string]struct{} // distinct observer IDs (for UniqueObserverCount)
 	// accountedBytes is what trackedBytes was last charged for this tx
 	// (observations excluded). See rechargeTx.
 	accountedBytes int64
@@ -295,10 +296,12 @@ type PacketStore struct {
 	// Precomputed subpath index: raw comma-joined hops → occurrence count.
 	// Built during Load(), incrementally updated on ingest. Avoids full
 	// packet iteration at query time (O(unique_subpaths) vs O(total_packets)).
-	spIndex      map[string]int        // "hop1,hop2" → count
-	spTxIndex    map[string][]*StoreTx // "hop1,hop2" → transmissions containing this subpath
-	spTotalPaths int                   // transmissions with paths >= 2 hops
-	// Background-build ready gates for spIndex/spTxIndex and byPathHop
+	// "hop1,hop2" → transmissions containing this subpath, one entry per
+	// occurrence. The subpath's count is len(spTxIndex[key]); a separate
+	// key → count map used to hold the same 1M+ keys a second time.
+	spTxIndex    map[string][]*StoreTx
+	spTotalPaths int // transmissions with paths >= 2 hops
+	// Background-build ready gates for spTxIndex and byPathHop
 	// (#1008). Flipped from false→true exactly once by the goroutine
 	// kicked off in Load() (or synchronously by the background chunk
 	// loader). Handlers gate reads via SubpathIndexReady() /
@@ -740,7 +743,6 @@ func NewPacketStore(db *DB, cfg *PacketStoreConfig, cacheTTLs ...map[string]inte
 		rfCacheTTL:           60 * time.Second,
 		collisionCacheTTL:    3600 * time.Second,
 		invCooldown:          300 * time.Second,
-		spIndex:              make(map[string]int, 4096),
 		spTxIndex:            make(map[string][]*StoreTx, 4096),
 		advertPubkeys:        make(map[string]int),
 		pathHopResolved:      make(map[*StoreTx][]string),
@@ -969,8 +971,6 @@ func (s *PacketStore) Load() error {
 				PayloadType: nullIntPtr(payloadType),
 				DecodedJSON: nullStrVal(decodedJSON),
 				ScopeName:   nullStrPtr(scopeName),
-				obsKeys:     make(map[string]bool),
-				observerSet: make(map[string]bool),
 			}
 			s.byHash[hashStr] = tx
 			s.packets = append(s.packets, tx)
@@ -993,8 +993,7 @@ func (s *PacketStore) Load() error {
 			obsPJ := nullStrVal(pathJSON)
 
 			// Dedup: skip if same observer + same path already loaded (O(1) map lookup)
-			dk := obsIDStr + "|" + obsPJ
-			if tx.obsKeys[dk] {
+			if tx.hasObservation(obsIDStr, obsPJ) {
 				continue
 			}
 
@@ -1036,13 +1035,7 @@ func (s *PacketStore) Load() error {
 				}
 			}
 
-			tx.Observations = append(tx.Observations, obs)
-			tx.obsKeys[dk] = true
-			if obs.ObserverID != "" && !tx.observerSet[obs.ObserverID] {
-				tx.observerSet[obs.ObserverID] = true
-				tx.UniqueObserverCount++
-			}
-			tx.ObservationCount++
+			tx.addObservation(obs)
 			if obs.Timestamp > tx.LatestSeen {
 				tx.LatestSeen = obs.Timestamp
 			}
@@ -1145,7 +1138,7 @@ func (s *PacketStore) Load() error {
 // The chunk is assumed to be older than the data already in the store, so
 // localPackets are prepended to s.packets.
 //
-// byPayloadType is updated here incrementally. byPathHop, spIndex, and
+// byPayloadType is updated here incrementally. byPathHop, spTxIndex and
 // distHops are NOT updated here — the caller (loadBackgroundChunks) rebuilds
 // those once after all chunks are merged.
 
@@ -1313,8 +1306,6 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 				PayloadType: nullIntPtr(payloadType),
 				DecodedJSON: nullStrVal(decodedJSON),
 				ScopeName:   nullStrPtr(scopeName),
-				obsKeys:     make(map[string]bool),
-				observerSet: make(map[string]bool),
 			}
 			localByHash[hashStr] = tx
 			localPackets = append(localPackets, tx)
@@ -1330,8 +1321,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 			obsIDStr := nullStrVal(observerID)
 			obsPJ := nullStrVal(pathJSON)
 
-			dk := obsIDStr + "|" + obsPJ
-			if tx.obsKeys[dk] {
+			if tx.hasObservation(obsIDStr, obsPJ) {
 				continue
 			}
 
@@ -1348,13 +1338,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
 			}
 
-			tx.Observations = append(tx.Observations, obs)
-			tx.obsKeys[dk] = true
-			if obs.ObserverID != "" && !tx.observerSet[obs.ObserverID] {
-				tx.observerSet[obs.ObserverID] = true
-				tx.UniqueObserverCount++
-			}
-			tx.ObservationCount++
+			tx.addObservation(obs)
 			if obs.Timestamp > tx.LatestSeen {
 				tx.LatestSeen = obs.Timestamp
 			}
@@ -2943,8 +2927,6 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				PayloadType: r.payloadType,
 				DecodedJSON: r.decodedJSON,
 				ScopeName:   r.scopeName,
-				obsKeys:     make(map[string]bool),
-				observerSet: make(map[string]bool),
 			}
 			s.byHash[r.hash] = tx
 			s.packets = append(s.packets, tx) // oldest-first; new items go to tail
@@ -2976,12 +2958,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		if r.obsID != nil {
 			oid := *r.obsID
 			// Dedup (O(1) map lookup)
-			dk := r.observerID + "|" + r.pathJSON
-			if tx.obsKeys == nil {
-				tx.obsKeys = make(map[string]bool)
-				tx.observerSet = make(map[string]bool)
-			}
-			if tx.obsKeys[dk] {
+			if tx.hasObservation(r.observerID, r.pathJSON) {
 				continue
 			}
 
@@ -3016,13 +2993,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				}
 				broadcastRP[*r.obsID] = rpForBroadcast
 			}
-			tx.Observations = append(tx.Observations, obs)
-			tx.obsKeys[dk] = true
-			if obs.ObserverID != "" && !tx.observerSet[obs.ObserverID] {
-				tx.observerSet[obs.ObserverID] = true
-				tx.UniqueObserverCount++
-			}
-			tx.ObservationCount++
+			tx.addObservation(obs)
 			if obs.Timestamp > tx.LatestSeen {
 				tx.LatestSeen = obs.Timestamp
 			}
@@ -3046,7 +3017,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 
 	// Incrementally update precomputed subpath index with new transmissions
 	for _, tx := range broadcastTxs {
-		if addTxToSubpathIndexFull(s.spIndex, s.spTxIndex, tx) {
+		if addTxToSubpathIndex(s.spTxIndex, tx) {
 			s.spTotalPaths++
 		}
 		addTxToPathHopIndex(s.byPathHop, tx)
@@ -3306,12 +3277,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 		}
 
 		// Dedup by observer + path (O(1) map lookup)
-		dk := r.observerID + "|" + r.pathJSON
-		if tx.obsKeys == nil {
-			tx.obsKeys = make(map[string]bool)
-			tx.observerSet = make(map[string]bool)
-		}
-		if tx.obsKeys[dk] {
+		if tx.hasObservation(r.observerID, r.pathJSON) {
 			continue
 		}
 
@@ -3351,13 +3317,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 			obsRPMap[r.obsID] = obsResolvedPath
 		}
 
-		tx.Observations = append(tx.Observations, obs)
-		tx.obsKeys[dk] = true
-		if obs.ObserverID != "" && !tx.observerSet[obs.ObserverID] {
-			tx.observerSet[obs.ObserverID] = true
-			tx.UniqueObserverCount++
-		}
-		tx.ObservationCount++
+		tx.addObservation(obs)
 		newObs = append(newObs, obs)
 		if obs.Timestamp > tx.LatestSeen {
 			tx.LatestSeen = obs.Timestamp
@@ -3449,7 +3409,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 				// Temporarily set parsedPath to old hops for removal.
 				saved, savedFlag := tx.parsedPath, tx.pathParsed
 				tx.parsedPath, tx.pathParsed = oldHops, true
-				if removeTxFromSubpathIndexFull(s.spIndex, s.spTxIndex, tx) {
+				if removeTxFromSubpathIndex(s.spTxIndex, tx) {
 					s.spTotalPaths--
 				}
 				tx.parsedPath, tx.pathParsed = saved, savedFlag
@@ -3464,7 +3424,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 			}
 			// pickBestObservation already set pathParsed=false so
 			// addTxToSubpathIndex will re-parse the new path.
-			if addTxToSubpathIndexFull(s.spIndex, s.spTxIndex, tx) {
+			if addTxToSubpathIndex(s.spTxIndex, tx) {
 				s.spTotalPaths++
 			}
 			addTxToPathHopIndex(s.byPathHop, tx)
@@ -4256,16 +4216,10 @@ func txGetParsedPath(tx *StoreTx) []string {
 	return tx.parsedPath
 }
 
-// addTxToSubpathIndex extracts all raw subpaths (lengths 2–8) from tx and
-// increments their counts in the index.  Returns true if the tx contributed
-// (path had ≥ 2 hops).
-func addTxToSubpathIndex(idx map[string]int, tx *StoreTx) bool {
-	return addTxToSubpathIndexFull(idx, nil, tx)
-}
-
-// addTxToSubpathIndexFull is like addTxToSubpathIndex but also appends
-// tx to txIdx for each subpath key (if txIdx is non-nil).
-func addTxToSubpathIndexFull(idx map[string]int, txIdx map[string][]*StoreTx, tx *StoreTx) bool {
+// addTxToSubpathIndex appends tx to txIdx under every raw subpath (lengths
+// 2–8) of its path, once per occurrence, so len(txIdx[key]) is the subpath's
+// count. Returns true if the tx contributed (path had ≥ 2 hops).
+func addTxToSubpathIndex(txIdx map[string][]*StoreTx, tx *StoreTx) bool {
 	hops := txGetParsedPath(tx)
 	if len(hops) < 2 {
 		return false
@@ -4274,25 +4228,16 @@ func addTxToSubpathIndexFull(idx map[string]int, txIdx map[string][]*StoreTx, tx
 	for l := 2; l <= maxL; l++ {
 		for start := 0; start <= len(hops)-l; start++ {
 			key := strings.ToLower(strings.Join(hops[start:start+l], ","))
-			idx[key]++
-			if txIdx != nil {
-				txIdx[key] = append(txIdx[key], tx)
-			}
+			txIdx[key] = append(txIdx[key], tx)
 		}
 	}
 	return true
 }
 
-// removeTxFromSubpathIndex is the inverse of addTxToSubpathIndex — it
-// decrements counts for all raw subpaths of tx.  Returns true if the tx
-// had a path.
-func removeTxFromSubpathIndex(idx map[string]int, tx *StoreTx) bool {
-	return removeTxFromSubpathIndexFull(idx, nil, tx)
-}
-
-// removeTxFromSubpathIndexFull is like removeTxFromSubpathIndex but also
-// removes tx from txIdx for each subpath key (if txIdx is non-nil).
-func removeTxFromSubpathIndexFull(idx map[string]int, txIdx map[string][]*StoreTx, tx *StoreTx) bool {
+// removeTxFromSubpathIndex is the inverse of addTxToSubpathIndex: it removes
+// one occurrence of tx per raw subpath of its path, and drops keys left
+// empty. Returns true if the tx had a path.
+func removeTxFromSubpathIndex(txIdx map[string][]*StoreTx, tx *StoreTx) bool {
 	hops := txGetParsedPath(tx)
 	if len(hops) < 2 {
 		return false
@@ -4301,40 +4246,35 @@ func removeTxFromSubpathIndexFull(idx map[string]int, txIdx map[string][]*StoreT
 	for l := 2; l <= maxL; l++ {
 		for start := 0; start <= len(hops)-l; start++ {
 			key := strings.ToLower(strings.Join(hops[start:start+l], ","))
-			idx[key]--
-			if idx[key] <= 0 {
-				delete(idx, key)
+			txs := txIdx[key]
+			for i, t := range txs {
+				if t == tx {
+					txs = append(txs[:i], txs[i+1:]...)
+					break
+				}
 			}
-			if txIdx != nil {
-				txs := txIdx[key]
-				for i, t := range txs {
-					if t == tx {
-						txIdx[key] = append(txs[:i], txs[i+1:]...)
-						break
-					}
-				}
-				if len(txIdx[key]) == 0 {
-					delete(txIdx, key)
-				}
+			if len(txs) == 0 {
+				delete(txIdx, key)
+			} else {
+				txIdx[key] = txs
 			}
 		}
 	}
 	return true
 }
 
-// buildSubpathIndex scans all packets and populates spIndex + spTotalPaths.
+// buildSubpathIndex scans all packets and populates spTxIndex + spTotalPaths.
 // Must be called with s.mu held.
 func (s *PacketStore) buildSubpathIndex() {
-	s.spIndex = make(map[string]int, 4096)
 	s.spTxIndex = make(map[string][]*StoreTx, 4096)
 	s.spTotalPaths = 0
 	for _, tx := range s.packets {
-		if addTxToSubpathIndexFull(s.spIndex, s.spTxIndex, tx) {
+		if addTxToSubpathIndex(s.spTxIndex, tx) {
 			s.spTotalPaths++
 		}
 	}
 	log.Printf("[store] Built subpath index: %d unique raw subpaths from %d paths",
-		len(s.spIndex), s.spTotalPaths)
+		len(s.spTxIndex), s.spTotalPaths)
 }
 
 // buildPathHopIndex rebuilds byPathHop: raw wire hops from every packet's
@@ -4815,7 +4755,7 @@ func (s *PacketStore) buildDistanceIndex() {
 //
 // Issue #743: Previous estimates missed major per-packet allocations:
 // - spTxIndex: O(path²) entries per tx (50-150MB at scale)
-// - Per-tx maps: obsKeys, observerSet (~11MB at scale)
+// - Per-tx dedup maps (now only past obsIndexThreshold observations)
 // - byPathHop index entries (20-40MB at scale)
 // Note: ResolvedPath per-obs overhead eliminated by #800 refactor.
 const (
@@ -4825,9 +4765,6 @@ const (
 	indexEntryBytes   = 48  // average cost of one index map entry (key + pointer + bucket overhead)
 	numIndexesPerTx   = 5   // byHash, byTxID, byNode, byPayloadType, nodeHashes entries
 	numIndexesPerObs  = 2   // byObsID, byObserver entries
-
-	// Per-tx map overhead (obsKeys + observerSet): map header + initial buckets
-	perTxMapsBytes = 200
 
 	// Per path hop: byPathHop index entry (pointer + map bucket)
 	perPathHopBytes = 50
@@ -4840,23 +4777,15 @@ const (
 	// production heap profile. Analytics touch every tx, so it is charged
 	// up front rather than when the cache fills.
 	decodedCacheFactor = 4
-
-	// Per obs: the tx.obsKeys dedup entry ("observerID|pathJSON" key string
-	// plus bucket slot); the key is built by concatenation, so its bytes are
-	// a separate allocation from the obs fields.
-	obsKeyEntryBytes = 16 + indexEntryBytes + 1
 )
 
 // estimateStoreTxBytes returns the estimated memory cost of a StoreTx (excluding observations).
-// Includes per-tx maps (obsKeys, observerSet), byPathHop entries, and spTxIndex subpath entries.
+// Includes byPathHop entries and spTxIndex subpath entries.
 func estimateStoreTxBytes(tx *StoreTx) int64 {
 	base := int64(storeTxBaseBytes)
 	base += int64(len(tx.RawHex) + len(tx.Hash) + len(tx.DecodedJSON) + len(tx.PathJSON))
 	base += int64(numIndexesPerTx * indexEntryBytes)
 	base += int64(decodedCacheFactor * len(tx.DecodedJSON))
-
-	// Per-tx maps: obsKeys + observerSet
-	base += perTxMapsBytes
 
 	// Path-dependent costs
 	hops := int64(len(txGetParsedPath(tx)))
@@ -4879,14 +4808,12 @@ func estimateStoreTxBytesTypical(numObs int) int64 {
 	base := int64(storeTxBaseBytes) + 64 + 200 + 40
 	base += int64(numIndexesPerTx * indexEntryBytes)
 	base += decodedCacheFactor * 200
-	base += perTxMapsBytes
 	hops := int64(3)
 	base += hops * perPathHopBytes
 	base += (hops * (hops - 1) / 2) * perSubpathEntryBytes
 	// Add observation costs
 	obsBase := int64(storeObsBaseBytes) + 30 + 30 + 60 + 25 // observer ID + name + path + timestamp
 	obsBase += int64(numIndexesPerObs * indexEntryBytes)
-	obsBase += obsKeyEntryBytes + 30 + 60 // dedup key: observer ID + path
 	// No per-obs ResolvedPath overhead (#800)
 	base += int64(numObs) * obsBase
 	return base
@@ -4899,7 +4826,6 @@ func estimateStoreObsBytes(obs *StoreObs) int64 {
 	base += int64(len(obs.PathJSON) + len(obs.ObserverID) + len(obs.ObserverName) +
 		len(obs.ObserverIATA) + len(obs.Direction) + len(obs.RawHex) + len(obs.Timestamp))
 	base += int64(numIndexesPerObs * indexEntryBytes)
-	base += int64(obsKeyEntryBytes + len(obs.ObserverID) + len(obs.PathJSON))
 	// ResolvedPath field removed (#800) — no per-obs RP overhead
 	return base
 }
@@ -5174,7 +5100,7 @@ func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 		s.removeFromResolvedPubkeyIndex(tx.ID)
 
 		// Remove from subpath index
-		removeTxFromSubpathIndexFull(s.spIndex, s.spTxIndex, tx)
+		removeTxFromSubpathIndex(s.spTxIndex, tx)
 	}
 	// Sweep raw AND resolved hop keys once per batch (#1908). The hash-only
 	// membership index cannot recover full pubkey strings. Reuse the evicted
@@ -5433,7 +5359,7 @@ func hasUpperASCII(s string) bool {
 // loops that resolve hops outside any per-tx scope (subpath/topology
 // aggregations). Caller passes the slice of txs to consider; we union the
 // per-tx contexts with de-dup. Used by call sites that read from precomputed
-// indices (s.spIndex, s.spTxIndex) or that resolve user-supplied hops.
+// indices (s.spTxIndex) or that resolve user-supplied hops.
 //
 // Result is order-independent in semantics; iteration order is deterministic
 // only modulo Go's map iteration (acceptable — the resolver's tier-2 averages
@@ -10325,7 +10251,7 @@ func (s *PacketStore) GetNodeAnalytics(pubkey string, days int) (*NodeAnalyticsR
 // path. With a zero TimeWindow this is byte-equivalent to GetAnalyticsSubpaths.
 //
 // For non-zero windows we iterate the packet list and filter on
-// `tx.FirstSeen`. We deliberately do not consult the precomputed `spIndex`
+// `tx.FirstSeen`. We deliberately do not consult the precomputed `spTxIndex`
 // (which has no per-tx timestamp), so the windowed path is O(N_tx · path²);
 // this matches the slow region-filtered path and keeps the fast unbounded
 // hot path untouched. Results are cached by (region|area|window) so repeated
@@ -10531,7 +10457,8 @@ func (s *PacketStore) GetAnalyticsSubpathsBulk(region string, groups []subpathGr
 		perGroup[i] = make(map[string]*subpathAccum)
 	}
 
-	for rawKey, count := range s.spIndex {
+	for rawKey, txs := range s.spTxIndex {
+		count := len(txs)
 		hops := strings.Split(rawKey, ",")
 		hopLen := len(hops)
 
@@ -10591,7 +10518,7 @@ func (s *PacketStore) computeAnalyticsSubpaths(region string, minLen, maxLen, li
 
 	_, pm := s.getCachedNodesAndPM()
 	// Aggregate hop-disambiguation context across all packets — bulk
-	// aggregator over s.spIndex / per-tx fallback both need it. See #1197.
+	// aggregator over s.spTxIndex / per-tx fallback both need it. See #1197.
 	contextPubkeys := buildAggregateHopContextPubkeys(s.packets, pm)
 	hopCache := make(map[string]*nodeInfo)
 	graph := s.graph.Load() // hoist out of resolver closure (PR #1208 carmack #1)
@@ -10618,8 +10545,9 @@ func (s *PacketStore) computeAnalyticsSubpaths(region string, minLen, maxLen, li
 
 	// Fast path: read from precomputed raw-hop subpath index.
 	// Resolve raw hop prefixes to names and merge counts.
-	namedCounts := make(map[string]*subpathAccum, len(s.spIndex))
-	for rawKey, count := range s.spIndex {
+	namedCounts := make(map[string]*subpathAccum, len(s.spTxIndex))
+	for rawKey, txs := range s.spTxIndex {
+		count := len(txs)
 		hops := strings.Split(rawKey, ",")
 		hopLen := len(hops)
 		if hopLen < minLen || hopLen > maxLen {

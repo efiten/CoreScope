@@ -173,8 +173,7 @@ func TestTrackedBytes_PathKnownAfterCreate(t *testing.T) {
 	store := makeTestStore(0, time.Now().UTC(), 0)
 	store.retentionHours = 1
 
-	tx := &StoreTx{ID: 1, Hash: "aabb", FirstSeen: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
-		obsKeys: map[string]bool{}, observerSet: map[string]bool{}}
+	tx := &StoreTx{ID: 1, Hash: "aabb", FirstSeen: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)}
 	store.trackedBytes += rechargeTx(tx)
 	bare := store.trackedBytes
 

@@ -19,7 +19,7 @@ func makeTestStore(count int, startTime time.Time, intervalMin int) *PacketStore
 		byNode:        make(map[string][]*StoreTx),
 		nodeHashes:    make(map[string]map[string]bool),
 		byPayloadType: make(map[int][]*StoreTx),
-		spIndex:       make(map[string]int),
+		spTxIndex:     make(map[string][]*StoreTx),
 		distHops:      make([]distHopRecord, 0),
 		distPaths:     make([]distPathRecord, 0),
 		rfCache:       make(map[string]*cachedResult),
@@ -84,7 +84,7 @@ func makeTestStore(count int, startTime time.Time, intervalMin int) *PacketStore
 		store.distPaths = append(store.distPaths, distPathRecord{tx: tx, Hash: hash})
 
 		// Subpath index
-		addTxToSubpathIndex(store.spIndex, tx)
+		addTxToSubpathIndex(store.spTxIndex, tx)
 
 		// Track bytes for self-accounting
 		store.trackedBytes += rechargeTx(tx)
@@ -261,7 +261,7 @@ func TestEvictStale_CleansResolvedPathNodeIndexes(t *testing.T) {
 		byNode:               make(map[string][]*StoreTx),
 		nodeHashes:           make(map[string]map[string]bool),
 		byPayloadType:        make(map[int][]*StoreTx),
-		spIndex:              make(map[string]int),
+		spTxIndex:            make(map[string][]*StoreTx),
 		distHops:             make([]distHopRecord, 0),
 		distPaths:            make([]distPathRecord, 0),
 		rfCache:              make(map[string]*cachedResult),
@@ -569,7 +569,6 @@ func TestEstimateStoreTxBytes(t *testing.T) {
 	hops := int64(len(txGetParsedPath(tx)))
 	manualCalc := int64(storeTxBaseBytes) + int64(len(tx.RawHex)+len(tx.Hash)+len(tx.DecodedJSON)+len(tx.PathJSON)) + int64(numIndexesPerTx*indexEntryBytes)
 	manualCalc += int64(decodedCacheFactor * len(tx.DecodedJSON))
-	manualCalc += perTxMapsBytes
 	manualCalc += hops * perPathHopBytes
 	if hops > 1 {
 		manualCalc += (hops * (hops - 1) / 2) * perSubpathEntryBytes
@@ -588,9 +587,9 @@ func TestEstimateStoreObsBytes(t *testing.T) {
 		PathJSON:   `["aa"]`,
 	}
 	est := estimateStoreObsBytes(obs)
-	// storeObsBaseBytes(192) + len(ObserverID=6) + len(PathJSON=6) + 2*48(96) = 300,
-	// plus the obsKeys dedup entry: obsKeyEntryBytes(65) + 6 + 6 = 77
-	expected := int64(192 + 6 + 6 + 2*48 + 77)
+	// storeObsBaseBytes(192) + len(ObserverID=6) + len(PathJSON=6) + 2*48(96) = 300.
+	// The dedup check scans tx.Observations, so it adds no per-obs bytes.
+	expected := int64(192 + 6 + 6 + 2*48)
 	if est != expected {
 		t.Fatalf("estimateStoreObsBytes = %d, want %d", est, expected)
 	}
