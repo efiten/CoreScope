@@ -2331,14 +2331,6 @@ func TestSubpathPrecomputedIndex(t *testing.T) {
 		t.Fatal("indexes never became ready")
 	}
 
-	// After Load(), the precomputed index must be populated.
-	if len(store.spTxIndex) == 0 {
-		t.Fatal("expected spTxIndex to be populated after Load()")
-	}
-	if store.spTotalPaths == 0 {
-		t.Fatal("expected spTotalPaths > 0 after Load()")
-	}
-
 	// The rich test DB has paths ["aa","bb"], ["aabb","ccdd"], and
 	// ["eeff","0011","2233"].  That yields 5 unique raw subpaths.
 	expectedRaw := map[string]int{
@@ -2349,15 +2341,9 @@ func TestSubpathPrecomputedIndex(t *testing.T) {
 		"eeff,0011,2233": 1,
 	}
 	for key, want := range expectedRaw {
-		txs, ok := store.spTxIndex[key]
-		if !ok {
-			t.Errorf("expected spTxIndex[%q] to exist", key)
-		} else if got := len(txs); got != want {
-			t.Errorf("len(spTxIndex[%q]) = %d, want %d", key, got, want)
+		if got := len(store.txsWithSubpath(strings.Split(key, ","))); got != want {
+			t.Errorf("txsWithSubpath(%q) = %d, want %d", key, got, want)
 		}
-	}
-	if store.spTotalPaths != 3 {
-		t.Errorf("spTotalPaths = %d, want 3", store.spTotalPaths)
 	}
 
 	// Fast-path (no region) and slow-path (with region) must return the
@@ -2373,9 +2359,9 @@ func TestSubpathPrecomputedIndex(t *testing.T) {
 		}
 	}
 
-	// Verify fast path totalPaths matches index.
-	if tp, ok := fast["totalPaths"].(int); ok && tp != store.spTotalPaths {
-		t.Errorf("fast totalPaths=%d, spTotalPaths=%d", tp, store.spTotalPaths)
+	// Three stored paths have two or more hops.
+	if tp, _ := fast["totalPaths"].(int); tp != 3 {
+		t.Errorf("fast totalPaths = %d, want 3", tp)
 	}
 }
 
@@ -2389,20 +2375,7 @@ func TestSubpathTxIndexPopulated(t *testing.T) {
 		t.Fatal("indexes never became ready")
 	}
 
-	// spTxIndex must be populated after Load()
-	if len(store.spTxIndex) == 0 {
-		t.Fatal("expected spTxIndex to be populated after Load()")
-	}
-
-	// len(spTxIndex[key]) is the subpath's count, so no key may be kept
-	// with an empty transaction list.
-	for key, txs := range store.spTxIndex {
-		if len(txs) == 0 {
-			t.Errorf("spTxIndex[%q] is empty; empty keys must be deleted", key)
-		}
-	}
-
-	// GetSubpathDetail should return correct match count via indexed lookup
+	// GetSubpathDetail should return the correct match count
 	detail := store.GetSubpathDetail([]string{"eeff", "0011"})
 	if detail == nil {
 		t.Fatal("expected non-nil detail for existing subpath")

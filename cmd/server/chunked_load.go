@@ -489,7 +489,6 @@ func (s *PacketStore) LoadChunked(chunkSize int) error {
 	sort.SliceStable(s.packets, func(i, j int) bool {
 		return s.packets[i].FirstSeen < s.packets[j].FirstSeen
 	})
-	s.buildSubpathIndex()
 	s.buildPathHopIndex()
 	s.buildDistanceIndex()
 	if s.hotStartupHours > 0 {
@@ -535,31 +534,34 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 	seenTxIDs := make(map[int]bool)
 	var maxID int64
 
-	for rows.Next() {
-		var txID int
-		var rawHex, hash, firstSeen, decodedJSON sql.NullString
-		var routeType, payloadType, payloadVersion sql.NullInt64
-		var obsID sql.NullInt64
-		var observerID, observerName, observerIATA, direction, pathJSON, obsTimestamp sql.NullString
-		var snr, rssi sql.NullFloat64
-		var score sql.NullInt64
-		var obsRawHex sql.NullString
-		var resolvedPathStr sql.NullString
-		var scopeName sql.NullString
+	// Scan overwrites every target on each row, so one set (and one
+	// argument slice) serves the whole loop instead of escaping per row.
+	var txID int
+	var rawHex, hash, firstSeen, decodedJSON sql.NullString
+	var routeType, payloadType, payloadVersion sql.NullInt64
+	var obsID sql.NullInt64
+	var observerID, observerName, observerIATA, direction, pathJSON, obsTimestamp sql.NullString
+	var snr, rssi sql.NullFloat64
+	var score sql.NullInt64
+	var obsRawHex sql.NullString
+	var resolvedPathStr sql.NullString
+	var scopeName sql.NullString
 
-		scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
-			&payloadVersion, &decodedJSON,
-			&obsID, &observerID, &observerName, &observerIATA, &direction,
-			&snr, &rssi, &score, &pathJSON, &obsTimestamp}
-		if s.db.hasObsRawHex {
-			scanArgs = append(scanArgs, &obsRawHex)
-		}
-		if s.db.hasResolvedPath {
-			scanArgs = append(scanArgs, &resolvedPathStr)
-		}
-		if s.db.hasScopeName {
-			scanArgs = append(scanArgs, &scopeName)
-		}
+	scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
+		&payloadVersion, &decodedJSON,
+		&obsID, &observerID, &observerName, &observerIATA, &direction,
+		&snr, &rssi, &score, &pathJSON, &obsTimestamp}
+	if s.db.hasObsRawHex {
+		scanArgs = append(scanArgs, &obsRawHex)
+	}
+	if s.db.hasResolvedPath {
+		scanArgs = append(scanArgs, &resolvedPathStr)
+	}
+	if s.db.hasScopeName {
+		scanArgs = append(scanArgs, &scopeName)
+	}
+
+	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
 			log.Printf("[store] LoadChunked scan error: %v", err)
 			continue
@@ -611,10 +613,10 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 			obs := &StoreObs{
 				ID:             oid,
 				TransmissionID: txID,
-				ObserverID:     obsIDStr,
-				ObserverName:   nullStrVal(observerName),
-				ObserverIATA:   nullStrVal(observerIATA),
-				Direction:      nullStrVal(direction),
+				ObserverID:     internStr(obsIDStr),
+				ObserverName:   internStr(nullStrVal(observerName)),
+				ObserverIATA:   internStr(nullStrVal(observerIATA)),
+				Direction:      internStr(nullStrVal(direction)),
 				SNR:            nullFloatPtr(snr),
 				RSSI:           nullFloatPtr(rssi),
 				Score:          nullIntPtr(score),

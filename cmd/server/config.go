@@ -209,6 +209,10 @@ type Config struct {
 	// BatteryThresholds: voltage cutoffs for low/critical alerts (#663).
 	BatteryThresholds *BatteryThresholdsConfig `json:"batteryThresholds,omitempty"`
 
+	// DutyCycleWarnPct: rolling 1 h TX airtime share (percent) at which the
+	// RF Health view and observer list warn. 0/missing => 10 (EU g3, #661).
+	DutyCycleWarnPct float64 `json:"dutyCycleWarnPct,omitempty"`
+
 	// Customizer controls operator-side knobs for the in-app customizer modal
 	// (theme/branding/etc.). See CustomizerConfig and issue #1508.
 	Customizer *CustomizerConfig `json:"customizer,omitempty"`
@@ -1052,6 +1056,26 @@ func SaveGeoFilter(configDir string, gf *GeoFilterConfig) error {
 		return fmt.Errorf("config.json not found in %s", configDir)
 	}
 
+	// Follow a symlink at configPath to the file it points at before the
+	// tmp+rename below. In the Docker image /app/config.json is a symlink to
+	// the bind-mounted /app/data/config.json (docker/entrypoint-go.sh), and
+	// os.Rename onto the link path would replace the link with a regular
+	// file inside the container: the mounted file would keep the old
+	// geo_filter, the saved one would be invisible on the host and would go
+	// away with the container. Resolving first keeps the write atomic and
+	// the result where the operator (and the next container) will read it.
+	//
+	// Unlike the stats file (writeStatsAtomic, refs #1170), replacing a
+	// symlink at the destination is not wanted here: this path is not
+	// world-writable, and the link is one the image itself creates. Only a
+	// regular file is followed, so a link to a device or a fifo is left
+	// alone and handled as before.
+	if resolved, err := filepath.EvalSymlinks(configPath); err == nil && resolved != configPath {
+		if fi, err := os.Lstat(resolved); err == nil && fi.Mode().IsRegular() {
+			configPath = resolved
+		}
+	}
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
@@ -1083,12 +1107,21 @@ func SaveGeoFilter(configDir string, gf *GeoFilterConfig) error {
 	// config.json holds the API key and broker passwords, and an operator
 	// who made it 0600 should not find it 0644 after a geo-filter save.
 	mode := os.FileMode(0644)
-	if fi, err := os.Stat(configPath); err == nil {
-		mode = fi.Mode().Perm()
+	orig, origErr := os.Stat(configPath)
+	if origErr == nil {
+		mode = orig.Mode().Perm()
 	}
 	tmp := configPath + ".tmp"
 	if err := os.WriteFile(tmp, out, mode); err != nil {
 		return fmt.Errorf("write config: %w", err)
+	}
+	// Keep the owner as well. The image runs the server as root by default,
+	// and without this the rename would hand the operator's bind-mounted
+	// config.json to root:root, which at 0600 they could no longer edit
+	// without sudo. Best effort: a server that may not chown leaves the file
+	// as it was created.
+	if origErr == nil {
+		copyOwner(tmp, orig)
 	}
 	if err := os.Rename(tmp, configPath); err != nil {
 		os.Remove(tmp)

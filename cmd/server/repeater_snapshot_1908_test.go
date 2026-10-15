@@ -18,7 +18,6 @@ func relaySnapshotStore1908(count, nodes, expired int) *PacketStore {
 	store := &PacketStore{
 		packets:        make([]*StoreTx, count),
 		byPathHop:      make(map[string][]*StoreTx, nodes+256),
-		spTxIndex:      make(map[string][]*StoreTx),
 		retentionHours: 1,
 	}
 	pt := 5

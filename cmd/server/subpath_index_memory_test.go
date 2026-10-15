@@ -3,19 +3,17 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"math/rand"
-	"os"
 	"runtime"
 	"testing"
 )
 
-// The subpath index holds every contiguous run of 2-8 hops of every stored
-// transmission's path. On a production instance's 7-day window (41k
-// transmissions with 2+ hops) that is 1.2M distinct keys, 79% of them seen
-// once, and 3.07M entries; a heap profile put 186 MB of a 805 MB live heap in
-// addTxToSubpathIndexFull.
+// The subpath index used to hold every contiguous run of 2-8 hops of every
+// stored transmission's path: on a production instance's 7-day window (41k
+// transmissions with 2+ hops) 1.2M distinct keys, 79% of them seen once, and
+// 186 MB of an 805 MB live heap. Subpaths are now counted per request, and
+// TestSubpathRequestAllocations bounds what one request allocates over the
+// same shape of data.
 //
 // subpathFixture builds transmissions with that shape from synthetic data: path
 // lengths follow the production hop-count histogram, and hops are random walks
@@ -76,13 +74,6 @@ func weightedHopCount(rng *rand.Rand, weights []int) int {
 	return 2
 }
 
-// buildSubpathIndexForTest builds the index the way Load does and returns it.
-func buildSubpathIndexForTest(txs []*StoreTx) *PacketStore {
-	s := &PacketStore{packets: txs}
-	s.buildSubpathIndex()
-	return s
-}
-
 // retainedHeapMB reports how much live heap build() keeps after a full GC.
 func retainedHeapMB(build func() interface{}) float64 {
 	var before, after runtime.MemStats
@@ -119,44 +110,37 @@ func TestSubpathFixtureShape(t *testing.T) {
 	}
 }
 
-// BenchmarkBuildSubpathIndex reports the live heap the index keeps for a
-// production-shaped 7-day window (41k transmissions with paths).
-//
-//	go test -run '^$' -bench BenchmarkBuildSubpathIndex -count 10 ./cmd/server
-func BenchmarkBuildSubpathIndex(b *testing.B) {
-	log.SetOutput(io.Discard)
-	b.Cleanup(func() { log.SetOutput(os.Stderr) })
-	txs := subpathFixture(41000, 1)
-	for _, tx := range txs {
-		txGetParsedPath(tx) // parse once, outside the measurement
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	var mb float64
-	for i := 0; i < b.N; i++ {
-		mb = retainedHeapMB(func() interface{} { return buildSubpathIndexForTest(txs) })
-	}
-	b.ReportMetric(mb, "retained-MB")
-}
-
-// TestSubpathIndexRetainedHeap bounds the live heap the subpath index keeps for
-// the production-shaped fixture. It kept 250 MB when a separate key → count
-// map duplicated every key of spTxIndex; with counts read as len(txs) it keeps
-// about 197 MB. The bound sits between the two.
-func TestSubpathIndexRetainedHeap(t *testing.T) {
+// TestSubpathRequestAllocations bounds what one analytics request allocates
+// to count the production-shaped fixture's subpaths. Counting with a map from
+// each named key string to a heap-allocated accumulator allocated about
+// 336 MB for its 1.5M keys: on a small instance that is a spike the size of
+// the whole store, every time the cache expires. Pointer-free tallies under
+// a hash of the name allocate about 110 MB, nearly all of it the one map's
+// growth.
+func TestSubpathRequestAllocations(t *testing.T) {
 	if testing.Short() {
-		t.Skip("builds a 1.5M-key index")
+		t.Skip("counts 1.5M subpaths")
 	}
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(os.Stderr)
 	txs := subpathFixture(41000, 1)
 	for _, tx := range txs {
 		txGetParsedPath(tx)
 	}
-	const limitMB = 225
-	mb := retainedHeapMB(func() interface{} { return buildSubpathIndexForTest(txs) })
-	t.Logf("subpath index for 41k production-shaped transmissions keeps %.1f MB", mb)
+	s := &PacketStore{packets: txs}
+	groups := []subpathGroup{{2, 2, 50}, {3, 3, 50}, {4, 4, 50}, {5, 8, 50}}
+	identity := func(h string) string { return h }
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	res, _ := s.topNamedSubpaths(groups, identity)
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(res)
+	mb := float64(after.TotalAlloc-before.TotalAlloc) / (1 << 20)
+	t.Logf("one subpaths request over 41k production-shaped transmissions allocates %.1f MB", mb)
+	const limitMB = 150
 	if mb > limitMB {
-		t.Fatalf("subpath index keeps %.1f MB, limit %d MB", mb, limitMB)
+		t.Fatalf("one subpaths request allocates %.1f MB, limit %d MB", mb, limitMB)
+	}
+	if got := len(res[0]); got != 50 {
+		t.Fatalf("group 2-2 returned %d subpaths, want 50", got)
 	}
 }
