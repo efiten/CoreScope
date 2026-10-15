@@ -450,6 +450,9 @@ type PacketStore struct {
 	// pointer load — no lock contention with the per-request enrichment
 	// path in handleNodes (same discipline as #1248).
 	bridgeScoreMap atomic.Pointer[map[string]float64]
+	// #1879: pubkey → which rule places it for the /api/nodes region filter,
+	// and in which regions. Written by the node-home-regions recomputer.
+	nodeRegionPlacements atomic.Pointer[map[string]NodeRegionPlacement]
 
 	// Coverage + Redundancy axes (issue #672 axes 3 & 4 of 4): atomic
 	// snapshots of pubkey → 0..1 score over the current neighbor graph.
@@ -4044,21 +4047,36 @@ func (s *PacketStore) observerIATAs() map[string]string {
 // #804: feeds analytics region-attribution so a multi-byte repeater whose
 // flood adverts get relayed across regions is still attributed to its home.
 func (s *PacketStore) computeNodeHomeRegions(obsIATA map[string]string) map[string]string {
-	if len(obsIATA) == 0 {
-		return map[string]string{}
-	}
-
-	// Tally zero-hop direct ADVERT region observations per pubkey.
-	type tally struct {
-		counts map[string]int
-	}
-	per := make(map[string]*tally, 256)
-
-	for _, tx := range s.packets {
-		if tx.RawHex == "" || len(tx.RawHex) < 4 {
-			continue
+	counts := s.nodeZeroHopRegionCounts(obsIATA)
+	out := make(map[string]string, len(counts))
+	for pk, perIATA := range counts {
+		var bestIATA string
+		bestCount := 0
+		for iata, n := range perIATA {
+			if n > bestCount || (n == bestCount && iata < bestIATA) {
+				bestCount = n
+				bestIATA = iata
+			}
 		}
-		if tx.PayloadType == nil || *tx.PayloadType != PayloadADVERT {
+		if bestIATA != "" {
+			out[pk] = bestIATA
+		}
+	}
+	return out
+}
+
+// nodeZeroHopRegionCounts tallies, per pubkey, how many observations of its
+// zero-hop DIRECT adverts each region's observers made (the #804 rule; see
+// computeNodeHomeRegions). Nodes without such an advert are absent. Caller
+// must hold s.mu (read or write); obsIATA is loaded before it, as above.
+func (s *PacketStore) nodeZeroHopRegionCounts(obsIATA map[string]string) map[string]map[string]int {
+	per := make(map[string]map[string]int, 256)
+	if len(obsIATA) == 0 {
+		return per
+	}
+	// Adverts only: the full packet list is mostly other traffic.
+	for _, tx := range s.byPayloadType[PayloadADVERT] {
+		if tx.RawHex == "" || len(tx.RawHex) < 4 {
 			continue
 		}
 		if tx.DecodedJSON == "" {
@@ -4096,30 +4114,14 @@ func (s *PacketStore) computeNodeHomeRegions(obsIATA map[string]string) map[stri
 			if iata == "" {
 				continue
 			}
-			t := per[pk]
-			if t == nil {
-				t = &tally{counts: map[string]int{}}
-				per[pk] = t
+			if per[pk] == nil {
+				per[pk] = map[string]int{}
 			}
-			t.counts[iata]++
+			per[pk][iata]++
 		}
 	}
 
-	out := make(map[string]string, len(per))
-	for pk, t := range per {
-		var bestIATA string
-		bestCount := 0
-		for iata, n := range t.counts {
-			if n > bestCount || (n == bestCount && iata < bestIATA) {
-				bestCount = n
-				bestIATA = iata
-			}
-		}
-		if bestIATA != "" {
-			out[pk] = bestIATA
-		}
-	}
-	return out
+	return per
 }
 
 // enrichObsRPJob returns a map with observation fields + transmission fields,
