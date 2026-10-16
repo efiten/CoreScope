@@ -11,6 +11,11 @@
   --nq-cov-weak: #e74c3c;   /* SF8: < −9 dB      (poor, packet loss likely) */
   --nq-cov-grey: #95a5a6;   /* heard, no SNR metric */
   --nq-cov-gap: #57606a;    /* hatch: driven through, nothing received */
+  /* Uplink layer (rx-coverage.js drawUplinkLayer): did the mesh hear the companion */
+  --nq-up-both: #2ecc71;     /* a repeater echoed it AND an observer received it */
+  --nq-up-observed: #2f80ed; /* an observer received it, no echo heard */
+  --nq-up-echo: #e6a817;     /* a repeater echoed it, no observer received it */
+  --nq-up-none: #c0392b;     /* neither */
 }
 /* Dark-theme variants: the saturated mid-luminance defaults glare on dark
    basemaps. Mirrors the rest of the dashboard's theme-aware tokens (#polish). */
@@ -20,6 +25,10 @@
   --nq-cov-weak: #f85149;
   --nq-cov-grey: #8b949e;
   --nq-cov-gap: #c9d1d9;
+  --nq-up-both: #3fb950;
+  --nq-up-observed: #58a6ff;
+  --nq-up-echo: #d29922;
+  --nq-up-none: #f85149;
 }
 .nq-cov-legend { display:flex; gap:12px; align-items:center; font-size:11px; color:var(--text-muted, #57606a); margin:4px 0 10px; }
 /* Toggled by node-reach.js applyCoverage via class, not inline style, so CSS

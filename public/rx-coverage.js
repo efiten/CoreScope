@@ -7,8 +7,9 @@
 'use strict';
 (function () {
   var map = null, covLayer = null, days = 7, selectedRx = '', selectedName = '', boardCache = [], destroyed = false, generation = 0;
-  // layer: 'signal' (default, per-cell best SNR of directly-heard nodes) or
-  // 'noise' (RF noise-floor layer, opt-in — see MC_CLIENT_RF_SAMPLES).
+  // layer: 'signal' (default, per-cell best SNR of directly-heard nodes),
+  // 'noise' (RF noise-floor layer, opt-in — see MC_CLIENT_RF_SAMPLES) or
+  // 'uplink' (did the mesh hear the companion's pings — see MC_CLIENT_UPLINK).
   var layer = 'signal';
   // showGaps: on the signal layer, also draw cells a companion drove through
   // with nothing received (/api/rx-coverage?gaps=1). Needs the RF sample
@@ -93,7 +94,39 @@
     return '--nq-cov-weak';
   }
 
+  // Uplink classes, best first: the legend order and the colour of a cell's best ping.
+  var UPLINK_CLASSES = [
+    { key: 'both', label: 'both directions', title: 'A repeater re-broadcast the ping where the companion heard it, and an observer received it' },
+    { key: 'observed', label: 'heard by observers', title: 'An observer received the ping; the companion heard no re-broadcast' },
+    { key: 'echo', label: 'repeater only', title: 'A repeater re-broadcast the ping, but no observer received it. Where no observer is in range this is the best a ping can show.' },
+    { key: 'none', label: 'not heard', title: 'No re-broadcast heard and no observer received it' }
+  ];
+
+  function uplinkColorVar(p) {
+    var k = p && p.best;
+    return UPLINK_CLASSES.some(function (c) { return c.key === k; }) ? '--nq-up-' + k : '--nq-up-none';
+  }
+
+  function uplinkCellHtml(p) {
+    if (!p) return '';
+    var parts = UPLINK_CLASSES.filter(function (c) { return p[c.key] > 0; }).map(function (c) { return p[c.key] + ' ' + c.label; });
+    var hops = (p.first_hops || []).map(function (h) { return escapeHtml(String(h).toUpperCase()); }).join(', ');
+    return '<div style="font-weight:600;margin-bottom:4px">' + p.pings + (p.pings === 1 ? ' uplink ping' : ' uplink pings') + '</div>' +
+      '<div style="font-size:12px;line-height:1.6;min-width:180px">' +
+      '<div>' + parts.join(' · ') + '</div>' +
+      (hops ? '<div>picked up by: ' + hops + '</div>' : '') +
+      (p.max_observers ? '<div>reached ' + p.max_observers + (p.max_observers === 1 ? ' observer' : ' observers') + (p.max_hops ? ', up to ' + p.max_hops + ' hops' : '') + '</div>' : '') +
+      '<div style="color:var(--text-muted)">last: ' + escapeHtml(String(p.last_at || '').slice(0, 16).replace('T', ' ')) + ' UTC</div>' +
+      '</div>';
+  }
+
   function legendHtml() {
+    if (layer === 'uplink') {
+      return '<div class="nq-cov-legend" id="rxLegend">' +
+        UPLINK_CLASSES.map(function (c) { return '<span title="' + c.title + '"><i style="background:var(--nq-up-' + c.key + ')"></i>' + c.label + '</span>'; }).join('') +
+        '<span>· "not heard by observers" can also mean no observer is in range</span>' +
+        '</div>';
+    }
     if (layer === 'noise') {
       return '<div class="nq-cov-legend" id="rxLegend">' +
         '<span><i style="background:var(--nq-cov-strong)"></i>quiet (≤ ' + NOISE_QUIET_MAX + ' dBm)</span>' +
@@ -154,14 +187,19 @@
   // must not keep claiming best-signal colouring while the noise legend (an
   // inverted, opposite-direction colour axis) sits right below it.
   function subtitleHtml() {
+    if (layer === 'uplink') {
+      return 'Where the mesh heard roaming companions: each cell shows the best result of the uplink pings sent there. <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a>';
+    }
     var colourText = layer === 'noise' ? 'Colour = median RF noise floor per cell.' : 'Colour = best signal per cell.';
     return 'Where roaming CoreScope-RX clients heard nodes. ' + colourText + ' <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a>';
   }
 
   function pageHtml() {
-    var layerBar = window.MC_CLIENT_RF_SAMPLES
-      ? '<div class="analytics-time-range" id="rxLayerBar" style="margin:8px 0">' + layerBtn('signal', 'Signal') + layerBtn('noise', 'Noise') + '</div>' +
-        '<div class="analytics-time-range" id="rxGapsBar" style="margin:8px 0' + (layer === 'signal' ? '' : ';display:none') + '">' + gapsBtnHtml() + '</div>'
+    var layerBar = (window.MC_CLIENT_RF_SAMPLES || window.MC_CLIENT_UPLINK)
+      ? '<div class="analytics-time-range" id="rxLayerBar" style="margin:8px 0">' + layerBtn('signal', 'Signal') +
+        (window.MC_CLIENT_RF_SAMPLES ? layerBtn('noise', 'Noise') : '') +
+        (window.MC_CLIENT_UPLINK ? layerBtn('uplink', 'Uplink') : '') + '</div>' +
+        (window.MC_CLIENT_RF_SAMPLES ? '<div class="analytics-time-range" id="rxGapsBar" style="margin:8px 0' + (layer === 'signal' ? '' : ';display:none') + '">' + gapsBtnHtml() + '</div>' : '')
       : '';
     return '<div style="max-width:1100px;margin:0 auto;padding:12px 16px">' +
       '<h2 style="margin:4px 0 2px;font-size:18px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Mobile RX coverage</h2>' +
@@ -304,6 +342,27 @@
     });
   }
 
+  function drawUplinkLayer(bbox) {
+    var url = '/api/uplink-coverage?bbox=' + bbox + '&z=' + map.getZoom() + '&days=' + days;
+    fetch(url).then(function (r) { return r.json(); }).then(function (fc) {
+      if (destroyed || !covLayer || layer !== 'uplink') return;
+      covLayer.clearLayers();
+      var features = fc.features || [];
+      setNoiseEmpty(features.length === 0, 'No uplink pings in this view yet.');
+      features.forEach(function (f) {
+        var ring = (f.geometry.coordinates[0] || []).map(function (c) { return [c[1], c[0]]; });
+        var col = cssColor(uplinkColorVar(f.properties));
+        L.polygon(ring, { color: col, weight: 1, fillColor: col, fillOpacity: 0.5 }).addTo(covLayer)
+          .bindTooltip(uplinkCellHtml(f.properties));
+      });
+    }).catch(function (e) {
+      console.warn('rx-coverage: uplink fetch failed', e);
+      if (destroyed || !covLayer || layer !== 'uplink') return;
+      covLayer.clearLayers();
+      setNoiseEmpty(true, 'Could not load uplink pings. Pan or zoom to retry.');
+    });
+  }
+
   // setNoiseEmpty toggles the "no samples in this view" message. Only shown
   // on the noise layer — MC_CLIENT_RF_SAMPLES already keeps the toggle (and
   // so this layer) out of reach entirely when the feature is off, so seeing
@@ -314,7 +373,7 @@
   function setNoiseEmpty(show, text) {
     var el = document.getElementById('rxNoiseEmpty');
     if (!el) return;
-    if (show && layer === 'noise') {
+    if (show && (layer === 'noise' || layer === 'uplink')) {
       el.textContent = text || 'No RF samples in this view yet.';
       el.style.display = 'block';
     } else {
@@ -327,6 +386,7 @@
     var b = map.getBounds();
     var bbox = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()].join(',');
     if (layer === 'noise') drawNoiseLayer(bbox);
+    else if (layer === 'uplink') drawUplinkLayer(bbox);
     else drawSignalLayer(bbox);
   }
 
@@ -517,6 +577,7 @@
         var dd = parseInt(p.get('days'), 10); if ([1, 7, 14, 30].indexOf(dd) >= 0) days = dd;
         selectedRx = (p.get('rx') || '').toLowerCase();
         if (window.MC_CLIENT_RF_SAMPLES && p.get('layer') === 'noise') layer = 'noise';
+        if (window.MC_CLIENT_UPLINK && p.get('layer') === 'uplink') layer = 'uplink';
         if (p.get('gaps') === '0') showGaps = false;
         mine = p.get('mine') === '1';
       }
@@ -614,6 +675,6 @@
   }
 
   if (window.addEventListener) window.addEventListener('cs-auth-changed', onAuthChanged);
-  window.CSRxCoverage = { _test: { coverageUrl: coverageUrl, mineBtnHtml: mineBtnHtml, authUser: authUser, coverageReply: coverageReply } };
+  window.CSRxCoverage = { _test: { coverageUrl: coverageUrl, mineBtnHtml: mineBtnHtml, authUser: authUser, coverageReply: coverageReply, uplinkColorVar: uplinkColorVar, uplinkCellHtml: uplinkCellHtml } };
   registerPage('rx-coverage', { init: init, destroy: destroy });
 })();

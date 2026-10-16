@@ -678,6 +678,7 @@ jobs:
           suite 2 test-neighbor-map-btn-clip-e2e.js CHROMIUM_REQUIRE=1
           suite 3 test-rx-coverage-viewport-e2e.js BASE_URL=$B
           suite 1 test-rx-coverage-noise-e2e.js BASE_URL=$B
+          suite 1 test-rx-coverage-uplink-e2e.js BASE_URL=$B
           # Issue #2037: these eight sat in tests/e2e/ with no runner at all.
           # Measured on upstream master in CI run 35340835178: all eight pass,
           # 45 seconds together. test-rx-coverage-mobile-nav-e2e.js is the

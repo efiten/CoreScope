@@ -112,6 +112,7 @@
       "tests/e2e/test-rx-coverage-mobile-nav-e2e.js",
       "tests/e2e/test-rx-coverage-gaps-e2e.js",
       "tests/e2e/test-rx-coverage-noise-e2e.js",
+      "tests/e2e/test-rx-coverage-uplink-e2e.js",
       "tests/e2e/test-rx-coverage-viewport-e2e.js",
       "tests/e2e/test-show-neighbors.js",
       "tests/e2e/test-slideover-1056-e2e.js",

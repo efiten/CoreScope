@@ -203,6 +203,7 @@ node tests/unit/test-rx-coverage-config-race.js
 node tests/unit/test-rx-coverage-mine.js
 node tests/unit/test-rx-coverage-escape.js
 node tests/unit/test-rx-coverage-noise.js
+node tests/unit/test-rx-coverage-uplink.js
 node tests/unit/test-rx-coverage-viewport.js
 node tests/unit/test-scope-audit-styles-linked.js
 node tests/unit/test-settings-sync.js

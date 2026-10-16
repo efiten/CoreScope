@@ -236,6 +236,12 @@ listens 10 s for repeaters re-broadcasting it, and publishes the ping here. Acce
 - Echoes keep their first hop (the repeater that heard the companion) and last hop (the one the
   companion heard it from). Invalid echoes are dropped; at most 32 are kept.
 - The broker ACL must allow `/uplink`.
+- **On the map:** the RX coverage page gets an **Uplink** layer (`GET /api/uplink-coverage`) when
+  `clientUplink.enabled` is set. Each hex shows the best result of the pings sent there:
+  *both directions* (a repeater re-broadcast was heard and an observer received the ping),
+  *heard by observers*, *repeater only* (no observer received it), or *not heard*. The tooltip lists
+  the repeaters that picked a ping up (first hops), the most observers reached and the longest path.
+  "Not received by an observer" can also mean no observer is in range there.
 
 ## Capture HARD RULE — only what was heard directly
 
