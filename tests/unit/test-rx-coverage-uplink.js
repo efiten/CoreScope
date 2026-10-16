@@ -43,5 +43,8 @@ assert.ok(html.includes('2026-10-16 14:51 UTC'), html);
 const one = t.uplinkCellHtml({ pings: 1, both: 0, observed: 0, echo: 0, none: 1, first_hops: ['<b>'], max_observers: 0, last_at: '' });
 assert.ok(one.includes('1 uplink ping<') && !one.includes('reached'), one);
 assert.ok(!one.includes('<b>'), 'first hops are escaped');
+const named = t.uplinkCellHtml({ pings: 1, both: 1, observed: 0, echo: 0, none: 0, first_hops: ['c0cd', '1403'],
+  first_hop_names: ['BE-ZHV-ON4AZP <x>', ''], max_observers: 0, last_at: '' });
+assert.ok(named.includes('picked up by: BE-ZHV-ON4AZP &#60;x&#62;, 1403'), 'a resolved name replaces the prefix, escaped; an unresolved one keeps it: ' + named);
 
 console.log('rx-coverage uplink layer OK');

@@ -110,7 +110,8 @@
   function uplinkCellHtml(p) {
     if (!p) return '';
     var parts = UPLINK_CLASSES.filter(function (c) { return p[c.key] > 0; }).map(function (c) { return p[c.key] + ' ' + c.label; });
-    var hops = (p.first_hops || []).map(function (h) { return escapeHtml(String(h).toUpperCase()); }).join(', ');
+    var names = p.first_hop_names || [];
+    var hops = (p.first_hops || []).map(function (h, i) { return escapeHtml(names[i] || String(h).toUpperCase()); }).join(', ');
     return '<div style="font-weight:600;margin-bottom:4px">' + p.pings + (p.pings === 1 ? ' uplink ping' : ' uplink pings') + '</div>' +
       '<div style="font-size:12px;line-height:1.6;min-width:180px">' +
       '<div>' + parts.join(' · ') + '</div>' +

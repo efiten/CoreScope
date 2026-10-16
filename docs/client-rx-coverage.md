@@ -240,7 +240,7 @@ listens 10 s for repeaters re-broadcasting it, and publishes the ping here. Acce
   `clientUplink.enabled` is set. Each hex shows the best result of the pings sent there:
   *both directions* (a repeater re-broadcast was heard and an observer received the ping),
   *heard by observers*, *repeater only* (no observer received it), or *not heard*. The tooltip lists
-  the repeaters that picked a ping up (first hops), the most observers reached and the longest path.
+  the repeaters that picked a ping up (first hops, by name when the prefix resolves to one node), the most observers reached and the longest path.
   "Not received by an observer" can also mean no observer is in range there.
 
 ## Capture HARD RULE — only what was heard directly
