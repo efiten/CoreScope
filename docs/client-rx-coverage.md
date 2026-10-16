@@ -128,6 +128,10 @@ the observer `/neighbors` source (`nodes.configured_scope`). Newest answer per r
 both, by the answer's own `timestamp`, so a buffered upload arriving late cannot overwrite a fresher
 one.
 
+`GET /api/nodes/declared-regions` returns that newest answer for every repeater in one response
+(`{pubkey, regions, wildcard, truncated}`), so a companion can choose the flood scope of what it
+sends from what the repeaters around it actually forward (see the uplink pings below).
+
 ```json
 {
   "origin": "<companion name>",
