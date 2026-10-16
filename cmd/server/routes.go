@@ -351,6 +351,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/uplink-coverage", s.handleUplinkCoverage).Methods("GET") // gated by requireClientUplink
 	r.HandleFunc("/api/nodes/resolve", s.handleResolvePrefix).Methods("GET")
 	r.HandleFunc("/api/nodes/reported", s.handleReportedNodes).Methods("GET")
+	r.HandleFunc("/api/nodes/declared-regions", s.handleDeclaredRegions).Methods("GET")
 	r.HandleFunc("/api/rx-coverage", s.handleRxCoverage).Methods("GET")
 	r.HandleFunc("/api/rx-leaderboard", s.handleRxLeaderboard).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}", s.handleNodeDetail).Methods("GET")
