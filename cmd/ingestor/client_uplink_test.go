@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -157,6 +158,42 @@ func TestNoteUplinkTransmissionLinksTagToHash(t *testing.T) {
 	noteUplinkTransmission(s, nil, grpTxtPayload(t, "#coredrive", "x: cdrx bbbbbbbb"), "3333333333333333")
 	if n := uplinkCount(t, s, "client_uplink_tx"); n != 1 {
 		t.Fatalf("client_uplink_tx rows = %d, want 1", n)
+	}
+}
+
+// The live ingestor holds #coredrive among its own channel keys, so the decoder
+// hands over a decrypted CHAN payload instead of GRP_TXT.
+func TestNoteUplinkTransmissionAlreadyDecrypted(t *testing.T) {
+	s := newTestStore(t)
+	ch := newUplinkChannel("#coredrive")
+	chanPayload := func(channel, text string) *DecodedPacket {
+		return &DecodedPacket{Payload: Payload{Type: "CHAN", Channel: channel, ChannelHash: ch.hashByte,
+			DecryptionStatus: "decrypted", Sender: "BE-ON8AR-Mobile", Text: text}}
+	}
+	noteUplinkTransmission(s, ch, chanPayload("#CoreDrive", "BE-ON8AR-Mobile: cdrx 71c131bd"), "19602811bbca85e5")
+	// Same hash byte, another channel: not a ping, whatever the text says.
+	noteUplinkTransmission(s, ch, chanPayload("#other", "x: cdrx aaaaaaaa"), "1111111111111111")
+	var hash, sender string
+	if err := s.db.QueryRow(`SELECT pkt_hash, sender FROM client_uplink_tx WHERE tag = '71c131bd'`).Scan(&hash, &sender); err != nil {
+		t.Fatal(err)
+	}
+	if hash != "19602811bbca85e5" || sender != "BE-ON8AR-Mobile" {
+		t.Fatalf("hash %s sender %q", hash, sender)
+	}
+	if n := uplinkCount(t, s, "client_uplink_tx"); n != 1 {
+		t.Fatalf("client_uplink_tx rows = %d, want 1", n)
+	}
+	// Through the real decoder with the key loaded: also CHAN, also linked.
+	key := ch.keyHex
+	keyed := grpTxtPayload(t, "#coredrive", "BE-ON8AR-Mobile: cdrx 036ec636")
+	raw, _ := hex.DecodeString(fmt.Sprintf("%02x", ch.hashByte) + keyed.Payload.MAC + keyed.Payload.EncryptedData)
+	dec := &DecodedPacket{Payload: decodeGrpTxt(raw, map[string]string{"#coredrive": key})}
+	if dec.Payload.Type != "CHAN" {
+		t.Fatalf("decoder type %s, want CHAN", dec.Payload.Type)
+	}
+	noteUplinkTransmission(s, ch, dec, "2222333344445555")
+	if n := uplinkCount(t, s, "client_uplink_tx"); n != 2 {
+		t.Fatalf("client_uplink_tx rows = %d, want 2", n)
 	}
 }
 

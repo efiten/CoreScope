@@ -170,6 +170,7 @@ func (s *Store) InsertClientUplinkPing(p *ClientUplinkPing) (bool, error) {
 
 // uplinkChannel is the ping channel the ingestor decrypts to learn tag → hash.
 type uplinkChannel struct {
+	name     string
 	keyHex   string
 	hashByte int
 }
@@ -185,29 +186,38 @@ func newUplinkChannel(name string) *uplinkChannel {
 	k := sha256.Sum256([]byte(name))
 	key := k[:16]
 	h := sha256.Sum256(key)
-	return &uplinkChannel{keyHex: hex.EncodeToString(key), hashByte: int(h[0])}
+	return &uplinkChannel{name: name, keyHex: hex.EncodeToString(key), hashByte: int(h[0])}
 }
 
 // noteUplinkTransmission links a ping's tag to the packet hash an observer
-// reported. Only GRP_TXT the ingestor could not decrypt with its own channel
-// keys reaches here, on the ping channel's hash byte; that byte is shared with
-// unrelated channels, so the MAC check in decryptChannelMessage is what tells
-// a ping from them.
+// reported. The ping channel's hash byte is shared with unrelated channels.
+// When the ingestor's own channel keys include the ping channel, the decoder
+// has already decrypted it (type CHAN) and the channel name tells a ping from
+// the others. Otherwise it arrives as GRP_TXT and the MAC check in
+// decryptChannelMessage does.
 func noteUplinkTransmission(store *Store, ch *uplinkChannel, decoded *DecodedPacket, pktHash string) {
 	if ch == nil || decoded == nil || pktHash == "" {
 		return
 	}
 	pl := decoded.Payload
-	if pl.Type != "GRP_TXT" || pl.ChannelHash != ch.hashByte || pl.EncryptedData == "" || pl.MAC == "" {
+	if pl.ChannelHash != ch.hashByte {
 		return
 	}
-	res, err := decryptChannelMessage(pl.EncryptedData, pl.MAC, ch.keyHex)
-	if err != nil {
+	var text, sender string
+	switch {
+	case pl.Type == "CHAN" && sameChannelName(pl.Channel, ch.name):
+		text, sender = pl.Text, pl.Sender
+	case pl.Type == "GRP_TXT" && pl.EncryptedData != "" && pl.MAC != "":
+		res, err := decryptChannelMessage(pl.EncryptedData, pl.MAC, ch.keyHex)
+		if err != nil {
+			return
+		}
+		text, sender = res.Message, res.Sender
+		if res.Sender != "" {
+			text = res.Sender + ": " + res.Message
+		}
+	default:
 		return
-	}
-	text := res.Message
-	if res.Sender != "" {
-		text = res.Sender + ": " + res.Message
 	}
 	m := uplinkTextTagRe.FindStringSubmatch(text)
 	if m == nil {
@@ -215,7 +225,12 @@ func noteUplinkTransmission(store *Store, ch *uplinkChannel, decoded *DecodedPac
 	}
 	if _, err := store.db.Exec(`
 		INSERT INTO client_uplink_tx (tag, pkt_hash, sender, seen_at) VALUES (?,?,?,?)
-		ON CONFLICT(tag) DO NOTHING`, m[1], pktHash, res.Sender, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		ON CONFLICT(tag) DO NOTHING`, m[1], pktHash, sender, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		log.Printf("[uplink] client_uplink_tx insert: %v", err)
 	}
+}
+
+// sameChannelName compares hashtag channel names ignoring case and the "#".
+func sameChannelName(a, b string) bool {
+	return strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(a), "#"), strings.TrimPrefix(strings.TrimSpace(b), "#"))
 }
