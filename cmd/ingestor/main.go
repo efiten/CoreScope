@@ -362,6 +362,16 @@ func main() {
 		}
 	}
 
+	// Uplink-ping retention: bounds client_uplink_pings and client_uplink_tx.
+	clientUplinkDays := cfg.ClientUplinkDaysOrZero()
+	if clientUplinkDays > 0 {
+		if n, err := store.PruneOldClientUplink(clientUplinkDays); err != nil {
+			log.Printf("[prune] client_uplink: %v", err)
+		} else if n > 0 {
+			log.Printf("[prune] startup pruned %d client_uplink rows older than %d days", n, clientUplinkDays)
+		}
+	}
+
 	// Node-name retention: bounds the opt-in client_node_names table.
 	// 0 = disabled.
 	clientNodeNamesDays := cfg.ClientNodeNamesDaysOrZero()
@@ -455,7 +465,7 @@ func main() {
 	// node_declared_regions retention (Task 6) rather than starting a second
 	// ticker — the four flags are independent (0 disables each separately),
 	// so the ticker itself must run when any is set.
-	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 || clientRegionsDays > 0 || clientNodeNamesDays > 0 {
+	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 || clientRegionsDays > 0 || clientNodeNamesDays > 0 || clientUplinkDays > 0 {
 		clientRxRetentionTicker := time.NewTicker(24 * time.Hour)
 		go func() {
 			for range clientRxRetentionTicker.C {
@@ -483,6 +493,13 @@ func main() {
 				if clientRegionsDays > 0 {
 					if n, err := store.PruneOldClientDeclaredRegions(clientRegionsDays); err != nil {
 						log.Printf("[prune] node_declared_regions: %v", err)
+					} else if n > 0 {
+						store.RunIncrementalVacuum(vacuumPages)
+					}
+				}
+				if clientUplinkDays > 0 {
+					if n, err := store.PruneOldClientUplink(clientUplinkDays); err != nil {
+						log.Printf("[prune] client_uplink: %v", err)
 					} else if n > 0 {
 						store.RunIncrementalVacuum(vacuumPages)
 					}
@@ -884,7 +901,8 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// Mobile client topics: meshcore/client/{PUBLIC_KEY}/packets (RX coverage),
 	// meshcore/client/{PUBLIC_KEY}/rf (RF environment samples), and
 	// meshcore/client/{PUBLIC_KEY}/regions (declared-region answers), and
-	// meshcore/client/{PUBLIC_KEY}/names (a repeater's own name). A
+	// meshcore/client/{PUBLIC_KEY}/names (a repeater's own name), and
+	// meshcore/client/{PUBLIC_KEY}/uplink (uplink pings). A
 	// roaming companion reports where it directly heard a node, its own
 	// radio's counters, or a repeater's declared region list; all three are
 	// handled in isolation from the observer/observations path. EMQX ACL
@@ -928,6 +946,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		case "names":
 			if cfg.ClientNodeNamesEnabled() {
 				handleClientNodeNames(store, tag, parts[2], msg)
+			}
+		case "uplink":
+			if cfg.ClientUplinkEnabled() {
+				handleClientUplink(store, tag, parts[2], msg)
 			}
 		}
 		return
@@ -1219,6 +1241,8 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			if _, err := store.InsertTransmission(pktData); err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
 			}
+			// An uplink ping an observer received: learn its tag → hash.
+			noteUplinkTransmission(store, cfg.UplinkChannel(), decoded, pktData.Hash)
 		}
 
 		// Upsert observer

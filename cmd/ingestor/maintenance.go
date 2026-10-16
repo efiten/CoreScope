@@ -437,3 +437,26 @@ func (s *Store) pruneOldClientNodeNamesAt(cutoffInstant time.Time) (int64, error
 	n, _ := res.RowsAffected()
 	return n, nil
 }
+
+// PruneOldClientUplink deletes uplink pings (by sent_at) and tag links (by
+// seen_at) older than `days`. 0 disables.
+func (s *Store) PruneOldClientUplink(days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	return s.pruneOldClientUplinkAt(time.Now().UTC().AddDate(0, 0, -days))
+}
+
+func (s *Store) pruneOldClientUplinkAt(cutoffInstant time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM client_uplink_pings WHERE sent_at < ?`, cutoffInstant.Format(rxTimeMillisLayout))
+	if err != nil {
+		return 0, fmt.Errorf("prune client_uplink_pings: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	res, err = s.db.Exec(`DELETE FROM client_uplink_tx WHERE seen_at < ?`, cutoffInstant.Format(time.RFC3339))
+	if err != nil {
+		return n, fmt.Errorf("prune client_uplink_tx: %w", err)
+	}
+	m, _ := res.RowsAffected()
+	return n + m, nil
+}

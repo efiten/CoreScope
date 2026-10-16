@@ -494,6 +494,38 @@ func applySchema(db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_cnn_target ON client_node_names(target, observed_at);
 		CREATE INDEX IF NOT EXISTS idx_cnn_prune  ON client_node_names(observed_at);
+
+		-- Uplink pings (cmd/ingestor/client_uplink.go): one row per ping a mobile
+		-- companion sent. pkt_hash is set when the companion heard an echo;
+		-- client_uplink_tx fills it in for pings without one, from the ingestor's
+		-- own decryption of the ping channel. The server joins both against
+		-- transmissions/observations to see whether an observer received it.
+		CREATE TABLE IF NOT EXISTS client_uplink_pings (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			rx_pubkey   TEXT NOT NULL,
+			tag         TEXT NOT NULL,
+			sent_at     TEXT NOT NULL,
+			ingested_at TEXT NOT NULL,
+			channel     TEXT NOT NULL DEFAULT '',
+			scope       TEXT NOT NULL DEFAULT '',
+			pkt_hash    TEXT,
+			echo_count  INTEGER NOT NULL DEFAULT 0,
+			first_hops  TEXT NOT NULL DEFAULT '',
+			echoes_json TEXT NOT NULL DEFAULT '[]',
+			lat         REAL,
+			lon         REAL,
+			pos_acc_m   REAL,
+			UNIQUE(rx_pubkey, tag)
+		);
+		CREATE INDEX IF NOT EXISTS idx_cup_latlon ON client_uplink_pings(lat, lon);
+		CREATE INDEX IF NOT EXISTS idx_cup_sent   ON client_uplink_pings(sent_at);
+		CREATE TABLE IF NOT EXISTS client_uplink_tx (
+			tag      TEXT PRIMARY KEY,
+			pkt_hash TEXT NOT NULL,
+			sender   TEXT NOT NULL DEFAULT '',
+			seen_at  TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_cut_seen ON client_uplink_tx(seen_at);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
