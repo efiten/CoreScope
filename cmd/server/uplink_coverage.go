@@ -74,17 +74,20 @@ type UplinkFeature struct {
 
 // UplinkProperties summarises the pings in one cell.
 type UplinkProperties struct {
-	Cell         string   `json:"cell"`
-	Pings        int      `json:"pings"`
-	Both         int      `json:"both"`
-	Observed     int      `json:"observed"`
-	Echo         int      `json:"echo"`
-	None         int      `json:"none"`
-	Best         string   `json:"best"`
-	FirstHops    []string `json:"first_hops"`
-	MaxObservers int      `json:"max_observers"`
-	MaxHops      int      `json:"max_hops"`
-	LastAt       string   `json:"last_at"`
+	Cell      string   `json:"cell"`
+	Pings     int      `json:"pings"`
+	Both      int      `json:"both"`
+	Observed  int      `json:"observed"`
+	Echo      int      `json:"echo"`
+	None      int      `json:"none"`
+	Best      string   `json:"best"`
+	FirstHops []string `json:"first_hops"`
+	// FirstHopNames runs parallel to FirstHops: the repeater's name, or ""
+	// when the prefix is unknown, ambiguous or hidden (batchResolveHeardKeys).
+	FirstHopNames []string `json:"first_hop_names"`
+	MaxObservers  int      `json:"max_observers"`
+	MaxHops       int      `json:"max_hops"`
+	LastAt        string   `json:"last_at"`
 }
 
 func aggregateUplink(rows []uplinkPingRow, arrivals map[string]uplinkArrival, res int) UplinkFeatureCollection {
@@ -247,6 +250,23 @@ func (s *Server) queryUplinkArrivals(rows []uplinkPingRow) (map[string]uplinkArr
 // lexicographically against stored values.
 const rxTimeMillisLayoutServer = "2006-01-02T15:04:05.000Z07:00"
 
+// nameUplinkFirstHops fills FirstHopNames for every cell with one lookup for
+// the distinct prefixes of the whole response.
+func (s *Server) nameUplinkFirstHops(features []UplinkFeature) {
+	var keys []string
+	for _, f := range features {
+		keys = append(keys, f.Properties.FirstHops...)
+	}
+	names := s.batchResolveHeardKeys(keys)
+	for i := range features {
+		p := &features[i].Properties
+		p.FirstHopNames = make([]string, len(p.FirstHops))
+		for j, h := range p.FirstHops {
+			p.FirstHopNames[j] = names[h][1]
+		}
+	}
+}
+
 func (s *Server) requireClientUplink(w http.ResponseWriter, r *http.Request) bool {
 	if s == nil || s.cfg == nil || !s.cfg.ClientUplinkEnabled() {
 		http.NotFound(w, r)
@@ -286,6 +306,7 @@ func (s *Server) handleUplinkCoverage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fc = aggregateUplink(rows, arrivals, zoomToHexRes(z))
+		s.nameUplinkFirstHops(fc.Features)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(fc)

@@ -85,6 +85,8 @@ func seedUplinkDB(t *testing.T) *DB {
 	mustExecDB(t, db, `INSERT INTO observations (transmission_id, observer_id, path_json, timestamp) VALUES
 		(1,'obsA','["1403","23C6"]',1),(1,'obsB','["1403","23C6","907C"]',1),(1,'obsA','["1403"]',1),
 		(2,'obsC','["5A5A"]',1)`)
+	// 1403 resolves to one node; c0cd matches two, so it stays unnamed.
+	mustExecDB(t, db, `INSERT INTO nodes (public_key, name) VALUES ('1403aa', 'BE-ZHV-ON4AZP'), ('c0cd01', 'one'), ('c0cd02', 'two')`)
 	return db
 }
 
@@ -122,6 +124,9 @@ func TestUplinkCoverageEndpoint(t *testing.T) {
 	}
 	if obs, ok := got[uplinkObserved]; !ok || obs.MaxObservers != 1 {
 		t.Fatalf("observed cell (hash from client_uplink_tx) = %+v", obs)
+	}
+	if len(both.FirstHops) != 2 || len(both.FirstHopNames) != 2 || both.FirstHopNames[0] != "BE-ZHV-ON4AZP" || both.FirstHopNames[1] != "" {
+		t.Fatalf("first hops %v named %q, want 1403 named and the ambiguous c0cd left empty", both.FirstHops, both.FirstHopNames)
 	}
 	if code, fc := getUplink(t, srv, "bbox=50,5,52,6&z=12&days=30"); code != 200 || len(fc.Features) != 3 {
 		t.Fatalf("30 days: status %d, cells %d, want 3", code, len(fc.Features))
