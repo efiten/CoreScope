@@ -1086,6 +1086,7 @@ type ClientConfigResponse struct {
 	Customizer          CustomizerClientConfig `json:"customizer"`
 	ClientRxCoverage    bool                   `json:"clientRxCoverage"`
 	ClientRfSamples     bool                   `json:"clientRfSamples"`
+	ClientUplink        bool                   `json:"clientUplink"`
 	// Present (true) only when clientRxCoverage.requireLinkedCompanion is set
 	// and user management is on: CoreDrive RX then holds its queue until
 	// its companion is linked.

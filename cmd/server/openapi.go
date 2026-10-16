@@ -160,6 +160,12 @@ func routeDescriptions() map[string]routeMeta {
 				{Name: "z", Description: "Leaflet zoom level; sets the hex resolution", Type: "integer"},
 				{Name: "days", Description: "Look-back window in days (1-30, default 7)", Type: "integer"},
 			}},
+		"GET /api/uplink-coverage": {Summary: "Uplink ping hex grid", Description: "GeoJSON hex cells where mobile companions sent uplink pings (CoreDrive RX, client_uplink_pings). Per cell: pings, and how many were `both` (a repeater re-broadcast was heard by the companion AND an observer received the ping), `observed` (observer only), `echo` (re-broadcast heard, no observer received it) or `none`; `best` is the best class in the cell, plus the first-hop repeaters, the most observers reached and the longest path. `observed` depends on observer placement: a ping no observer received may still have travelled. Gated on clientUplink.", Tag: "coverage",
+			QueryParams: []paramMeta{
+				{Name: "bbox", Description: "Bounding box as minLat,minLon,maxLat,maxLon", Type: "string", Required: true},
+				{Name: "z", Description: "Leaflet zoom level; sets the hex resolution", Type: "integer"},
+				{Name: "days", Description: "Look-back window in days (1-30, default 7)", Type: "integer"},
+			}},
 		"GET /api/rx-coverage": {Summary: "Mobile RX coverage hex grid", Description: "GeoJSON hex cells where mobile clients directly heard nodes (client_receptions): count, best SNR and the nodes heard per cell. With gaps=1 the payload also carries a `gaps` member: cells a companion drove through (moving client_rf_samples) with no reception in the same window, each with its sample count, plus `gaps_truncated` when capped. Gaps are only returned without a node filter and with clientRfSamples on; they mean nothing was received in this period, not that there is no coverage. Gated on clientRxCoverage.", Tag: "coverage",
 			QueryParams: []paramMeta{
 				{Name: "bbox", Description: "Bounding box as minLat,minLon,maxLat,maxLon", Type: "string", Required: true},

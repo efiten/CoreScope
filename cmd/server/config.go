@@ -185,6 +185,10 @@ type Config struct {
 	// off; see ClientRfSamplesEnabled.
 	ClientRfSamples *ClientRfSamplesConfig `json:"clientRfSamples,omitempty"`
 
+	// ClientUplink gates the uplink ping layer (cmd/server/uplink_coverage.go).
+	// Same JSON section as the ingestor's ClientUplinkConfig; absent ⇒ off.
+	ClientUplink *ClientUplinkConfig `json:"clientUplink,omitempty"`
+
 	// UserManagement gates optional accounts
 	// (docs/specs/2026-10-06-user-management-design.md). Absent/nil means off;
 	// see UserManagementEnabled.
@@ -316,6 +320,16 @@ func (c *Config) ClientRxRequireLinkedCompanionSet() bool {
 // both binaries from the same config.json).
 type ClientRfSamplesConfig struct {
 	Enabled bool `json:"enabled"`
+}
+
+// ClientUplinkConfig mirrors cmd/ingestor's ClientUplinkConfig.
+type ClientUplinkConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ClientUplinkEnabled reports whether the uplink layer is served.
+func (c *Config) ClientUplinkEnabled() bool {
+	return c != nil && c.ClientUplink != nil && c.ClientUplink.Enabled
 }
 
 // ClientRfSamplesEnabled reports whether the opt-in RF environment sample

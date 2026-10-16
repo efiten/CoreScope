@@ -348,6 +348,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	// Same registered-unconditionally / 404-when-off pattern as coverage above,
 	// gated by requireClientRfSamples instead.
 	r.HandleFunc("/api/rf-noise", s.handleRfNoise).Methods("GET")
+	r.HandleFunc("/api/uplink-coverage", s.handleUplinkCoverage).Methods("GET") // gated by requireClientUplink
 	r.HandleFunc("/api/nodes/resolve", s.handleResolvePrefix).Methods("GET")
 	r.HandleFunc("/api/nodes/reported", s.handleReportedNodes).Methods("GET")
 	r.HandleFunc("/api/rx-coverage", s.handleRxCoverage).Methods("GET")
@@ -550,6 +551,7 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		Customizer:                     CustomizerClientConfig{DisabledTabs: disabledTabs},
 		ClientRxCoverage:               s.cfg.ClientRxCoverageEnabled(),
 		ClientRfSamples:                s.cfg.ClientRfSamplesEnabled(),
+		ClientUplink:                   s.cfg.ClientUplinkEnabled(),
 		ClientRxRequireLinkedCompanion: s.auth != nil && s.cfg.ClientRxRequireLinkedCompanionSet(),
 		PathTrust:                      &pathTrust,
 		UserManagement:                 s.clientUserManagement(),
