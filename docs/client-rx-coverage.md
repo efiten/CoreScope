@@ -206,6 +206,37 @@ toggle under Display shows or hides them (on by default).
   from one side only is placed towards that side. The ingestor stores the receptions; the server
   computes the estimate on request and caches it for 5 minutes.
 
+### Uplink pings: `meshcore/client/{PUBLIC_KEY}/uplink`
+
+CoreDrive RX v1.21.0 and later can test whether the mesh hears the companion. With its `uplinkPing`
+on, it sends `cdrx <tag>` on a hashtag channel (`#coredrive` by default, usually region-scoped),
+listens 10 s for repeaters re-broadcasting it, and publishes the ping here. Accepted only when
+`clientUplink.enabled` is set; stored in `client_uplink_pings`.
+
+```json
+{
+  "origin": "<companion name>",
+  "origin_id": "<companion pubkey hex>",
+  "timestamp": "2026-10-16T14:11:17.000Z",
+  "type": "UPLINK_PING",
+  "tag": "78277c0e",
+  "channel": "#coredrive",
+  "scope": "#be",
+  "pkt_hash": "b76c6a2777f9b0e9",
+  "echoes": [{ "first_hop": "1403", "last_hop": "1403", "hops": 1, "snr": 12.25, "rssi": -100 }],
+  "gps": { "lat": 50.998, "lon": 5.384, "acc_m": 6 }
+}
+```
+
+- `tag` must be 8 hex characters. `pkt_hash` (16 hex) is present when an echo was heard; it is the
+  same hash `transmissions.hash` uses, so the ping can be matched with what observers received.
+- Without an echo, the ingestor fills the link in itself: it decrypts GRP_TXT on the ping channel
+  (`clientUplink.channel`) and stores tag to hash in `client_uplink_tx`. The channel's hash byte is
+  shared with unrelated channels; the MAC check and the `cdrx <tag>` text tell a ping apart.
+- Echoes keep their first hop (the repeater that heard the companion) and last hop (the one the
+  companion heard it from). Invalid echoes are dropped; at most 32 are kept.
+- The broker ACL must allow `/uplink`.
+
 ## Capture HARD RULE — only what was heard directly
 
 The app and ingestor record **only the node the companion physically received**, never upstream

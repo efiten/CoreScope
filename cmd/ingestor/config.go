@@ -65,6 +65,7 @@ type Config struct {
 	ClientRfSamples      *ClientRfSamplesConfig      `json:"clientRfSamples,omitempty"`
 	ClientRegions        *ClientRegionsConfig        `json:"clientRegions,omitempty"`
 	ClientNodeNames      *ClientNodeNamesConfig      `json:"clientNodeNames,omitempty"`
+	ClientUplink         *ClientUplinkConfig         `json:"clientUplink,omitempty"`
 	GeoFilter            *GeoFilterConfig            `json:"geo_filter,omitempty"`
 	// PathTrust configures the minimum path-hash prefix length trusted as
 	// mapping/topology evidence (issue #1784).
@@ -236,6 +237,39 @@ func (c *Config) ClientNodeNamesEnabled() bool {
 	return c.ClientNodeNames != nil && c.ClientNodeNames.Enabled
 }
 
+// ClientUplinkConfig controls the opt-in uplink ping stream
+// (meshcore/client/<pubkey>/uplink). Channel is the hashtag channel the pings
+// are sent on; the ingestor decrypts it to link a ping to its packet hash when
+// the companion heard no echo. Default "#coredrive".
+type ClientUplinkConfig struct {
+	Enabled bool   `json:"enabled"`
+	Channel string `json:"channel,omitempty"`
+
+	once sync.Once
+	ch   *uplinkChannel
+}
+
+// ClientUplinkEnabled reports whether uplink pings are recorded. Default false.
+func (c *Config) ClientUplinkEnabled() bool {
+	return c.ClientUplink != nil && c.ClientUplink.Enabled
+}
+
+// UplinkChannel returns the ping channel's derived key, computed once.
+func (c *Config) UplinkChannel() *uplinkChannel {
+	if !c.ClientUplinkEnabled() {
+		return nil
+	}
+	u := c.ClientUplink
+	u.once.Do(func() {
+		name := u.Channel
+		if strings.TrimSpace(name) == "" {
+			name = "#coredrive"
+		}
+		u.ch = newUplinkChannel(name)
+	})
+	return u.ch
+}
+
 // AutoRegionKeysConfig controls the opt-in derivation of region keys from the
 // names repeaters declare over RF (node_declared_regions), on top of the
 // explicit hashRegions list.
@@ -325,6 +359,9 @@ type RetentionConfig struct {
 	// ClientNodeNamesDays is the retention window (by observed_at) for the
 	// client_node_names table; 0 disables.
 	ClientNodeNamesDays int `json:"clientNodeNamesDays"`
+	// ClientUplinkDays is the retention window (by sent_at / seen_at) for
+	// client_uplink_pings and client_uplink_tx; 0 disables.
+	ClientUplinkDays int `json:"clientUplinkDays"`
 }
 
 // PacketDaysOrZero returns the configured retention.packetDays or 0
@@ -375,6 +412,14 @@ func (c *Config) ClientRfDaysOrZero() int {
 func (c *Config) ClientRegionsDaysOrZero() int {
 	if c.Retention != nil && c.Retention.ClientRegionsDays > 0 {
 		return c.Retention.ClientRegionsDays
+	}
+	return 0
+}
+
+// ClientUplinkDaysOrZero returns retention.clientUplinkDays or 0 (disabled).
+func (c *Config) ClientUplinkDaysOrZero() int {
+	if c.Retention != nil && c.Retention.ClientUplinkDays > 0 {
+		return c.Retention.ClientUplinkDays
 	}
 	return 0
 }
