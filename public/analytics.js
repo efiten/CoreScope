@@ -71,6 +71,40 @@
     return `<svg viewBox="0 0 ${w} ${h}" style="width:${w}px;height:${h}px" role="img" aria-label="Sparkline showing trend of ${data.length} data points"><title>Sparkline showing trend of ${data.length} data points</title><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
   }
 
+  // Packets / Hour (#2193): a long history rolls up to coarser bars (at most
+  // 180, so about 4 units each in barChart's plot) with about 10 labels.
+  // Under "All data" (no opts.window) the chart starts on the first UTC day
+  // with at least 2% of a typical recent day (the median of the seven days
+  // before the last one), at its first hour with a tenth of a typical hour: a
+  // short store also keeps a few old packets that were heard again, weeks
+  // before the rest. The card then says where it starts. In a picked window
+  // the server has already cut the data to it, so nothing is cropped.
+  function packetsPerHourCard(pph, opts) {
+    const icon = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-trend-up"/></svg>';
+    if (!pph || !pph.length) return { html: `<h3>${icon} Packets / Hour</h3><p class="text-muted">No packets in this period.</p>`, from: null };
+    const at = (h) => Date.parse(h.hour.replace(' ', 'T') + ':00:00Z');
+    const days = new Map();
+    pph.forEach((h) => days.set(h.hour.slice(0, 10), (days.get(h.hour.slice(0, 10)) || 0) + h.count));
+    const recent = [...days.values()].slice(-8, -1).sort((a, b) => a - b);
+    const floor = (recent.length ? recent[recent.length >> 1] : 0) * 0.02;
+    const day = [...days.keys()].find((d) => days.get(d) >= floor);
+    const first = at(pph[0]);
+    const start = opts && opts.window ? first : at(pph.find((h) => h.hour.slice(0, 10) >= day && h.count >= floor * 5 / 24) || pph[0]);
+    const last = at(pph[pph.length - 1]), spanH = (last - start) / 3600e3 + 1;
+    const [bh, name] = [[1, 'Hour'], [6, '6 hours'], [24, 'Day']].find(([b]) => spanH / b <= 180) || [168, 'Week'];
+    const step = bh * 3600e3, from = Math.floor(start / step) * step, counts = [];
+    for (let t = from; t <= last; t += step) counts.push(0);
+    pph.forEach((h) => { const k = Math.floor((at(h) - from) / step); if (k >= 0) counts[k] += h.count; });
+    const every = [1, 3, 6, 12, 24, 48, 72, 168, 336, 672, 1344].find((e) => e >= bh && counts.length * bh / e <= 10) || 2688;
+    const labels = counts.map((_, i) => {
+      const t = from + i * step, d = new Date(t), hh = d.getUTCHours();
+      if ((t / 3600e3) % every) return '';
+      return spanH > 48 && (every >= 24 || hh === 0) ? d.toISOString().slice(5, 10) : String(hh).padStart(2, '0') + 'h';
+    });
+    const since = from > first ? ` <span class="text-muted">since ${new Date(from).toISOString().slice(5, 10)}</span>` : '';
+    return { html: `<h3>${icon} Packets / ${name}${since}</h3>${barChart(counts, labels, 'var(--accent)')}`, from };
+  }
+
   function barChart(data, labels, colors, w = 800, h = 220, pad = 40) {
     const max = Math.max(...data, 1);
     const barW = Math.max(1, Math.min((w - pad * 2) / data.length - 2, 30));
@@ -260,6 +294,9 @@
       // from window.ROLE_COLORS, role swatches use CSS tokens, and the one
       // cached value (_labelColor) is re-read on restart.
       if (_currentTab === 'neighbor-graph' && _ngState) { startGraphRenderer(); return; }
+      // Before the answers land there is nothing to re-render; loadAnalytics()
+      // renders the tab with the current theme when they do.
+      if (!_analyticsData.rfData) return;
       renderTab(_currentTab);
     };
     window.addEventListener('theme-refresh', _themeRefreshHandler);
@@ -299,7 +336,7 @@
         api('/analytics/hash-collisions' + sepBase, { ttl: CLIENT_TTL.analyticsRF }),
         api('/analytics/relay-airtime-share' + sepWin, { ttl: CLIENT_TTL.analyticsRF }).catch(() => ({ rows: [] })),
       ]);
-      _analyticsData = { hashData, rfData, topoData, chanData, collisionData, airtimeData };
+      _analyticsData = { hashData, rfData, topoData, chanData, collisionData, airtimeData, window: twVal };
       renderTab(_currentTab);
     } catch (e) {
       document.getElementById('analyticsContent').innerHTML =
@@ -405,28 +442,7 @@
       </div>
 
       <div class="analytics-row">
-        <div class="analytics-card flex-1">
-          <h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-trend-up"/></svg> Packets / Hour</h3>
-          ${(() => {
-            const pph = rf.packetsPerHour;
-            const counts = pph.map(h => h.count);
-            // Decimate x-axis labels to avoid overlap
-            const totalHours = pph.length;
-            // Pick label interval: <=24h show every 6h, <=72h every 12h, else every 24h
-            const labelInterval = totalHours <= 24 ? 6 : totalHours <= 72 ? 12 : 24;
-            const labels = pph.map((h, i) => {
-              const hh = h.hour.slice(11, 13); // "HH"
-              const hourNum = parseInt(hh, 10);
-              if (hourNum % labelInterval === 0) {
-                // For multi-day ranges, show date on 00h boundaries
-                if (totalHours > 48 && hourNum === 0) return h.hour.slice(5, 10);
-                return hh + 'h';
-              }
-              return ''; // skip label
-            });
-            return barChart(counts, labels, 'var(--accent)');
-          })()}
-        </div>
+        <div class="analytics-card flex-1">${packetsPerHourCard(rf.packetsPerHour, { window: d.window }).html}</div>
       </div>
 
       <div class="analytics-row">
@@ -2453,18 +2469,13 @@
       const byObservers = [...enriched].sort((a, b) => (b.health.observers?.length || 0) - (a.health.observers?.length || 0));
       const byRecent = [...enriched].filter(n => n.health.stats.lastHeard).sort((a, b) => new Date(b.health.stats.lastHeard) - new Date(a.health.stats.lastHeard));
 
-      // Compute network status client-side from loaded nodes using shared getHealthThresholds()
+      // Compute network status client-side from loaded nodes using shared getHealthStatus()
       const now = Date.now();
       let active = 0, degraded = 0, silent = 0;
       nodes.forEach(function(n) {
-        const role = n.role || 'unknown';
-        const th = getHealthThresholds(role);
-        const lastMs = n.last_heard ? new Date(n.last_heard).getTime()
-                     : n.last_seen ? new Date(n.last_seen).getTime()
-                     : 0;
-        const age = lastMs ? (now - lastMs) : Infinity;
-        if (age < th.degradedMs) active++;
-        else if (age < th.silentMs) degraded++;
+        const s = getHealthStatus(n.role, n.last_heard || n.last_seen, now);
+        if (s === 'healthy') active++;
+        else if (s === 'degraded') degraded++;
         else silent++;
       });
       const totalNodes = nodesResp.total || nodes.length;
@@ -2655,14 +2666,9 @@
       (Array.isArray(clockData) ? clockData : []).forEach(c => { if (c && c.pubkey) clockByPk[c.pubkey] = c; });
 
       const now = Date.now();
-      function ageOf(n) {
-        const ms = n.last_heard ? new Date(n.last_heard).getTime() : n.last_seen ? new Date(n.last_seen).getTime() : 0;
-        return ms ? now - ms : Infinity;
-      }
       function statusOf(n) {
-        const th = (typeof getHealthThresholds === 'function') ? getHealthThresholds(n.role) : { degradedMs: 3600000, silentMs: 86400000 };
-        const age = ageOf(n);
-        return age < th.degradedMs ? 'active' : age < th.silentMs ? 'degraded' : 'silent';
+        const s = getHealthStatus(n.role, n.last_heard || n.last_seen, now);
+        return s === 'healthy' ? 'active' : (s || 'silent');
       }
       const pct = v => (v != null ? (v * 100).toFixed(1) + '%' : '—');
       // #1927: no fallback to usefulness_score. They are different metrics:
@@ -3184,6 +3190,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _stopDistanceRet
     window._analyticsRetransmissionBucketFor = retransmissionBucketFor;
     window._analyticsRenderRetransmissionChart = renderRetransmissionChart;
     window._analyticsScopeAdvertsByRoleHtml = scopeAdvertsByRoleHtml;
+    window._analyticsPacketsPerHourCard = packetsPerHourCard;
   }
 
   // ─── Neighbor Graph Tab ─────────────────────────────────────────────────────
