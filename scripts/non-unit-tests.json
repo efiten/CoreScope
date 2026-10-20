@@ -35,6 +35,7 @@
       "tests/e2e/test-gestures-1185-scroll-discriminator-e2e.js",
       "tests/e2e/test-health-status-e2e.js",
       "tests/e2e/test-home-coverage-e2e.js",
+      "tests/e2e/test-hop-path-inference-e2e.js",
       "tests/e2e/test-issue-1109-hamburger-dropdown-visible-e2e.js",
       "tests/e2e/test-issue-1122-packets-filter-ux-e2e.js",
       "tests/e2e/test-issue-1128-multi-viewport-e2e.js",
@@ -71,6 +72,7 @@
       "tests/e2e/test-issue-1268-rf-params-e2e.js",
       "tests/e2e/test-issue-1639-observers-sort-e2e.js",
       "tests/e2e/test-issue-748-node-analytics-coverage-e2e.js",
+      "tests/e2e/test-issue-2218-node-analytics-stale-e2e.js",
       "tests/e2e/test-issue-661-airtime-e2e.js",
       "tests/e2e/test-issue-1640-compare-discovery-e2e.js",
       "tests/e2e/test-issue-1648-m1-icons-e2e.js",
@@ -122,6 +124,7 @@
       "tests/e2e/test-slideover-1056-e2e.js",
       "tests/e2e/test-slideover-1168-munger-e2e.js",
       "tests/e2e/test-table-fluid-e2e.js",
+      "tests/e2e/test-theme-url-param-2236-e2e.js",
       "tests/e2e/test-touch-gestures-coverage-e2e.js",
       "tests/e2e/test-touch-targets.js",
       "tests/e2e/test-user-management-e2e.js"
