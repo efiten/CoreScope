@@ -153,11 +153,29 @@ type reportedNodesCache struct {
 	resp *ReportedNodesResponse
 }
 
+// handleReportedNodes is gated like the other endpoints built on
+// client_receptions: the counts and the estimate come from companion GPS fixes.
 func (s *Server) handleReportedNodes(w http.ResponseWriter, r *http.Request) {
+	if !s.requireClientRxCoverage(w, r) {
+		return
+	}
 	if s.db == nil || s.db.conn == nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
+	resp, err := s.reportedNodesResponse()
+	if err != nil {
+		log.Printf("[reported-nodes] compute failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	writeJSON(w, resp)
+}
+
+// reportedNodesResponse returns the cached list, recomputing it when stale.
+// The mutex makes concurrent misses wait for one computation; the response is
+// written after it is released, so a slow client never holds it.
+func (s *Server) reportedNodesResponse() (*ReportedNodesResponse, error) {
 	c := &s.reportedNodes
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -165,13 +183,12 @@ func (s *Server) handleReportedNodes(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		resp, err := s.computeReportedNodes()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+			return nil, err
 		}
 		log.Printf("[reported-nodes] %d repeaters, %d with an estimate, computed in %s", len(resp.Nodes), countEstimates(resp.Nodes), time.Since(start).Round(time.Millisecond))
 		c.resp, c.at = resp, time.Now()
 	}
-	writeJSON(w, c.resp)
+	return c.resp, nil
 }
 
 func countEstimates(nodes []ReportedNode) int {
@@ -192,28 +209,31 @@ func (db *DB) tablePresent(name string) bool {
 	return err == nil && n > 0
 }
 
-// computeReportedNodes builds the list: every client_node_names target with no
-// advert position in nodes (or inactive_nodes), with its direct receptions.
+// computeReportedNodes builds the list: every client_node_names target that
+// never sent an advert (no row in nodes or inactive_nodes) and was heard
+// directly at least once (clientNameHeard), with its direct receptions. A node
+// with an advert, with or without a position, is in /api/nodes under its
+// advert name, so listing it here as well would show it twice.
 func (s *Server) computeReportedNodes() (*ReportedNodesResponse, error) {
 	resp := &ReportedNodesResponse{Nodes: []ReportedNode{}}
 	resp.Method.SpotM = estimateSpotM
 	resp.Method.MinSpots = estimateMinSpots
 	resp.Method.MinSpreadM = estimateMinSpreadM
 	resp.Method.MinRadiusM = estimateMinRadiusM
-	if !s.db.clientNodeNamesPresent() {
+	if !s.db.clientNamesUsable() {
 		return resp, nil
 	}
 
-	positioned := `EXISTS (SELECT 1 FROM nodes n WHERE n.public_key = c.target AND n.lat IS NOT NULL AND n.lon IS NOT NULL AND NOT (n.lat = 0 AND n.lon = 0))`
-	if s.db.tablePresent("inactive_nodes") {
-		positioned += ` OR EXISTS (SELECT 1 FROM inactive_nodes n WHERE n.public_key = c.target AND n.lat IS NOT NULL AND n.lon IS NOT NULL AND NOT (n.lat = 0 AND n.lon = 0))`
+	advertised := `EXISTS (SELECT 1 FROM nodes n WHERE n.public_key = c.target)`
+	if s.db.inactiveNodesPresent() {
+		advertised += ` OR EXISTS (SELECT 1 FROM inactive_nodes n WHERE n.public_key = c.target)`
 	}
 	// The bare name beside MAX(observed_at) is SQLite's bare-column rule: the
 	// name of the newest observation (same as lookupPrefixes).
 	rows, err := s.db.conn.Query(`
 		SELECT target, name, MAX(observed_at), COUNT(DISTINCT rx_pubkey)
 		FROM client_node_names c
-		WHERE NOT (`+positioned+`)
+		WHERE NOT (`+advertised+`) AND `+s.db.clientNameHeard()+`
 		GROUP BY target
 		ORDER BY MAX(observed_at) DESC
 		LIMIT ?`, reportedNodesMax)
@@ -240,7 +260,7 @@ func (s *Server) computeReportedNodes() (*ReportedNodesResponse, error) {
 		return nil, err
 	}
 
-	if len(order) > 0 && s.db.tablePresent("client_receptions") {
+	if len(order) > 0 {
 		pts, err := s.directReceptions(order)
 		if err != nil {
 			return nil, err
@@ -266,8 +286,9 @@ type targetReceptions struct {
 
 // directReceptions collects, per target, the receptions that certainly heard
 // that repeater directly:
-//   - discover/advert rows keyed by the full pubkey or its 8-byte prefix, which
-//     carry the responder's own identity
+//   - discover/advert rows keyed by the full pubkey, which carry the
+//     responder's own identity, or by its 8-byte prefix when no other known
+//     pubkey starts with it (sharedEightBytePrefixes)
 //   - rxlog rows keyed by a 2-3 byte path hash, only when that prefix resolves
 //     uniquely to this target (lookupPrefixes); otherwise another node with
 //     the same hash could be the one heard
@@ -279,13 +300,16 @@ func (s *Server) directReceptions(targets []string) (map[string]*targetReception
 	var short []string
 	for _, pk := range targets {
 		keyTarget[pk] = pk
-		if len(pk) >= 16 {
-			keyTarget[pk[:16]] = pk
-		}
 		for _, n := range []int{4, 6} {
 			if len(pk) >= n {
 				short = append(short, pk[:n])
 			}
+		}
+	}
+	shared := s.sharedEightBytePrefixes(targets)
+	for _, pk := range targets {
+		if len(pk) >= 16 && !shared[pk[:16]] {
+			keyTarget[pk[:16]] = pk
 		}
 	}
 	wanted := make(map[string]bool, len(targets))
@@ -361,4 +385,61 @@ func (s *Server) directReceptions(targets []string) (map[string]*targetReception
 		}
 	}
 	return out, nil
+}
+
+// sharedEightBytePrefixes returns the 8-byte (16 hex) prefixes of targets that
+// another known pubkey (nodes, inactive_nodes, client_node_names) also starts
+// with. An 8-byte reception under such a prefix could be either node, so
+// directReceptions does not credit it, the same rule as clientNameHeard. A
+// failed chunk marks its prefixes shared: crediting nothing is the safe side.
+func (s *Server) sharedEightBytePrefixes(targets []string) map[string]bool {
+	byPrefix := map[string]string{}
+	for _, pk := range targets {
+		if len(pk) >= 16 {
+			byPrefix[pk[:16]] = pk
+		}
+	}
+	prefixes := make([]string, 0, len(byPrefix))
+	for p := range byPrefix {
+		prefixes = append(prefixes, p)
+	}
+	tables := [][2]string{{"nodes", "public_key"}, {"client_node_names", "target"}}
+	if s.db.inactiveNodesPresent() {
+		tables = append(tables, [2]string{"inactive_nodes", "public_key"})
+	}
+	shared := map[string]bool{}
+	// Lowercase hex keys: [p, p+"g") is exactly the keys starting with p (see
+	// clientNameHeard). Each prefix costs one LIMIT 1 term per table, so a chunk
+	// of 150 stays within SQLite's 500-term compound limit.
+	const chunk = 150
+	for i := 0; i < len(prefixes); i += chunk {
+		end := i + chunk
+		if end > len(prefixes) {
+			end = len(prefixes)
+		}
+		var parts []string
+		var args []interface{}
+		for _, p := range prefixes[i:end] {
+			for _, tc := range tables {
+				parts = append(parts, `SELECT * FROM (SELECT ? FROM `+tc[0]+` WHERE `+tc[1]+` >= ? AND `+tc[1]+` < ? AND `+tc[1]+` <> ? LIMIT 1)`)
+				args = append(args, p, p, p+"g", byPrefix[p])
+			}
+		}
+		rows, err := s.db.conn.Query(strings.Join(parts, " UNION ALL "), args...)
+		if err != nil {
+			log.Printf("WARN sharedEightBytePrefixes: %v", err)
+			for _, p := range prefixes[i:end] {
+				shared[p] = true
+			}
+			continue
+		}
+		for rows.Next() {
+			var p string
+			if rows.Scan(&p) == nil {
+				shared[p] = true
+			}
+		}
+		rows.Close()
+	}
+	return shared
 }

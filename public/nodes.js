@@ -87,6 +87,9 @@
   // forwards traffic is never counted as silent just because its ADVERT is old.
   let silentFor = localStorage.getItem('meshcore-nodes-silent-for') || '';
   const SILENT_MS = { '1d': 86400000, '3d': 259200000, '7d': 604800000, '14d': 1209600000, '30d': 2592000000 };
+  // #1268 M3: '' or 'differs' (LoRa settings differ from nearby same-band nodes).
+  let loraFilter = '';
+  let _loraDiffCount = 0;
   let _silentCounts = null;
   let wsHandler = null;
   let detailMap = null;
@@ -534,6 +537,7 @@
     // #1845: shareable — "here are the repeaters silent over a week".
     const _urlSilent = _listUrlParams.get('silent');
     if (_urlSilent !== null) silentFor = SILENT_MS[_urlSilent] ? _urlSilent : '';
+    loraFilter = _listUrlParams.get('lora') === 'differs' ? 'differs' : '';
     // #749 — restore sort from URL (overrides localStorage persistence).
     var _urlSort = _listUrlParams.get('sort');
     if (_urlSort && window.URLState) {
@@ -816,7 +820,7 @@
           ${stats.avgHops ? `<tr><td>Avg Hops</td><td>${stats.avgHops}</td></tr>` : ''}
           ${hasLoc ? `<tr><td>Location</td><td>${Number(n.lat).toFixed(5)}, ${Number(n.lon).toFixed(5)}</td></tr>` : ''}
           <tr><td>Hash Prefix</td><td>${n.hash_size ? '<code style="font-family:var(--mono);font-weight:700">' + n.public_key.slice(0, n.hash_size * 2).toUpperCase() + '</code> (' + n.hash_size + '-byte)' : 'Unknown'}${n.hash_size_inconsistent ? ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + (Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : []).join(', ') + '-byte"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> varies</span>' : ''}</td></tr>
-          ${rfOn() ? `<tr><td title="LoRa radio settings this node last advertised to the MeshCore map">LoRa</td><td data-testid="node-detail-lora">${RfParams.detailHtml(rfFor(n), _rfParams.presets, Date.now())}</td></tr>` : ''}
+          ${rfOn() ? `<tr><td title="LoRa radio settings this node last advertised to the MeshCore map">LoRa</td><td data-testid="node-detail-lora">${RfParams.detailHtml(rfFor(n), _rfParams.presets, Date.now(), rfDev(n))}</td></tr>` : ''}
         </table>
 
         <div class="node-full-card" id="node-packets">
@@ -1123,6 +1127,20 @@
       // stays "Loading…" forever and there's no link back to the Nodes list.
       const msg = (e && e.message) || '';
       const is404 = /\b404\b/.test(msg) || /not\s*found/i.test(msg);
+      // A repeater known only from its reported name has no /api/nodes row.
+      // Checked before the title changes, so it never flashes "not found".
+      if (is404 && window.ReportedNodes) {
+        const rep = await window.ReportedNodes.load();
+        const hit = window.ReportedNodes.find(rep.nodes, pubkey);
+        if (document.getElementById('nodeFullBody') !== body) return;
+        if (hit) {
+          const t = document.querySelector('.node-full-title');
+          if (t) t.textContent = (hit.name || hit.pubkey.slice(0, 12)) + ' (self-reported)';
+          removeDetailMap(body);
+          body.innerHTML = window.ReportedNodes.detailHtml(hit, rep.method);
+          return;
+        }
+      }
       const titleEl = document.querySelector('.node-full-title');
       if (titleEl) {
         titleEl.textContent = is404
@@ -1196,6 +1214,9 @@
   function rfOn() { return !!(_rfParams && _rfParams.enabled && _rfParams.fetched_at); }
   function rfFor(n) {
     return (rfOn() && n && n.public_key && _rfParams.nodes[String(n.public_key).toLowerCase()]) || null;
+  }
+  function rfDev(n) {
+    return (rfOn() && n && n.public_key && _rfParams.deviations && _rfParams.deviations[String(n.public_key).toLowerCase()]) || null;
   }
 
   /**
@@ -1362,6 +1383,7 @@
         let firstTotal = null; // informational only (M1: not used as loop bound)
         // Kick off fleet skew in parallel with the first page only.
         const skewPromise = getFleetSkew();
+        const rfPromise = loadRfParams(); // #1268 M3: deviation badges and filter
         const nodesBody = document.getElementById('nodesBody');
         while (offset < SAFETY_CAP) {
           baseParams.set('offset', String(offset));
@@ -1397,6 +1419,7 @@
         _allNodes = Array.from(seen.values());
         // m3: counts from first response only (subsequent pages may differ)
         await skewPromise;
+        await rfPromise;
       }
 
       // Client-side filtering
@@ -1426,6 +1449,9 @@
       if (silentFor && SILENT_MS[silentFor]) {
         filtered = filtered.filter(n => silenceAgeMs(n) >= SILENT_MS[silentFor]);
       }
+      // #1268 M3: count before the LoRa filter, like the silence counts.
+      updateLoraFilter(filtered.filter(n => rfDev(n)).length);
+      if (loraFilter === 'differs' && rfOn()) filtered = filtered.filter(n => rfDev(n));
       nodes = filtered;
 
       // Defensive filter: hide nodes with obviously corrupted data
@@ -1477,6 +1503,17 @@
     btn.textContent = n ? 'Export JSON (' + n + ')' : 'Export JSON';
   }
 
+  // #1268 M3: the LoRa filter only exists while the server has map data.
+  // renderLeft rebuilds it from this state; a refresh-only load (no
+  // renderLeft) updates the existing element.
+  function updateLoraFilter(count) {
+    _loraDiffCount = count;
+    const sel = document.getElementById('nodeLoraFilter');
+    if (!sel) return;
+    sel.hidden = !rfOn();
+    if (sel.options[1]) sel.options[1].textContent = 'LoRa: differs from nearby (' + count + ')';
+  }
+
   function renderCounts() {
     const el = document.getElementById('nodeCounts');
     if (!el) return;
@@ -1520,6 +1557,10 @@
             <option value="">Silent for: Any</option>
             ${['1d','3d','7d','14d','30d'].map(k => `<option value="${k}" ${silentFor===k?'selected':''}>over ${k}${_silentCounts ? ` (${_silentCounts[k]})` : ''}</option>`).join('')}
           </select>
+          <select id="nodeLoraFilter" aria-label="Show only nodes whose LoRa settings differ from nearby nodes" ${rfOn() ? '' : 'hidden'}>
+            <option value="">LoRa: Any</option>
+            <option value="differs" ${loraFilter==='differs'?'selected':''}>LoRa: differs from nearby (${_loraDiffCount})</option>
+          </select>
         </div>
       </div>
       <div class="table-fluid-wrap"><table class="data-table" id="nodesTable">
@@ -1554,6 +1595,19 @@
         const base = String(location.hash || '#/nodes').split('?')[0];
         const params = getHashParams();
         if (silentFor) { params.set('silent', silentFor); } else { params.delete('silent'); }
+        const qs = params.toString();
+        history.replaceState(null, '', base + (qs ? '?' + qs : ''));
+      } catch (err) { /* URL sync is a convenience; never block the filter on it */ }
+      loadNodes();
+    });
+
+    // #1268 M3: same URL handling as Silent for, so the list can be shared.
+    document.getElementById('nodeLoraFilter').addEventListener('change', e => {
+      loraFilter = e.target.value;
+      try {
+        const base = String(location.hash || '#/nodes').split('?')[0];
+        const params = getHashParams();
+        if (loraFilter) { params.set('lora', loraFilter); } else { params.delete('lora'); }
         const qs = params.toString();
         history.replaceState(null, '', base + (qs ? '?' + qs : ''));
       } catch (err) { /* URL sync is a convenience; never block the filter on it */ }
@@ -1644,14 +1698,23 @@
   // renderReported lists repeaters known only from their reported name
   // (reported-nodes.js) under the table, on the All and Repeaters tabs, with
   // the same search text applied.
+  // renderRows runs on every sort, select and refresh, so the section is only
+  // rebuilt when the element, the tab, the search text or the list changed.
+  let reportedShown = null; // { el, tab, q, nodes }
+  function reportedTab() { return activeTab === 'all' || activeTab === 'repeater'; }
   function renderReported() {
     const el = document.getElementById('reportedSection');
     if (!el || !window.ReportedNodes) return;
-    if (activeTab !== 'all' && activeTab !== 'repeater') { el.innerHTML = ''; return; }
-    const q = search;
+    if (!reportedTab()) { el.innerHTML = ''; reportedShown = null; return; }
+    const q = search, tab = activeTab;
     window.ReportedNodes.load().then(function (rep) {
       const cur = document.getElementById('reportedSection');
-      if (cur && q === search) cur.innerHTML = window.ReportedNodes.sectionHtml(rep.nodes, rep.method, q);
+      // The tab or the search may have changed while the list loaded.
+      if (!cur || q !== search || tab !== activeTab || !reportedTab()) return;
+      const s = reportedShown;
+      if (s && s.el === cur && s.tab === tab && s.q === q && s.nodes === rep.nodes) return;
+      cur.innerHTML = window.ReportedNodes.sectionHtml(rep.nodes, rep.method, q);
+      reportedShown = { el: cur, tab: tab, q: q, nodes: rep.nodes };
     });
   }
 
@@ -1700,7 +1763,7 @@
       const cs = _fleetSkew && _fleetSkew[n.public_key];
       const skewBadgeHtml = cs && cs.severity && cs.severity !== 'ok' ? renderSkewBadge(cs.severity, window.currentSkewValue(cs), cs) : '';
       return `<tr data-key="${n.public_key}" data-action="select" data-value="${n.public_key}" tabindex="0" role="row" class="${selectedKey === n.public_key ? 'selected' : ''}${isClaimed ? ' claimed-row' : ''}">
-        <td ${locodeAttr(n.name)}>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span> ' : ''}<strong>${escapeHtml(n.name || '(unnamed)')}</strong>${dupNameBadge(n.name, n.public_key, dupMap)}${skewBadgeHtml}</td>
+        <td ${locodeAttr(n.name)}>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span> ' : ''}<strong>${escapeHtml(n.name || '(unnamed)')}</strong>${dupNameBadge(n.name, n.public_key, dupMap)}${skewBadgeHtml}${RfParams.deviationBadge(rfFor(n), rfDev(n))}</td>
         <td class="mono col-pubkey">${truncate(n.public_key, 16)}</td>
         <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(roleColor)) || ('background:'+roleColor+';color:#fff')}">${n.role}</span></td>
         <td style="font-family:var(--mono);font-size:12px">${n.default_scope ? escapeHtml(n.default_scope) : ''}</td>
@@ -1861,7 +1924,7 @@
             <dt>Packets Today</dt><dd>${stats.packetsToday || 0}</dd>
             ${stats.avgHops ? `<dt>Avg Hops</dt><dd>${stats.avgHops}</dd>` : ''}
             ${hasLoc ? `<dt>Location</dt><dd>${Number(n.lat).toFixed(5)}, ${Number(n.lon).toFixed(5)}</dd>` : ''}
-            ${rfOn() ? `<dt title="LoRa radio settings this node last advertised to the MeshCore map">LoRa</dt><dd data-testid="node-detail-lora">${RfParams.detailHtml(rfFor(n), _rfParams.presets, Date.now())}</dd>` : ''}
+            ${rfOn() ? `<dt title="LoRa radio settings this node last advertised to the MeshCore map">LoRa</dt><dd data-testid="node-detail-lora">${RfParams.detailHtml(rfFor(n), _rfParams.presets, Date.now(), rfDev(n))}</dd>` : ''}
           </dl>
         </div>
 
