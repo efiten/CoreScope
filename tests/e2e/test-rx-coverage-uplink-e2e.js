@@ -2,7 +2,8 @@
 'use strict';
 // Uplink layer on the Mobile RX coverage page: the "Uplink" button exists only
 // with clientUplink, asks /api/uplink-coverage, colours each cell by its best
-// class, swaps in the uplink legend, and is deep-linkable (layer=uplink).
+// class, swaps in the uplink legend, is deep-linkable (layer=uplink), and is
+// narrowed by the observer filter and "My coverage" like the other layers.
 // Backend-independent: every /api/* call is mocked.
 const assert = require('assert');
 const { chromium } = require('playwright');
@@ -19,7 +20,7 @@ async function step(name, fn) {
   catch (e) { failed++; console.log('  ✗ ' + name + ': ' + e.message); }
 }
 
-async function openPage(browser, { uplink, hash }) {
+async function openPage(browser, { uplink, hash, user }) {
   const page = await browser.newPage();
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
@@ -27,7 +28,8 @@ async function openPage(browser, { uplink, hash }) {
   await page.route('**/api/**', route => {
     const url = route.request().url();
     const path = new URL(url).pathname;
-    if (path === '/api/config/client') return route.fulfill({ json: { clientRxCoverage: true, clientRfSamples: false, clientUplink: uplink } });
+    if (path === '/api/config/client') return route.fulfill({ json: { clientRxCoverage: true, clientRfSamples: false, clientUplink: uplink, userManagement: { enabled: !!user } } });
+    if (path === '/api/auth/me' && user) return route.fulfill({ json: user });
     if (path === '/api/config/map') return route.fulfill({ json: { center: [51, 5.4], zoom: 11 } });
     if (path === '/api/rx-leaderboard') return route.fulfill({ json: { observers: [] } });
     if (path === '/api/rx-coverage') return route.fulfill({ json: { type: 'FeatureCollection', features: [] } });
@@ -74,6 +76,27 @@ async function openPage(browser, { uplink, hash }) {
     const { page, uplinkRequests } = await openPage(browser, { uplink: true, hash: '?layer=uplink&days=7' });
     await page.waitForFunction(() => document.querySelectorAll('#rxMap path.leaflet-interactive').length === 2, null, { timeout: 10000 });
     assert.ok(uplinkRequests.length >= 1);
+    await page.close();
+  });
+
+  await step('the uplink layer sends the observer filter and My coverage', async () => {
+    const rx = 'cd'.repeat(32);
+    const { page, errors, uplinkRequests } = await openPage(browser, {
+      uplink: true, hash: '?layer=uplink&rx=' + rx,
+      user: { id: 1, email: 'alice@example.org', displayName: 'Alice', role: 'user', csrfToken: 't' },
+    });
+    await page.waitForSelector('#rxMineBar button[data-mine]', { timeout: 10000 });
+    for (let i = 0; i < 50 && !uplinkRequests.length; i++) await page.waitForTimeout(100);
+    assert.ok(uplinkRequests.length >= 1, 'a ?layer=uplink link must fetch the uplink layer');
+    assert.strictEqual(new URL(uplinkRequests[uplinkRequests.length - 1]).searchParams.get('rx'), rx, 'rx is sent to /api/uplink-coverage');
+    const before = uplinkRequests.length;
+    await page.click('#rxMineBar button[data-mine]');
+    for (let i = 0; i < 50 && uplinkRequests.length === before; i++) await page.waitForTimeout(100);
+    assert.ok(uplinkRequests.length > before, 'toggling My coverage refetches the uplink layer');
+    const last = new URL(uplinkRequests[uplinkRequests.length - 1]).searchParams;
+    assert.strictEqual(last.get('mine'), '1', 'mine=1 is sent to /api/uplink-coverage');
+    assert.strictEqual(last.get('rx'), rx, 'the observer filter stays on');
+    assert.deepStrictEqual(errors, []);
     await page.close();
   });
 

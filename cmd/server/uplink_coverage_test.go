@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -146,4 +148,42 @@ func TestUplinkCoverageGatedAndTolerant(t *testing.T) {
 	if code, fc := getUplink(t, bare, "bbox=50,5,52,6"); code != 200 || len(fc.Features) != 0 {
 		t.Fatalf("no tables yet: status %d, cells %d, want 200 and none", code, len(fc.Features))
 	}
+}
+
+// The uplink layer narrows to one companion (?rx=) or to the caller's linked
+// companions (?mine=1) like the signal and noise layers.
+func TestUplinkCoverageRxAndMine(t *testing.T) {
+	f := newAuthFixture(t)
+	f.srv.db = seedUplinkDB(t)
+	f.srv.cfg.ClientUplink = &ClientUplinkConfig{Enabled: true}
+	f.router.HandleFunc("/api/uplink-coverage", f.srv.handleUplinkCoverage).Methods("GET")
+	mine := pubHex(companionKey)
+	recent := time.Now().UTC().Add(-time.Hour).Format(rxTimeMillisLayoutServer)
+	mustExecDB(t, f.srv.db, `INSERT INTO client_uplink_pings (rx_pubkey, tag, sent_at, ingested_at, echo_count, lat, lon)
+		VALUES ('`+mine+`','44444444','`+recent+`','x',0,51.30,5.70)`)
+	const q = "/api/uplink-coverage?bbox=50,5,52,6&z=12&days=7"
+	get := func(path string, mods ...reqMod) *httptest.ResponseRecorder { return f.do("GET", path, nil, mods...) }
+	cells := func(w *httptest.ResponseRecorder) int { return strings.Count(w.Body.String(), `"Feature"`) }
+	if n := cells(get(q)); n != 3 {
+		t.Fatalf("everyone: %d cells, want 3", n)
+	}
+	if n := cells(get(q + "&rx=AA11")); n != 2 {
+		t.Fatalf("rx=aa11 (upper case): %d cells, want its 2", n)
+	}
+
+	expectStatus(t, get(q+"&mine=1"), http.StatusUnauthorized)
+	alice := f.registerAndActivate(t, "alice@example.org", "Alice", pw)
+	w := get(q+"&mine=1", as(alice))
+	expectStatus(t, w, http.StatusOK)
+	if n := cells(w); n != 0 {
+		t.Fatalf("nothing linked: %d cells, want none", n)
+	}
+	tok := f.deviceToken(t, "alice@example.org", pw, "Pixel").Token
+	expectStatus(t, f.linkCompanion(t, tok, companionKey, "Car"), http.StatusOK)
+	w = get(q+"&mine=1", as(alice))
+	expectStatus(t, w, http.StatusOK)
+	if w.Body.String() != get(q+"&rx="+mine).Body.String() || cells(w) != 1 {
+		t.Fatalf("mine=1 is not the linked companion's ping: %s", w.Body.String())
+	}
+	expectStatus(t, get(q+"&mine=1", bearer(tok)), http.StatusForbidden)
 }

@@ -2,9 +2,9 @@
 const REPO_ROOT = require('path').resolve(__dirname, '..', '..');
 // "My coverage" toggle (docs/specs/2026-10-08-companion-linking-design.md,
 // Coverage attribution): shown to logged-in users only, it adds mine=1 to the
-// request of every layer (signal and noise). The real public/rx-coverage.js
-// is loaded in a vm, with a window that has no addEventListener, like
-// test-rx-coverage-config-race.js.
+// request of every layer (signal, noise and uplink). The real
+// public/rx-coverage.js is loaded in a vm, with a window that has no
+// addEventListener, like test-rx-coverage-config-race.js.
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
@@ -53,7 +53,8 @@ assert.ok(code.indexOf('function mineSent() { return mine && !!authUser(window.C
   'fetchLayer must build its URL with coverageUrl, the observer filter and the toggle');
 assert.ok(/fetchLayer\('\/api\/rx-coverage', bbox, /.test(code), 'the signal layer must fetch through fetchLayer');
 assert.ok(/fetchLayer\('\/api\/rf-noise', bbox, /.test(code), 'the noise layer must fetch through fetchLayer');
-assert.strictEqual((code.match(/fetch\('\/api\/rf-noise/g) || []).length, 0, 'no unfiltered noise fetch');
+assert.ok(/fetchLayer\('\/api\/uplink-coverage', bbox, /.test(code), 'the uplink layer must fetch through fetchLayer');
+assert.strictEqual((code.match(/fetch\('\/api\/(rf-noise|uplink-coverage)/g) || []).length, 0, 'no unfiltered noise or uplink fetch');
 assert.ok(/id="rxMineBar"[^>]*hidden/.test(code), 'the toggle bar must start hidden');
 
 // A reply only counts when it answers the newest layer request: an

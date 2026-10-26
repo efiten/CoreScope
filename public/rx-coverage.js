@@ -353,9 +353,9 @@
   }
 
   function drawUplinkLayer(bbox) {
-    var url = '/api/uplink-coverage?bbox=' + bbox + '&z=' + map.getZoom() + '&days=' + days;
-    fetch(url).then(function (r) { return r.json(); }).then(function (fc) {
-      if (destroyed || !covLayer || layer !== 'uplink') return;
+    var seq = ++drawSeq;
+    fetchLayer('/api/uplink-coverage', bbox, '', seq).then(function (fc) {
+      if (!fc || destroyed || !covLayer || layer !== 'uplink') return;
       covLayer.clearLayers();
       var features = fc.features || [];
       setNoiseEmpty(features.length === 0, 'No uplink pings in this view yet.');
@@ -367,7 +367,7 @@
       });
     }).catch(function (e) {
       console.warn('rx-coverage: uplink fetch failed', e);
-      if (destroyed || !covLayer || layer !== 'uplink') return;
+      if (destroyed || !covLayer || layer !== 'uplink' || seq !== drawSeq) return;
       covLayer.clearLayers();
       setNoiseEmpty(true, 'Could not load uplink pings. Pan or zoom to retry.');
     });

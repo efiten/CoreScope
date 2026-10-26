@@ -163,11 +163,17 @@ func aggregateUplink(rows []uplinkPingRow, arrivals map[string]uplinkArrival, re
 }
 
 // queryUplinkPings returns pings with a position inside the bbox, within
-// `days` (0 = all time). The packet hash comes from the ping when it had an
-// echo, otherwise from the ingestor's own tag -> hash link.
-func (s *Server) queryUplinkPings(days int, b bbox) ([]uplinkPingRow, error) {
+// `days` (0 = all time), optionally narrowed to one companion (rx) or a set
+// of companions (rxIn, see queryCoverageFiltered). The packet hash comes from
+// the ping when it had an echo, otherwise from the ingestor's own tag -> hash
+// link.
+func (s *Server) queryUplinkPings(rx string, rxIn []string, days int, b bbox) ([]uplinkPingRow, error) {
+	if rxIn != nil && len(rxIn) == 0 {
+		return []uplinkPingRow{}, nil
+	}
 	where := []string{"p.lat IS NOT NULL", "p.lat BETWEEN ? AND ?", "p.lon BETWEEN ? AND ?"}
 	args := []interface{}{b.MinLat, b.MaxLat, b.MinLon, b.MaxLon}
+	where, args = appendRxFilter(where, args, "p.rx_pubkey", rx, rxIn)
 	if days > 0 {
 		where = append(where, "p.sent_at >= ?")
 		args = append(args, time.Now().UTC().AddDate(0, 0, -days).Format(rxTimeMillisLayoutServer))
@@ -282,6 +288,13 @@ func (s *Server) handleUplinkCoverage(w http.ResponseWriter, r *http.Request) {
 	if !s.requireClientUplink(w, r) {
 		return
 	}
+	var mine []string
+	if r.URL.Query().Get("mine") == "1" {
+		var ok bool
+		if mine, ok = s.myCompanionPubkeys(w, r); !ok {
+			return
+		}
+	}
 	b, ok := parseBBox(r.URL.Query().Get("bbox"))
 	if !ok {
 		http.Error(w, "bbox required as minLat,minLon,maxLat,maxLon", http.StatusBadRequest)
@@ -295,7 +308,7 @@ func (s *Server) handleUplinkCoverage(w http.ResponseWriter, r *http.Request) {
 	z, _ := strconv.Atoi(r.URL.Query().Get("z"))
 	fc := UplinkFeatureCollection{Type: "FeatureCollection", Features: []UplinkFeature{}}
 	if s.db.tablePresent("client_uplink_pings") && s.db.tablePresent("client_uplink_tx") {
-		rows, err := s.queryUplinkPings(days, b)
+		rows, err := s.queryUplinkPings(r.URL.Query().Get("rx"), mine, days, b)
 		if err != nil {
 			http.Error(w, "query failed", http.StatusInternalServerError)
 			return
