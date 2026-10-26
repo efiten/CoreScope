@@ -169,6 +169,8 @@ func routeDescriptions() map[string]routeMeta {
 				{Name: "bbox", Description: "Bounding box as minLat,minLon,maxLat,maxLon", Type: "string", Required: true},
 				{Name: "z", Description: "Leaflet zoom level; sets the hex resolution", Type: "integer"},
 				{Name: "days", Description: "Look-back window in days (1-30, default 7)", Type: "integer"},
+				{Name: "rx", Description: "Only this companion's samples", Type: "string"},
+				{Name: "mine", Description: "1 = only samples of companions linked to the logged-in user (browser session; 401 without one)", Type: "string"},
 			}},
 		"GET /api/uplink-coverage": {Summary: "Uplink ping hex grid", Description: "GeoJSON hex cells where mobile companions sent uplink pings (CoreDrive RX, client_uplink_pings). Per cell: pings, and how many were `both` (a repeater re-broadcast was heard by the companion AND an observer received the ping), `observed` (observer only), `echo` (re-broadcast heard, no observer received it) or `none`; `best` is the best class in the cell, plus the first-hop repeaters (`first_hops`, with `first_hop_names` parallel: the name, or empty when the prefix is unknown, ambiguous or hidden), the most observers reached and the longest path. `observed` depends on observer placement: a ping no observer received may still have travelled. Gated on clientUplink.", Tag: "coverage",
 			QueryParams: []paramMeta{
