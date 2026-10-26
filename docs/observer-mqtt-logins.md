@@ -9,8 +9,9 @@ username (`obs_` + 12 characters) and the password, and mails them; they are nev
 interface or returned by the API. One login serves all of a user's observers.
 
 The broker asks CoreScope over HTTP whether a login may connect and whether it may publish.
-A personal login may only publish to `meshcore/<iata>/<pubkey>/<type>`, and only for observers
-bound to its user:
+A personal login may only publish to `meshcore/<iata>/<pubkey>/<type>` (with a 64-hex pubkey,
+and not under the `client` IATA that client uploads use), and only for observers bound to its
+user:
 
 | Pubkey in the topic | Publish | Effect |
 |---|---|---|
@@ -18,17 +19,41 @@ bound to its user:
 | bound to another user, or orphaned (owner deleted) | denied | logged with the username and the first 8 characters of the pubkey |
 | not bound yet | allowed | bound to this user now (`auto`); admins get a mail if CoreScope already knew the observer |
 
-A user can auto-bind at most 20 observers; past that, publishing under a new pubkey is denied
-until an admin assigns it (`PUT /api/admin/observer-bindings/<pubkey>`). Subscribing is always
-denied for personal logins. Admins revoke and reissue logins, and unbind or reassign observers,
-on *Admin, Observer logins*.
+Automatic binding stops once a user owns 20 observers, counting the ones an admin assigned;
+past that, publishing under a new pubkey is denied until an admin assigns it
+(`PUT /api/admin/observer-bindings/<pubkey>`). Subscribing is always denied for personal
+logins. Admins revoke and reissue logins, and unbind or reassign observers, on *Admin,
+Observer logins*.
+
+When a login is created, the owner's notification events get "My observers go offline"
+(`observer.offline.own`). Mails only go out once the user has switched notifications on; the
+user can untick the event on the account page.
+
+**Who can claim an observer.** Any active account can request a login, and that login binds
+every observer it publishes for that is not bound yet, including observers CoreScope already
+knows from the shared login (first come wins). The observer pubkeys are public on
+`/api/observers`. With open registration this means: anyone with a mail address can claim up
+to 20 unbound observers per account, and publish as them. Before this feature, publishing
+needed the shared password you hand out. What limits it:
+
+- every claim of an observer CoreScope already knew mails the admins (`observer-bound`);
+- an admin can unbind or reassign a claimed observer, and revoke the login, on
+  *Admin, Observer logins*;
+- a claimed observer cannot be claimed again by another login, so the sooner the real owners
+  migrate, the smaller the window.
+
+Registration cannot be closed. If this is not acceptable for your instance, assign the known
+observers to their owners yourself (once the owners have a login) before you announce the
+feature, and watch the `observer-bound` mails during the migration.
 
 Logins CoreScope does not manage (the shared login, bridges, your own operator users) are
 answered with `ignore`, so the broker decides them with its own user store, exactly as before.
 The shared login therefore keeps working, and can still publish as any observer, until you
 remove it from the broker.
 
-Only EMQX 5 is covered here. The setup below was tested on EMQX 5.8.6.
+Only EMQX 5 is covered here. The setup below was tested on EMQX 5.8.6 in Docker, and runs on a
+production EMQX 5.8.9 with about 50 clients, set up through the REST API as described in
+section 2.
 
 ## 1. Configure CoreScope
 
@@ -172,6 +197,101 @@ The authorization cache (`ttl = 1m` above) means a revoke or an unbind stops pub
 topic that was allowed in the last minute only when that cache entry expires. Revocation is
 checked on every connect; an open connection stays open. Kicking it by hand
 (`emqx ctl clients kick <clientid>`) was not tested.
+
+### On a running broker, with the REST API
+
+The same chains can be added to a live EMQX through its management API, without a restart and
+without dropping connected clients. This is the order used on a production broker (EMQX 5.8.9,
+about 50 clients). After each step, check that nothing else changed before going on.
+
+Set `E=http://<emqx-host>:18083/api/v5` and use an API key (`-u <key>:<secret>`). Put the hook
+URL and secret in two JSON files and send them with `--data-binary @file`, so the secret does
+not end up in your shell history.
+
+**0. Baseline.** Note the connection count and the drop rate:
+`curl -s -u ... $E/monitor_current` (`connections`, `dropped_msg_rate`).
+
+**1. The `^obs_` deny rule, last in the authorization chain.** No `obs_` user exists yet, so
+this changes nothing:
+
+```bash
+curl -s -u ... -X POST -H 'Content-Type: application/json' $E/authorization/sources \
+  -d '{"type":"file","enable":true,"rules":"{deny, {username, {re, \"^obs_\"}}, all, [\"#\"]}.\n"}'
+curl -s -u ... -X POST -H 'Content-Type: application/json' $E/authorization/sources/file/move \
+  -d '{"position":"rear"}'
+```
+
+A new source is added at the **front** of the chain, so the `move` is needed. `GET
+$E/authorization/sources` must list `file` last.
+
+**If `GET $E/authorization/sources` already lists a `file` source** (the stock EMQX config
+can ship one with an `acl.conf` that ends in `{allow, all}.`), the POST above is refused:
+EMQX keeps one source per type. Add the rule to the existing file instead, as its **first**
+line, so no `allow` rule in that file matches an `obs_` login before it:
+
+```bash
+curl -s -u ... $E/authorization/sources/file > file.json   # keep the other fields
+# edit file.json: prepend {deny, {username, {re, "^obs_"}}, all, ["#"]}.\n to "rules"
+curl -s -u ... -X PUT -H 'Content-Type: application/json' $E/authorization/sources/file \
+  --data-binary @file.json
+```
+
+Leave that source where it is in the chain: moving it would also move its other rules. The
+HTTP authorizer goes in front of it in step 2, so it only sees what the hook ignored. Do not go
+on to step 2 until the rule is in place; without it, a connected personal login can publish
+anywhere while CoreScope is unreachable (section 3).
+
+**2. The HTTP authorizer, first in the chain.** `authz.json`:
+
+```json
+{"type": "http", "enable": true, "method": "post",
+ "url": "https://<corescope-host>/api/mqtt-hook/emqx/authz",
+ "headers": {"content-type": "application/json", "X-CoreScope-Hook-Secret": "<hook-secret>"},
+ "body": {"username": "${username}", "topic": "${topic}", "action": "${action}"},
+ "request_timeout": "5s",
+ "ssl": {"enable": true, "verify": "verify_peer", "server_name_indication": "<corescope-host>"}}
+```
+
+`POST $E/authorization/sources` with it lands at the front. Leave out the `ssl` block for a
+plain `http://` URL on an internal network. Check `GET $E/authorization/sources/http/status`:
+`status` is `connected`, and after a minute (the authorization cache) `metrics.ignore` grows
+while `deny` stays 0. Every existing login is answered with `ignore`, so the connection count
+and the drop rate do not change.
+
+**3. The HTTP authenticator, first in the chain.** `authn.json`:
+
+```json
+{"mechanism": "password_based", "backend": "http", "enable": true, "method": "post",
+ "url": "https://<corescope-host>/api/mqtt-hook/emqx/authn",
+ "headers": {"content-type": "application/json", "X-CoreScope-Hook-Secret": "<hook-secret>"},
+ "body": {"username": "${username}", "password": "${password}", "clientid": "${clientid}"},
+ "request_timeout": "5s",
+ "ssl": {"enable": true, "verify": "verify_peer", "server_name_indication": "<corescope-host>"}}
+```
+
+```bash
+curl -s -u ... -X POST -H 'Content-Type: application/json' $E/authentication --data-binary @authn.json
+curl -s -u ... -X PUT $E/authentication/password_based:http/position/front
+```
+
+`GET $E/authentication` must list `password_based:http` first. Test both paths with any MQTT
+client: the shared login still gets CONNACK 0, and an unknown `obs_` username is refused with
+`not authorised`. `GET $E/authentication/password_based:http/status` then shows `nomatch` for
+both: the hook answered `ignore` and the built-in database decided.
+
+**Rollback:** disable or delete the two `http` entries; the built-in database answers alone
+again.
+
+**Uploaders that already tried.** A user who configured a personal login before step 3 was
+refused, and some uploaders stop retrying after that. They need a restart of the uploader or
+the observer once the authenticator is in place. Personal logins appear under
+`GET $E/clients?like_username=obs_`, and on *Admin, Observer logins* in CoreScope ("Last auth").
+
+**Reverse proxy.** When the broker reaches CoreScope through its public HTTPS name, the proxy
+must pass the `X-CoreScope-Hook-Secret` header through (most do by default). A `401` from
+`curl -X POST https://<corescope-host>/api/mqtt-hook/emqx/authn` on the broker host shows that
+the route is reachable; with the secret header and `{"username":"x","password":"x","clientid":"x"}` the answer is
+`{"result":"ignore"}`.
 
 ## 3. When CoreScope is down
 
