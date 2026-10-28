@@ -50,6 +50,15 @@ Enable clustering to group nearby nodes into cluster bubbles. Zoom in to expand 
 
 Select a reference node to highlight only its direct neighbors.
 
+### Measured links
+
+Tick **Measured links** to draw the links between nodes from their neighbours reports (see [Personal MQTT logins](../observer-mqtt-logins.md#neighbour-reports-how-observers-send-them)). It is off by default; when on, the URL carries `links=1`.
+
+- The colour follows the weaker of the two SNRs: good (5 dB or more), fair (-5 dB or more), poor (below that, or no SNR at all).
+- A solid line is verified and measured in both directions. A dashed line is not verified, measured in one direction only, or has no SNR.
+- A line is drawn only when both nodes are on the map right now, so the role, status, last heard and other filters also hide their links.
+- Click a line for the SNR in each direction, the age of the report and whether it is verified.
+
 ## Show Route
 
 Click a node marker, then click **Show Route** in the popup to see the paths packets take to reach that node. Routes are drawn as lines between nodes.
