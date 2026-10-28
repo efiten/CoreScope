@@ -62,8 +62,13 @@ scripts/           — Tooling (coverage collector, fixture capture, frontend in
   for the approved hashtag channel names. With
   `clientRxCoverage.requireLinkedCompanion` it reads `companion_links` the same
   way (`SELECT pubkey`, every 60 s, plus at most one re-read per 5 s on a miss).
-  `TestChannelKeySetIsReadOnly` and `TestLinkedCompanionSetIsReadOnly` pin the
-  read-only open.
+  For verified neighbours reports (#1865) it always reads `observer_bindings`
+  the same way (`SELECT pubkey FROM observer_bindings WHERE confirmed_at IS NOT
+  NULL AND user_id IS NOT NULL`, every 60 s, plus at most one re-read per 5 s
+  on a miss). `TestChannelKeySetIsReadOnly`, `TestLinkedCompanionSetIsReadOnly`
+  and `TestNeighborsReportVerifiedFlag` pin the read-only open;
+  `TestConfirmedObserverQueryMatchesUsersSchema` pins the `observer_bindings`
+  query against the `internal/users` schema.
 - Enforcement: `cmd/server/readonly_invariant_test.go` reflect-asserts that
   `PruneOldPackets`, `PruneOldMetrics`, and `RemoveStaleObservers` are NOT
   methods on the server's `*DB`. If you need a new write, add it to
