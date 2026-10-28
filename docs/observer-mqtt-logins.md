@@ -391,6 +391,8 @@ Set `verifiesObservers` only on the source that reads the broker running this ho
 source (a second broker, a bridge, the `MQTT_BROKER` environment source) defaults to `false`, and
 its reports are never verified.
 
+A source with `verifiesObservers` must subscribe under `meshcore/` (for example `meshcore/#`), never a root wildcard such as `#` or `+/+/+/neighbors`, because the broker hook only guards the `meshcore/` root.
+
 ```json
 "mqttSources": [
   { "name": "emqx", "broker": "mqtts://broker.example:8883", "topics": ["meshcore/#"], "verifiesObservers": true }
