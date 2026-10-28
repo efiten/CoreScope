@@ -635,6 +635,26 @@ func TestConfirmedObserverSetMissingDB(t *testing.T) {
 	}
 }
 
+// Without a verifiesObservers source nothing can be verified, so the ingestor
+// builds no confirmed-observer set and never reads users.db for it.
+func TestConfirmedObserverFilterNeedsFlaggedSource(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{DBPath: filepath.Join(dir, "meshcore.db"), MQTTSources: []MQTTSource{{Name: "a"}, {Name: "b"}}}
+	if s := newConfirmedObserverFilter(cfg); s != nil {
+		s.Close()
+		t.Fatal("no flagged source: got a confirmed-observer set, want nil")
+	}
+	cfg.MQTTSources[1].VerifiesObservers = true
+	s := newConfirmedObserverFilter(cfg)
+	if s == nil {
+		t.Fatal("flagged source: got nil, want a confirmed-observer set")
+	}
+	defer s.Close()
+	if s.path != cfg.UsersDBPath() {
+		t.Errorf("set reads %q, want %q", s.path, cfg.UsersDBPath())
+	}
+}
+
 func TestPruneMeasuredLinksAndReports(t *testing.T) {
 	store := openNeighborsStore(t)
 	old := time.Now().UTC().Add(-10 * 24 * time.Hour).Format(time.RFC3339)

@@ -446,7 +446,7 @@ func componentSchemas() map[string]interface{} {
 				"total":      {Type: "integer", Description: "Neighbours the node knows. Null when not reported."},
 				"queried":    {Type: "integer", Description: "Neighbours queried for scopes. Null when not reported."},
 				"truncated":  {Type: "boolean", Description: "True when the node cut the list short. Null when not reported."},
-				"verified":   {Type: "boolean", Description: "True when the report came from a verified observer login."},
+				"verified":   {Type: "boolean", Description: "True when the reporter is a confirmed personal-login observer and the report arrived through an MQTT source with verifiesObservers set."},
 			},
 		},
 		"NodeNeighborsResponse": map[string]interface{}{
