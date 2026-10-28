@@ -359,6 +359,13 @@ test('includes the green text-on-tint mapping for the admin tables', () => {
   assert.strictEqual(api.THEME_CSS_MAP.statusGreenTintText, '--status-green-tint-text');
 });
 
+test('maps the measured-link SNR band colours', () => {
+  const { api } = loadCustomizer();
+  assert.strictEqual(api.THEME_CSS_MAP.linkSnrGood, '--link-snr-good');
+  assert.strictEqual(api.THEME_CSS_MAP.linkSnrFair, '--link-snr-fair');
+  assert.strictEqual(api.THEME_CSS_MAP.linkSnrPoor, '--link-snr-poor');
+});
+
 test('matches all keys from old app.js varMap', () => {
   const { api } = loadCustomizer();
   const expectedKeys = [

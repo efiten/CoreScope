@@ -50,6 +50,7 @@
     statusGreen: '--status-green', statusYellow: '--status-yellow', statusRed: '--status-red',
     statusYellowText: '--status-yellow-text', statusRedText: '--status-red-text',
     statusGreenTintText: '--status-green-tint-text',
+    linkSnrGood: '--link-snr-good', linkSnrFair: '--link-snr-fair', linkSnrPoor: '--link-snr-poor',
     surface1: '--surface-1', surface2: '--surface-2', surface3: '--surface-3',
     sectionBg: '--section-bg',
     cardBg: '--card-bg', contentBg: '--content-bg', detailBg: '--detail-bg',
