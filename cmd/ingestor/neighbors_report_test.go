@@ -204,6 +204,27 @@ func TestNeighborsReportOriginMismatchDropped(t *testing.T) {
 	}
 }
 
+// Through the MQTT handler a mismatched report also stays off the observer
+// page table (#2270/#2271): both paths drop it.
+func TestNeighborsTopicOriginMismatchStoresNoObserverReport(t *testing.T) {
+	store := openNeighborsStore(t)
+	const other = "AA00000000000000000000000000000000000000000000000000000000000001"
+	msg := &mockMessage{topic: "meshcore/TST/" + other + "/neighbors", payload: []byte(sample1865)}
+	handleMessage(store, "test", MQTTSource{Name: "test"}, msg, nil, nil, &Config{})
+	for _, table := range []string{"observer_neighbor_reports", "neighbor_reports", "measured_links"} {
+		if n := countRows(t, store, table); n != 0 {
+			t.Errorf("%s rows = %d, want 0", table, n)
+		}
+	}
+
+	// The matching topic still stores the observer report.
+	msg = &mockMessage{topic: "meshcore/TST/" + nrOriginUpper + "/neighbors", payload: []byte(sample1865)}
+	handleMessage(store, "test", MQTTSource{Name: "test"}, msg, nil, nil, &Config{})
+	if n := countRows(t, store, "observer_neighbor_reports"); n != 1 {
+		t.Errorf("matching report: observer_neighbor_reports rows = %d, want 1", n)
+	}
+}
+
 func TestNeighborsReportMismatchLogIsBounded(t *testing.T) {
 	var l reporterLogLimiter
 	now := time.Date(2026, 7, 26, 9, 0, 0, 0, time.UTC)
