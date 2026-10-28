@@ -84,20 +84,26 @@ type measuredLinkIndex struct {
 }
 
 // loadMeasuredLinks reads measured_links through the read-only handle. A
-// database without the table, or a failed read, yields an empty index.
+// database without the table yields an empty index. A failed read returns
+// nil, never a partial index, so the caller can keep the one it has.
 func loadMeasuredLinks(conn *sql.DB) *measuredLinkIndex {
 	ix := &measuredLinkIndex{byNode: make(map[string][]measuredLink)}
 	if conn == nil {
 		return ix
 	}
 	var name string
-	if err := conn.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'measured_links'`).Scan(&name); err != nil {
+	err := conn.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'measured_links'`).Scan(&name)
+	if err == sql.ErrNoRows {
 		return ix
+	}
+	if err != nil {
+		log.Printf("[measured-links] failed to probe measured_links: %v", err)
+		return nil
 	}
 	rows, err := conn.Query(`SELECT reporter, neighbor, snr, heard_at, reported_at, verified, status FROM measured_links`)
 	if err != nil {
 		log.Printf("[measured-links] failed to load measured_links: %v", err)
-		return ix
+		return nil
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -105,7 +111,8 @@ func loadMeasuredLinks(conn *sql.DB) *measuredLinkIndex {
 		var snr sql.NullFloat64
 		var verified int
 		if err := rows.Scan(&l.Reporter, &l.Neighbor, &snr, &l.HeardAt, &l.ReportedAt, &verified, &l.Status); err != nil {
-			continue
+			log.Printf("[measured-links] failed to load measured_links: %v", err)
+			return nil
 		}
 		l.Reporter = strings.ToLower(l.Reporter)
 		l.Neighbor = strings.ToLower(l.Neighbor)
@@ -121,6 +128,7 @@ func loadMeasuredLinks(conn *sql.DB) *measuredLinkIndex {
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("[measured-links] failed to load measured_links: %v", err)
+		return nil
 	}
 	return ix
 }
@@ -191,9 +199,25 @@ func (s *Server) measuredIndex() *measuredLinkIndex {
 	return s.store.measured.Load()
 }
 
+// measuredNodeHidden reports whether pk is blacklisted or carries a hidden
+// name prefix, from the node cache so no row is read per pubkey.
+func (s *Server) measuredNodeHidden(pk string, nodeMap map[string]nodeInfo) bool {
+	if s.cfg == nil {
+		return false
+	}
+	if s.cfg.IsBlacklisted(pk) {
+		return true
+	}
+	info, ok := nodeMap[pk]
+	return ok && s.cfg.IsNameHidden(info.Name)
+}
+
 // mergeMeasuredNeighbors adds the measured links of pubkey to the neighbour
-// entries: an entry with the same full pubkey gets Measured, and every other
-// measured neighbour is appended with Inferred false and Count 0.
+// entries. An entry with the same full pubkey gets Measured. A measured
+// neighbour without one is matched next against the entries that have no
+// resolved pubkey: first by candidate, then by hop prefix; the first such
+// entry still without Measured gets it. Every other measured neighbour is
+// appended with Inferred false and Count 0.
 func (s *Server) mergeMeasuredNeighbors(pubkey string, entries []NeighborEntry, nodeMap map[string]nodeInfo, srcInfo nodeInfo) []NeighborEntry {
 	links := s.measuredIndex().forNode(pubkey)
 	if len(links) == 0 {
@@ -201,8 +225,15 @@ func (s *Server) mergeMeasuredNeighbors(pubkey string, entries []NeighborEntry, 
 	}
 	measured := measuredInfoByNeighbor(pubkey, links)
 	present := make(map[string]bool, len(entries))
+	byCandidate := make(map[string][]int)
+	var unresolved []int
 	for i := range entries {
 		if entries[i].Pubkey == nil {
+			unresolved = append(unresolved, i)
+			for _, c := range entries[i].Candidates {
+				key := strings.ToLower(c.Pubkey)
+				byCandidate[key] = append(byCandidate[key], i)
+			}
 			continue
 		}
 		key := strings.ToLower(*entries[i].Pubkey)
@@ -220,11 +251,29 @@ func (s *Server) mergeMeasuredNeighbors(pubkey string, entries []NeighborEntry, 
 		}
 	}
 	sort.Strings(others)
+	attach := func(pk string) bool {
+		for _, i := range byCandidate[pk] {
+			if entries[i].Measured == nil {
+				m := measured[pk]
+				entries[i].Measured = &m
+				return true
+			}
+		}
+		for _, i := range unresolved {
+			p := strings.ToLower(entries[i].Prefix)
+			if entries[i].Measured == nil && p != "" && strings.HasPrefix(pk, p) {
+				m := measured[pk]
+				entries[i].Measured = &m
+				return true
+			}
+		}
+		return false
+	}
 	for _, pk := range others {
-		if s.cfg != nil && s.cfg.IsBlacklisted(pk) {
+		if s.measuredNodeHidden(pk, nodeMap) {
 			continue
 		}
-		if s.isPubkeyHidden(pk) {
+		if attach(pk) {
 			continue
 		}
 		m := measured[pk]
@@ -265,13 +314,7 @@ func (s *Server) measuredPairs(now time.Time) []MeasuredPair {
 	nodeMap := s.buildNodeInfoMap()
 	positioned := func(pk string) bool {
 		info, ok := nodeMap[pk]
-		if !ok || !info.HasGPS {
-			return false
-		}
-		if s.cfg != nil && s.cfg.IsBlacklisted(pk) {
-			return false
-		}
-		return !s.isPubkeyHidden(pk)
+		return ok && info.HasGPS && !s.measuredNodeHidden(pk, nodeMap)
 	}
 
 	type acc struct {

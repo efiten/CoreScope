@@ -207,6 +207,12 @@ func main() {
 	if err := dbschema.AssertReady(database.conn); err != nil {
 		log.Fatalf("[db] schema not ready (ingestor must run migrations first): %v", err)
 	}
+	// #1865: AssertReady just verified these. detectSchema ran before it, at
+	// open time, and can have missed them when the ingestor created them in
+	// between.
+	database.hasDefaultFloodScope = true
+	database.hasDefaultFloodScopeAt = true
+	database.hasNeighborReports = true
 
 	// In-memory packet store
 	store := NewPacketStore(database, cfg.PacketStore, cfg.CacheTTL)
@@ -227,7 +233,12 @@ func main() {
 		store.graph.Store(loadNeighborEdgesFromDB(database.conn))
 		log.Printf("[neighbor] loaded persisted neighbor graph")
 	}
-	store.measured.Store(loadMeasuredLinks(database.conn))
+	// #1865: a failed first read starts empty; the recomputer retries every 60 s.
+	measured := loadMeasuredLinks(database.conn)
+	if measured == nil {
+		measured = &measuredLinkIndex{byNode: map[string][]measuredLink{}}
+	}
+	store.measured.Store(measured)
 
 	// #1009: chunked Load with early HTTP readiness. RunStartupLoad runs
 	// asynchronously and signals FirstChunkReady after the first chunk

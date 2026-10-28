@@ -216,6 +216,28 @@ func TestApplyCreatesNeighborReportTables(t *testing.T) {
 	}
 }
 
+// TestAssertReady_RequiresDefaultFloodScopeAt: the server reads
+// default_flood_scope_at, so AssertReady must refuse a database without it on
+// either node table (#1321 rule, #1865 columns).
+func TestAssertReady_RequiresDefaultFloodScopeAt(t *testing.T) {
+	for _, table := range []string{"nodes", "inactive_nodes"} {
+		t.Run(table, func(t *testing.T) {
+			db := minimalDB(t)
+			defer db.Close()
+			if err := Apply(db, nil); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if _, err := db.Exec(`ALTER TABLE ` + table + ` DROP COLUMN default_flood_scope_at`); err != nil {
+				t.Fatalf("drop column: %v", err)
+			}
+			err := AssertReady(db)
+			if err == nil || !contains(err.Error(), table+".default_flood_scope_at") {
+				t.Fatalf("AssertReady = %v, want it to name %s.default_flood_scope_at", err, table)
+			}
+		})
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {

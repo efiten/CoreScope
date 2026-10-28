@@ -411,7 +411,7 @@ func componentSchemas() map[string]interface{} {
 		},
 		"MeasuredInfo": openAPISchema{
 			Type:        "object",
-			Description: "#1865: the link as measured by the neighbours reports. Absent when neither node reported the other.",
+			Description: "#1865: the link as measured by the neighbours reports. Absent when neither node reported the other. On an entry without a resolved pubkey it belongs to a measured neighbour that matched one of the candidates, or else the hop prefix.",
 			Properties: map[string]openAPISchema{
 				"snrIn":      {Type: "number", Description: "SNR (dB) at which the queried node hears this neighbour. Null when the queried node did not report it."},
 				"snrOut":     {Type: "number", Description: "SNR (dB) at which this neighbour hears the queried node. Null when the neighbour did not report it."},
