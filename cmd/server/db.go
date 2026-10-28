@@ -53,7 +53,7 @@ type DB struct {
 	hasConfiguredScope      bool   // nodes.configured_scope column exists (#1865)
 	hasDefaultFloodScope    bool   // nodes.default_flood_scope column exists (#1865)
 	hasDefaultFloodScopeAt  bool   // nodes.default_flood_scope_at column exists (#1865)
-	hasNeighborReports      bool   // neighbor_reports table exists (#1865)
+	hasNeighborReportLog    bool   // neighbor_reports table exists (#1865)
 	hasDeclaredRegionsTable bool   // node_declared_regions table exists at startup (#1975); read via declaredRegionsTablePresent
 	hasMultibyteSupCols     bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
 	hasLastSeen             bool   // transmissions.last_seen column exists (#1690)
@@ -291,7 +291,7 @@ func (db *DB) detectSchema(ctx context.Context, q rowQuerier) error {
 	db.hasDefaultFloodScopeAt = nodes["default_flood_scope_at"]
 
 	nr, nrErr := schemaColumns(ctx, q, "neighbor_reports")
-	db.hasNeighborReports = nrErr == nil && len(nr) > 0
+	db.hasNeighborReportLog = nrErr == nil && len(nr) > 0
 
 	// #1975: an optional second confirmed-scope source. Absent on a stock
 	// install, so schemaColumns returns nothing and the flag stays false;

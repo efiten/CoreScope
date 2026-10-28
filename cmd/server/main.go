@@ -212,7 +212,7 @@ func main() {
 	// between.
 	database.hasDefaultFloodScope = true
 	database.hasDefaultFloodScopeAt = true
-	database.hasNeighborReports = true
+	database.hasNeighborReportLog = true
 
 	// In-memory packet store
 	store := NewPacketStore(database, cfg.PacketStore, cfg.CacheTTL)
