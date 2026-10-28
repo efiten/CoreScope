@@ -34,6 +34,9 @@ type DBStats struct {
 	// NeighborsOriginMismatch counts /neighbors reports dropped because
 	// origin_id differs from the topic pubkey (#1865).
 	NeighborsOriginMismatch atomic.Int64
+	// NeighborLinksDropped counts neighbour entries beyond
+	// maxNeighborsPerReport that were not stored.
+	NeighborLinksDropped atomic.Int64
 	// RelayTouches counts nodes.last_seen refreshes driven by relay
 	// participation rather than an ADVERT (#1598).
 	RelayTouches atomic.Int64
@@ -86,8 +89,11 @@ type Store struct {
 	// confirmedObservers marks /neighbors reports verified
 	// (confirmed_observers.go); nil means none is.
 	confirmedObservers *usersKeySet
-	// neighborsMismatchLog throttles the origin_id mismatch log line.
-	neighborsMismatchLog reporterLogLimiter
+	// neighborsMismatchLog, neighborsOverflowLog and neighborsTimestampLog
+	// throttle the /neighbors log lines per reporter.
+	neighborsMismatchLog  reporterLogLimiter
+	neighborsOverflowLog  reporterLogLimiter
+	neighborsTimestampLog reporterLogLimiter
 
 	stmtGetTxByHash            *sql.Stmt
 	stmtInsertTransmission     *sql.Stmt
@@ -2551,18 +2557,42 @@ type MeasuredLink struct {
 	Status     string
 }
 
+const upsertMeasuredLinkSQL = `INSERT INTO measured_links
+	(reporter, neighbor, snr, heard_at, reported_at, verified, status)
+	VALUES (?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(reporter, neighbor) DO UPDATE SET
+		snr = excluded.snr, heard_at = excluded.heard_at, reported_at = excluded.reported_at,
+		verified = excluded.verified, status = excluded.status
+	WHERE excluded.reported_at >= measured_links.reported_at`
+
 // UpsertMeasuredLink stores the latest measurement of a link. An older report
 // arriving late does not overwrite a newer one; an equal reported_at does.
 func (s *Store) UpsertMeasuredLink(l MeasuredLink) error {
-	_, err := s.db.Exec(`INSERT INTO measured_links
-		(reporter, neighbor, snr, heard_at, reported_at, verified, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(reporter, neighbor) DO UPDATE SET
-			snr = excluded.snr, heard_at = excluded.heard_at, reported_at = excluded.reported_at,
-			verified = excluded.verified, status = excluded.status
-		WHERE excluded.reported_at >= measured_links.reported_at`,
-		l.Reporter, l.Neighbor, l.SNR, l.HeardAt, l.ReportedAt, l.Verified, l.Status)
-	return err
+	return s.UpsertMeasuredLinks([]MeasuredLink{l})
+}
+
+// UpsertMeasuredLinks upserts the links of one report in one transaction,
+// with the ordering rule of UpsertMeasuredLink.
+func (s *Store) UpsertMeasuredLinks(links []MeasuredLink) error {
+	if len(links) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(upsertMeasuredLinkSQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, l := range links {
+		if _, err := stmt.Exec(l.Reporter, l.Neighbor, l.SNR, l.HeardAt, l.ReportedAt, l.Verified, l.Status); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // UpdateNodeDefaultFloodScope records the scope a node puts on its own
