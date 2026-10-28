@@ -375,7 +375,7 @@ func (s *Server) handleMeasuredLinks(w http.ResponseWriter, r *http.Request) {
 // reported or the table does not exist.
 func (db *DB) latestNeighborReport(pubkey string) (NeighborReportSummary, bool, error) {
 	var nr NeighborReportSummary
-	if !db.hasNeighborReports {
+	if !db.hasNeighborReportLog {
 		return nr, false, nil
 	}
 	var total, queried, truncated sql.NullInt64
