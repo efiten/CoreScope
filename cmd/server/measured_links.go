@@ -83,10 +83,13 @@ type measuredLinkIndex struct {
 	byNode map[string][]measuredLink
 }
 
-// loadMeasuredLinks reads measured_links through the read-only handle. A
-// database without the table yields an empty index. A failed read returns
-// nil, never a partial index, so the caller can keep the one it has.
-func loadMeasuredLinks(conn *sql.DB) *measuredLinkIndex {
+// loadMeasuredLinks reads the measured_links reported in the last days days
+// through the read-only handle (idx_measured_links_reported), the same window
+// the ingestor prunes by, so a row the daily prune has not reached yet is not
+// shown as current. A database without the table yields an empty index. A
+// failed read returns nil, never a partial index, so the caller can keep the
+// one it has.
+func loadMeasuredLinks(conn *sql.DB, days int) *measuredLinkIndex {
 	ix := &measuredLinkIndex{byNode: make(map[string][]measuredLink)}
 	if conn == nil {
 		return ix
@@ -100,7 +103,9 @@ func loadMeasuredLinks(conn *sql.DB) *measuredLinkIndex {
 		log.Printf("[measured-links] failed to probe measured_links: %v", err)
 		return nil
 	}
-	rows, err := conn.Query(`SELECT reporter, neighbor, snr, heard_at, reported_at, verified, status FROM measured_links`)
+	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
+	rows, err := conn.Query(`SELECT reporter, neighbor, snr, heard_at, reported_at, verified, status FROM measured_links
+		WHERE reported_at >= ?`, cutoff)
 	if err != nil {
 		log.Printf("[measured-links] failed to load measured_links: %v", err)
 		return nil
@@ -370,8 +375,10 @@ func (s *Server) handleMeasuredLinks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, MeasuredLinksResponse{Links: s.measuredPairs(time.Now())})
 }
 
-// latestNeighborReport returns the newest neighbor_reports row of pubkey, one
-// lookup on idx_neighbor_reports_reporter. ok is false when the node never
+// latestNeighborReport returns the neighbor_reports row of pubkey with the
+// newest reported_at, one lookup on idx_neighbor_reports_reporter. Ordering by
+// the report's own time keeps a late replay of an old report from becoming
+// the latest. ok is false when the node never
 // reported or the table does not exist.
 func (db *DB) latestNeighborReport(pubkey string) (NeighborReportSummary, bool, error) {
 	var nr NeighborReportSummary
@@ -381,7 +388,7 @@ func (db *DB) latestNeighborReport(pubkey string) (NeighborReportSummary, bool, 
 	var total, queried, truncated sql.NullInt64
 	var verified int
 	err := db.conn.QueryRow(`SELECT reported_at, total, queried, truncated, verified FROM neighbor_reports
-		WHERE reporter = ? ORDER BY received_at DESC LIMIT 1`, strings.ToLower(pubkey)).
+		WHERE reporter = ? ORDER BY reported_at DESC, received_at DESC LIMIT 1`, strings.ToLower(pubkey)).
 		Scan(&nr.ReportedAt, &total, &queried, &truncated, &verified)
 	if err == sql.ErrNoRows {
 		return nr, false, nil

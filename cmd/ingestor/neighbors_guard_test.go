@@ -57,7 +57,7 @@ func TestNeighborsReportIgnoresNonHexPubkeys(t *testing.T) {
 			map[string]interface{}{"pubkey": strings.ToUpper(pk), "status": "responded", "scopes": "dk"},
 		},
 	}
-	handleNeighborsReport(store, "test", false, "not-a-pubkey", msg, nil)
+	handleNeighborsReport(store, "test", false, false, "not-a-pubkey", msg, nil)
 
 	// The valid neighbor was written; nothing errored on the junk keys.
 	if sc, _ := configuredScope(t, store, pk); sc.String != "#dk" {

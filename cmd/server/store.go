@@ -514,6 +514,9 @@ type PacketStore struct {
 	// Measured links from the observers' neighbours reports (#1865), loaded
 	// at startup and swapped with the graph on every recompute tick.
 	measured atomic.Pointer[measuredLinkIndex]
+	// measuredLinkDays is retention.measuredLinkDays: the window
+	// loadMeasuredLinks reads. Set once before the recomputer starts.
+	measuredLinkDays int
 
 	// Singleflight state for ensureNeighborGraph. These were package-globals
 	// in #1203 r0 — moved to per-store fields (PR #1208 review) so parallel
@@ -822,6 +825,7 @@ func NewPacketStore(db *DB, cfg *PacketStoreConfig, cacheTTLs ...map[string]inte
 		// Override via cacheTTL.analyticsRF in config.json (also
 		// propagates to distance / topology / hash-sizes / etc.).
 		rfCacheTTL:           60 * time.Second,
+		measuredLinkDays:     defaultMeasuredLinkDays,
 		collisionCacheTTL:    3600 * time.Second,
 		invCooldown:          300 * time.Second,
 		advertPubkeys:        make(map[string]int),

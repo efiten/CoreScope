@@ -300,12 +300,15 @@ func (c *Config) NeighborReportsDaysOrDefault() int {
 	return 90
 }
 
+// defaultMeasuredLinkDays is retention.measuredLinkDays when unset.
+const defaultMeasuredLinkDays = 7
+
 // MeasuredLinkDaysOrDefault returns retention.measuredLinkDays or 7.
 func (c *Config) MeasuredLinkDaysOrDefault() int {
 	if c.Retention != nil && c.Retention.MeasuredLinkDays > 0 {
 		return c.Retention.MeasuredLinkDays
 	}
-	return 7
+	return defaultMeasuredLinkDays
 }
 
 // HopIndexDaysOrZero returns retention.hopIndexDays, or 0 (off) when unset.
