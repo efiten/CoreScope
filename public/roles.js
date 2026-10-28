@@ -565,6 +565,25 @@
   // ─── SNR thresholds ───
   window.SNR_THRESHOLDS = { excellent: 6, good: 0 };
 
+  // ─── Measured neighbour link SNR (#1865) ───
+  // Band of one measured SNR in dB: good >= 5, fair >= -5, else poor. Null when
+  // there is no number to judge. Styled via --link-snr-good/fair/poor.
+  window.snrBand = function (snr) {
+    if (snr == null || isNaN(Number(snr))) return null;
+    var v = Number(snr);
+    return v >= 5 ? 'good' : v >= -5 ? 'fair' : 'poor';
+  };
+
+  // "in 5.5 dB · out -2.0 dB". in = this node hears the neighbour, out = the
+  // neighbour hears this node; a side that was not reported reads "not measured".
+  window.formatMeasuredSnr = function (measured) {
+    var m = measured || {};
+    function side(label, v) {
+      return label + ' ' + (v == null || isNaN(Number(v)) ? 'not measured' : Number(v).toFixed(1) + ' dB');
+    }
+    return side('in', m.snrIn) + ' · ' + side('out', m.snrOut);
+  };
+
   // ─── Distance thresholds (km) ───
   window.DIST_THRESHOLDS = { local: 50, regional: 200 };
 

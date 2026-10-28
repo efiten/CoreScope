@@ -412,6 +412,37 @@
     return { icon: '<span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'MEDIUM', cls: 'confidence-medium' };
   }
 
+  // The "Measured" cell: SNR per direction from the neighbours report (#1865),
+  // the age of that report and whether it was verified. data-value is the weaker
+  // of the measured SNRs so the column sorts by link quality.
+  function renderMeasuredCell(m) {
+    if (!m) return '<td data-value=""><span class="text-muted">—</span></td>';
+    var snrs = [m.snrIn, m.snrOut].filter(function(v) { return v != null; }).map(Number);
+    var weakest = snrs.length ? Math.min.apply(null, snrs) : null;
+    var band = snrBand(weakest);
+    var title = m.status === 'timeout' ? ' title="does not answer scope queries"' : '';
+    return '<td data-value="' + (weakest != null ? weakest : '') + '">' +
+      '<div class="nb-measured"' + title + '>' +
+      '<span class="nb-snr' + (band ? ' nb-snr-' + band : '') + '">' + escapeHtml(formatMeasuredSnr(m)) + '</span> ' +
+      (m.verified
+        ? '<span class="nb-badge nb-verified">verified</span>'
+        : '<span class="nb-badge nb-unverified">not verified</span>') +
+      '<div class="nb-age text-muted">' + renderNodeTimestampHtml(m.reportedAt) + '</div>' +
+      '</div></td>';
+  }
+
+  // "3 of 5 neighbours queried, reported 4m ago" for the newest report of the
+  // node (node detail neighbor_report); total and queried can be unknown.
+  function renderNeighborReportSummary(report) {
+    if (!report) return '';
+    var counts = report.queried != null && report.total != null
+      ? Number(report.queried) + ' of ' + Number(report.total) + ' neighbours queried, reported '
+      : 'Neighbours reported ';
+    return '<div class="nb-report text-muted" style="font-size:12px;padding:0 0 6px">' + counts +
+      renderNodeTimestampHtml(report.reportedAt) +
+      (report.truncated ? ', list cut short' : '') + '</div>';
+  }
+
   function renderNeighborRows(neighbors, limit) {
     var sorted = neighbors.slice().sort(function(a, b) {
       return (b.count || 0) - (a.count || 0);
@@ -419,7 +450,12 @@
     var items = limit ? sorted.slice(0, limit) : sorted;
     return items.map(function(nb) {
       var conf = getConfidenceIndicator(nb);
-      var name = nb.name || (nb.prefix + '… (unknown)');
+      var m = nb.measured || null;
+      var name = nb.name;
+      if (!name) {
+        // Measured-only rows carry no packet evidence: say who heard whom.
+        name = nb.prefix + (m && !nb.count && m.snrIn == null ? '… (heard only by this neighbour)' : '… (unknown)');
+      }
       var nameHtml = nb.pubkey
         ? '<a href="#/nodes/' + encodeURIComponent(nb.pubkey) + '">' + escapeHtml(name) + '</a>'
         : '<span class="text-muted">' + escapeHtml(name) + '</span>';
@@ -447,9 +483,10 @@
       return '<tr>' +
         '<td data-value="' + escapeHtml(name.toLowerCase()) + '" style="font-weight:600">' + nameHtml + '</td>' +
         '<td data-value="' + escapeHtml(role.toLowerCase()) + '">' + roleBadge + '</td>' +
-        '<td data-value="' + Number(nb.score || 0) + '" title="' + escapeHtml(scoreTitle) + '">' + Number(nb.score).toFixed(2) + '</td>' +
-        '<td data-value="' + (nb.count || 0) + '">' + nb.count + '</td>' +
+        '<td data-value="' + Number(nb.score || 0) + '" title="' + escapeHtml(scoreTitle) + '">' + Number(nb.score || 0).toFixed(2) + '</td>' +
+        '<td data-value="' + (nb.count || 0) + '">' + (nb.count || 0) + '</td>' +
         '<td data-value="' + lastSeenVal + '">' + renderNodeTimestampHtml(nb.last_seen) + '</td>' +
+        renderMeasuredCell(m) +
         '<td data-value="' + distanceVal + '">' + distanceCell + '</td>' +
         '<td><span title="' + conf.label + '">' + conf.icon + '</span></td>' +
         '<td class="col-action">' + showOnMap + '</td>' +
@@ -465,6 +502,7 @@
       '<th scope="col" data-sort-key="score" data-type="numeric" data-sort-default="desc">Score</th>' +
       '<th scope="col" data-sort-key="count" data-type="numeric" data-sort-default="desc">Obs</th>' +
       '<th scope="col" data-sort-key="last_seen" data-type="numeric" data-sort-default="desc">Last Seen</th>' +
+      '<th scope="col" data-sort-key="measured" data-type="numeric">Measured</th>' +
       '<th scope="col" data-sort-key="distance" data-type="numeric">Distance</th>' +
       '<th scope="col">Conf</th><th scope="col" class="col-action"></th>' +
       '</tr></thead>' +
@@ -476,6 +514,7 @@
     var limit = opts.limit || 0;
     var headerSelector = opts.headerSelector;
     var viewAllPubkey = opts.viewAllPubkey;
+    var report = opts.report || null;
 
     // Always set spinner as initial DOM state (synchronous) so tests can observe it
     var spinnerEl = document.getElementById(containerId);
@@ -484,20 +523,20 @@
     // Check cache
     var cached = _neighborCache[pubkey];
     if (cached && (Date.now() - cached.ts < 300000)) { // 5 min cache
-      renderNeighborData(cached.data, containerId, limit, headerSelector, viewAllPubkey);
+      renderNeighborData(cached.data, containerId, limit, headerSelector, viewAllPubkey, report);
       return;
     }
 
     api('/nodes/' + encodeURIComponent(pubkey) + '/neighbors', { ttl: CLIENT_TTL.nodeDetail }).then(function(data) {
       _neighborCache[pubkey] = { data: data, ts: Date.now() };
-      renderNeighborData(data, containerId, limit, headerSelector, viewAllPubkey);
+      renderNeighborData(data, containerId, limit, headerSelector, viewAllPubkey, report);
     }).catch(function() {
       var el = document.getElementById(containerId);
       if (el) el.innerHTML = '<div class="text-muted" style="padding:8px">Could not load neighbor data</div>';
     });
   }
 
-  function renderNeighborData(data, containerId, limit, headerSelector, viewAllPubkey) {
+  function renderNeighborData(data, containerId, limit, headerSelector, viewAllPubkey, report) {
     var el = document.getElementById(containerId);
     if (!el) return;
     if (!data || !data.neighbors || !data.neighbors.length) {
@@ -512,7 +551,7 @@
       var h = document.querySelector(headerSelector);
       if (h) h.textContent = 'Neighbors (' + data.neighbors.length + ')';
     }
-    var html = renderNeighborTable(data.neighbors, limit);
+    var html = renderNeighborReportSummary(report) + renderNeighborTable(data.neighbors, limit);
     if (limit && data.neighbors.length > limit) {
       html += '<div style="margin-top:6px;text-align:right"><button class="btn-link show-all-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--link-color);padding:0">Show all ' + data.neighbors.length + ' neighbors <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg></button></div>';
     } else if (!limit && data.neighbors.length > 5) {
@@ -525,14 +564,14 @@
     var expandBtn = el.querySelector('.show-all-neighbors-btn');
     if (expandBtn) {
       expandBtn.addEventListener('click', function() {
-        renderNeighborData(data, containerId, 0, headerSelector, null);
+        renderNeighborData(data, containerId, 0, headerSelector, null, report);
       });
     }
     // Wire collapse button (#855)
     var collapseBtn = el.querySelector('.collapse-neighbors-btn');
     if (collapseBtn) {
       collapseBtn.addEventListener('click', function() {
-        renderNeighborData(data, containerId, 5, headerSelector, null);
+        renderNeighborData(data, containerId, 5, headerSelector, null, report);
       });
     }
 
@@ -861,6 +900,7 @@
           })() : ''}
           ${(n.role === 'repeater' || n.role === 'room') && Array.isArray(n.transported_scopes) && n.transported_scopes.length ? `<tr id="row-transported-scopes"><td title="Distinct region scopes (transmissions.scope_name) of the non-advert packets whose path names this repeater by its full pubkey. Shows which regions' traffic it has carried (#1751). Packets that only carry a 1-byte hop are excluded: that byte is shared by every node with the same pubkey prefix, so it cannot say which of them relayed (#1902).">Transported scopes</td><td><span style="display:inline-flex;flex-wrap:wrap;gap:3px;vertical-align:middle">${n.transported_scopes.map(sc => '<span class="badge">' + escapeHtml(String(sc)) + '</span>').join('')}</span></td></tr>` : ''}
           ${'configured_scope' in n && n.configured_scope !== null ? `<tr id="row-configured-scope"><td title="Region scopes this node has CONFIGURED, confirmed via an observer /neighbors report (status=responded) — concrete evidence, distinct from observed default scope and transported scopes (#1865).${n.configured_scope_at ? ' Last confirmed ' + escapeHtml(String(n.configured_scope_at)) + '.' : ''}">Configured scope <span style="color:var(--status-green-text)" role="img" aria-label="confirmed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check"/></svg></span></td><td>${n.configured_scope === '' ? '<span style="color:var(--text-muted)">none configured</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.configured_scope)}</code>`}</td></tr>` : ''}
+          ${n.default_flood_scope ? `<tr id="row-flood-scope"><td title="Region this node floods under when no scope is chosen, from its neighbours report (#1865).${n.default_flood_scope_at ? ' Reported ' + escapeHtml(String(n.default_flood_scope_at)) + '.' : ''}">Floods under</td><td>${n.default_flood_scope === '*' ? '<span style="color:var(--text-muted)">unscoped</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.default_flood_scope)}</code>`}</td></tr>` : ''}
           <tr><td>First Seen</td><td>${renderNodeTimestampHtml(n.first_seen)}</td></tr>
           <tr><td>${renderPacketCountLabel('fullNodePacketCountHelp')}</td><td>${stats.totalTransmissions || stats.totalPackets || n.advert_count || 0}${stats.totalObservations && stats.totalObservations !== (stats.totalTransmissions || stats.totalPackets) ? ' <span class="text-muted" style="font-size:0.85em">(seen ' + stats.totalObservations + '×)</span>' : ''}</td></tr>
           <tr><td>Packets Today</td><td>${stats.packetsToday || 0}</td></tr>
@@ -1016,7 +1056,8 @@
 
       // Fetch neighbors for this node (full-screen view)
       fetchAndRenderNeighbors(n.public_key, 'fullNeighborsContent', {
-        headerSelector: '#fullNeighborsHeader'
+        headerSelector: '#fullNeighborsHeader',
+        report: n.neighbor_report
       });
 
       // #690 — Clock Skew detail section (full-screen view)
@@ -2080,7 +2121,8 @@
     fetchAndRenderNeighbors(n.public_key, 'panelNeighborsContent', {
       limit: 5,
       headerSelector: '#panelNeighborsHeader',
-      viewAllPubkey: n.public_key
+      viewAllPubkey: n.public_key,
+      report: n.neighbor_report
     });
 
     // #813 — Clock Skew section in side panel (mirrors full-screen view)

@@ -7524,6 +7524,42 @@ console.log('\n=== analytics.js: filtered role breakdown ===');
   });
 }
 
+// ===== MEASURED LINK SNR HELPERS (roles.js) =====
+console.log('\n=== roles.js: measured link SNR helpers ===');
+{
+  const ctx = makeSandbox();
+  loadInCtx(ctx, 'public/roles.js');
+
+  test('snrBand boundaries: >= 5 good, >= -5 fair, below poor', () => {
+    assert.strictEqual(ctx.snrBand(5), 'good');
+    assert.strictEqual(ctx.snrBand(4.9), 'fair');
+    assert.strictEqual(ctx.snrBand(-5), 'fair');
+    assert.strictEqual(ctx.snrBand(-5.1), 'poor');
+    assert.strictEqual(ctx.snrBand(12), 'good');
+    assert.strictEqual(ctx.snrBand(-20), 'poor');
+  });
+
+  test('snrBand has no band for a missing or non-numeric SNR', () => {
+    assert.strictEqual(ctx.snrBand(null), null);
+    assert.strictEqual(ctx.snrBand(undefined), null);
+    assert.strictEqual(ctx.snrBand(NaN), null);
+  });
+
+  test('formatMeasuredSnr shows both directions with one decimal', () => {
+    assert.strictEqual(ctx.formatMeasuredSnr({ snrIn: 5.5, snrOut: -2 }), 'in 5.5 dB · out -2.0 dB');
+  });
+
+  test('formatMeasuredSnr names the side that was not measured', () => {
+    assert.strictEqual(ctx.formatMeasuredSnr({ snrIn: 5.5, snrOut: null }), 'in 5.5 dB · out not measured');
+    assert.strictEqual(ctx.formatMeasuredSnr({ snrIn: null, snrOut: 3 }), 'in not measured · out 3.0 dB');
+    assert.strictEqual(ctx.formatMeasuredSnr({}), 'in not measured · out not measured');
+  });
+
+  test('formatMeasuredSnr keeps a zero SNR', () => {
+    assert.strictEqual(ctx.formatMeasuredSnr({ snrIn: 0, snrOut: 0 }), 'in 0.0 dB · out 0.0 dB');
+  });
+}
+
 // ===== SUMMARY =====
 Promise.allSettled(pendingTests).then(() => {
   console.log(`\n${'═'.repeat(40)}`);
