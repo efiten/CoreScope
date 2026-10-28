@@ -40,6 +40,11 @@ type NeighborEntry struct {
 	Ambiguous    bool             `json:"ambiguous"`
 	Unresolved   bool             `json:"unresolved,omitempty"`
 	Candidates   []CandidateEntry `json:"candidates,omitempty"`
+	// Measured is set when the neighbours report of either node lists the
+	// other (#1865). Inferred is set, to false, only on a neighbour known
+	// from such a report alone; graph entries leave it out.
+	Measured *MeasuredInfo `json:"measured,omitempty"`
+	Inferred *bool         `json:"inferred,omitempty"`
 }
 
 type CandidateEntry struct {
@@ -255,6 +260,9 @@ func (s *Server) handleNodeNeighbors(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Score > entries[j].Score
 	})
+
+	// Measured-only neighbours go after the scored ones.
+	entries = s.mergeMeasuredNeighbors(pubkey, entries, nodeMap, srcInfo)
 
 	if entries == nil {
 		entries = []NeighborEntry{}

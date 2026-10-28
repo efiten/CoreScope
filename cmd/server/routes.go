@@ -374,6 +374,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/analytics/subpaths-bulk", s.handleAnalyticsSubpathsBulk).Methods("GET")
 	r.HandleFunc("/api/analytics/subpath-detail", s.handleAnalyticsSubpathDetail).Methods("GET")
 	r.HandleFunc("/api/analytics/neighbor-graph", s.handleNeighborGraph).Methods("GET")
+	r.HandleFunc("/api/links/measured", s.handleMeasuredLinks).Methods("GET")
 	r.HandleFunc("/api/analytics/relay-airtime-share", s.handleAnalyticsRelayAirtimeShare).Methods("GET")
 	r.HandleFunc("/api/analytics/retransmissions", s.handleAnalyticsRetransmissions).Methods("GET")
 
@@ -1866,6 +1867,13 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	if pk, _ := node["public_key"].(string); pk != "" {
 		pubkey = pk
+	}
+
+	// #1865: the newest neighbours report this node sent, when it reports.
+	if nr, ok, err := s.db.latestNeighborReport(pubkey); err != nil {
+		log.Printf("[node-detail] neighbor_report for %s: %v", pubkey, err)
+	} else if ok {
+		node["neighbor_report"] = nr
 	}
 
 	if s.store != nil {
