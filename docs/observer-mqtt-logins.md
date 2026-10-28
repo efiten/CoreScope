@@ -422,4 +422,6 @@ Retention, both consumed by the ingestor (the server also reads `measuredLinkDay
 
 A neighbour missing from a report never removes its link: the firmware truncates long reports at 10 kB. A link goes away only when it expires after `measuredLinkDays`.
 
+The default of 7 days covers a report interval up to 168 hours. An observer set to a longer interval (up to 336 hours) has its links expire between two reports; raise `measuredLinkDays` above that interval if such observers matter.
+
 Only a current report creates or refreshes links. A retained replay, a report without a valid `timestamp` and a report older than `measuredLinkDays` are kept in the journal and change no link.
