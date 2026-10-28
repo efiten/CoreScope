@@ -1,0 +1,131 @@
+/**
+ * Measured links layer on the map (#1865).
+ * Route-mocks /api/nodes and /api/links/measured with four nodes and three pairs
+ * (two-way verified good, one-way verified, two-way unverified weak) and checks
+ * the toggle, the hash state, the colour classes, the dashes, the popup and that
+ * nothing is fetched while the layer is off.
+ * Usage: BASE_URL=http://localhost:13581 node tests/e2e/test-map-measured-links-e2e.js
+ * Defaults to localhost:3000, never point it at a public instance.
+ */
+'use strict';
+const { chromium } = require('playwright');
+
+const BASE = process.env.BASE_URL || 'http://localhost:3000';
+const pk = (c) => c.repeat(64);
+const NODES = [
+  { public_key: pk('a'), name: 'Node-A', role: 'repeater', lat: 50.80, lon: 4.30 },
+  { public_key: pk('b'), name: 'Node-B', role: 'repeater', lat: 50.85, lon: 4.40 },
+  { public_key: pk('c'), name: 'Node-C<i>', role: 'repeater', lat: 50.90, lon: 4.35 },
+  { public_key: pk('d'), name: 'Node-D', role: 'repeater', lat: 50.75, lon: 4.45 },
+].map((n) => Object.assign({ last_seen: new Date().toISOString(), advert_count: 1 }, n));
+const LINKS = { links: [
+  { a: pk('a'), b: pk('b'), snrAB: 8, snrBA: 6.5, verified: true, ageSec: 120 },
+  { a: pk('a'), b: pk('c'), snrAB: null, snrBA: -2, verified: true, ageSec: 3700 },
+  { a: pk('b'), b: pk('d'), snrAB: -9, snrBA: 1, verified: false, ageSec: 90000 },
+] };
+
+const results = [];
+async function test(name, fn) {
+  try { await fn(); results.push(true); console.log(`  ok   ${name}`); }
+  catch (e) { results.push(false); console.log(`  FAIL ${name}: ${e.message}`); }
+}
+function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
+
+(async () => {
+  const launchOpts = { headless: true, args: ['--no-sandbox', '--disable-gpu'] };
+  if (process.env.CHROMIUM_PATH) launchOpts.executablePath = process.env.CHROMIUM_PATH;
+  const browser = await chromium.launch(launchOpts);
+  const context = await browser.newContext({ viewport: { width: 1400, height: 900 } });
+  const page = await context.newPage();
+
+  let linkFetches = 0;
+  await page.route(/\/api\/links\/measured/, (r) => {
+    linkFetches++;
+    r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(LINKS) });
+  });
+  await page.route(/\/api\/nodes\?/, (r) => r.fulfill({ status: 200, contentType: 'application/json',
+    body: JSON.stringify({ nodes: NODES, total: NODES.length, has_more: false, counts: { repeaters: 4, rooms: 0, companions: 0, sensors: 0 } }) }));
+
+  const paths = 'path.ml-link';
+  const hash = () => page.evaluate(() => location.hash);
+  const waitMap = async () => {
+    await page.waitForSelector('#mcLinks', { state: 'attached', timeout: 20000 });
+    await page.waitForSelector('.leaflet-container', { timeout: 20000 });
+  };
+  const waitPaths = (n) => page.waitForFunction(([s, k]) => document.querySelectorAll(s).length === k, [paths, n], { timeout: 10000 });
+  const classes = () => page.locator(paths).evaluateAll((els) => els.map((e) => (e.getAttribute('class') || '').split(/\s+/)));
+
+  console.log(`Measured links map E2E against ${BASE}`);
+  await page.goto(`${BASE}/#/map`, { waitUntil: 'domcontentloaded' });
+  await waitMap();
+  await page.waitForTimeout(1000);
+
+  await test('off by default: unchecked, no paths, no fetch', async () => {
+    assert(!(await page.locator('#mcLinks').isChecked()), 'checked');
+    assert((await page.locator(paths).count()) === 0, 'paths drawn');
+    assert(linkFetches === 0, 'fetched ' + linkFetches);
+  });
+
+  await test('toggle on draws three paths, sets links=1 in the hash, fetches once', async () => {
+    await page.locator('#mcLinks').check();
+    await waitPaths(3);
+    assert((await hash()).includes('links=1'), 'hash ' + (await hash()));
+    assert(linkFetches === 1, 'fetches ' + linkFetches);
+  });
+
+  await test('colour classes follow the weaker SNR', async () => {
+    const cls = await classes();
+    const has = (c) => cls.filter((x) => x.includes(c)).length;
+    assert(has('ml-good') === 1 && has('ml-fair') === 1 && has('ml-poor') === 1, JSON.stringify(cls));
+  });
+
+  await test('two paths are dashed: one-way and unverified', async () => {
+    const cls = await classes();
+    assert(cls.filter((x) => x.includes('ml-dashed')).length === 2, JSON.stringify(cls));
+    const dashes = await page.locator(paths).evaluateAll((els) => els.map((e) => getComputedStyle(e).strokeDasharray));
+    assert(dashes.filter((d) => d && d !== 'none').length === 2, dashes.join(' | '));
+  });
+
+  await test('stroke colour comes from the CSS variable', async () => {
+    const good = await page.locator('path.ml-good').first().evaluate((e) => getComputedStyle(e).stroke);
+    const poor = await page.locator('path.ml-poor').first().evaluate((e) => getComputedStyle(e).stroke);
+    assert(good && poor && good !== poor && good !== 'none', good + ' / ' + poor);
+  });
+
+  await test('popup shows both SNRs, age, verified label, and escapes names', async () => {
+    await page.locator('path.ml-fair').first().dispatchEvent('click');
+    await page.waitForSelector('.leaflet-popup-content', { timeout: 5000 });
+    const html = await page.locator('.leaflet-popup-content').innerHTML();
+    const t = await page.locator('.leaflet-popup-content').innerText();
+    assert(t.includes('Node-A') && t.includes('Node-C<i>'), t);
+    assert(!html.includes('<i>'), 'unescaped name');
+    assert(t.includes('not measured') && t.includes('-2.0 dB'), t);
+    assert(t.includes('verified') && !t.includes('not verified'), t);
+    assert(/1 h/.test(t), 'age: ' + t);
+  });
+
+  await test('reload with the hash restores the layer', async () => {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await waitMap();
+    await waitPaths(3);
+    assert(await page.locator('#mcLinks').isChecked(), 'checkbox');
+  });
+
+  await test('toggle off removes the paths and the hash flag', async () => {
+    await page.locator('#mcLinks').uncheck();
+    await waitPaths(0);
+    assert(!(await hash()).includes('links=1'), 'hash still set');
+  });
+
+  await test('toggling on again reuses the cached response', async () => {
+    const before = linkFetches;
+    await page.locator('#mcLinks').check();
+    await waitPaths(3);
+    assert(linkFetches === before, 'refetched');
+  });
+
+  await browser.close();
+  const failed = results.filter((x) => !x).length;
+  console.log(`${results.length - failed} passed, ${failed} failed`);
+  if (failed) process.exit(1);
+})().catch((e) => { console.error(e); process.exit(1); });

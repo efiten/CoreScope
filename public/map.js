@@ -23,6 +23,9 @@
   let affinityData = null;
   let topRoutesLayer = null;
   let topRoutesEdges = null; // cached neighbor-graph edges for the Important Links overlay
+  let measuredLayer = null;  // Measured links layer (#1865): one polyline per pair
+  let measuredPairs = null;  // /api/links/measured response, fetched once per page
+  let measuredFetching = false;
   let topRoutesRenderTimer = null; // debounce for the Top-N slider
   let topRoutesAccentCache = ''; // cached --accent, invalidated on theme-refresh
   let userHasMoved = false;
@@ -522,7 +525,8 @@
             <label for="mcMultiByte"><input type="checkbox" id="mcMultiByte"> Multi-byte support</label>
             <label for="mcScopeOverlay" title="Colour repeater markers by their region-scope configuration"><input type="checkbox" id="mcScopeOverlay"> Scope config colours</label>
             <label for="mcEstimated" title="Repeaters that never sent an advert, placed from where mobile companions heard them. Dashed circle = uncertainty. Follows the repeater role filter only, not the area, region or last-heard filters."><input type="checkbox" id="mcEstimated"> Estimated positions <span class="mc-est-legend" aria-hidden="true">≈</span></label>
-            <label id="mcGeoFilterLabel" for="mcGeoFilter" style="display:none"><input type="checkbox" id="mcGeoFilter"> Mesh live area</label>
+            <label for="mcLinks" title="Links between repeaters from their neighbour reports, coloured by the weaker SNR. Dashed = not verified or measured one way only."><input type="checkbox" id="mcLinks"> Measured links</label>
+            <label id="mcGeoFilterLabel"for="mcGeoFilter" style="display:none"><input type="checkbox" id="mcGeoFilter"> Mesh live area</label>
           </fieldset>
           <div id="mapAreaFilter"></div>
           <fieldset class="mc-section">
@@ -883,6 +887,17 @@
         }
       });
     })();
+
+    // Measured links (#1865): off by default, state in the hash as links=1.
+    // loadNodes() draws it once the node positions are in.
+    const linksEl = document.getElementById('mcLinks');
+    if (linksEl) {
+      linksEl.checked = urlParams.get('links') === '1';
+      linksEl.addEventListener('change', function (e) {
+        setLinksHash(e.target.checked);
+        syncMeasuredLinks();
+      });
+    }
 
     // Hash Labels toggle
     const hashLabelEl = document.getElementById('mcHashLabels');
@@ -1767,6 +1782,8 @@
         });
       }
 
+      syncMeasuredLinks();
+
       // Keep the Important Links overlay in sync on a full node reload: re-fetch
       // the neighbor-graph edges (not just re-render the stale cache) so the
       // overlay tracks the current graph + scores.
@@ -2486,6 +2503,9 @@
     estimatedLayer = null;
     reported = { nodes: [], method: null };
     clusterGroup = null;
+    measuredLayer = null;
+    measuredPairs = null;
+    measuredFetching = false;
     _currentMarkerData = [];
     routeLayer = null;
     if (heatLayer) { heatLayer = null; }
@@ -2727,6 +2747,98 @@
     topRoutesLayer.addTo(map);
   }
   // ─── End Important Links ─────────────────────────────────────────────────────
+
+  // ─── Measured links (#1865) ──────────────────────────────────────────────────
+  // One L.polyline per pair in one layerGroup (Task 7: well under 2000 links, no
+  // canvas renderer). Colour and dashes come from CSS classes (style.css) so the
+  // palette stays in the --link-snr-* variables.
+  function setLinksHash(on) {
+    const parts = location.hash.split('?');
+    const params = new URLSearchParams(parts[1] || '');
+    if (on) params.set('links', '1'); else params.delete('links');
+    const qs = params.toString();
+    history.replaceState(null, '', parts[0] + (qs ? '?' + qs : ''));
+  }
+
+  function clearMeasuredLinks() {
+    if (measuredLayer) { if (map) map.removeLayer(measuredLayer); measuredLayer = null; }
+  }
+
+  function measuredAgeText(sec) {
+    sec = Number(sec);
+    if (!isFinite(sec) || sec < 0) return 'unknown';
+    if (sec < 60) return 'under 1 min ago';
+    if (sec < 3600) return Math.floor(sec / 60) + ' min ago';
+    if (sec < 86400) return Math.floor(sec / 3600) + ' h ago';
+    return Math.floor(sec / 86400) + ' d ago';
+  }
+
+  function measuredSnrText(v) {
+    return v == null || isNaN(Number(v)) ? 'not measured' : Number(v).toFixed(1) + ' dB';
+  }
+
+  // Draws, fetches (once) or clears, following the checkbox.
+  async function syncMeasuredLinks() {
+    const cb = document.getElementById('mcLinks');
+    if (!map) return;
+    if (!cb || !cb.checked) { clearMeasuredLinks(); return; }
+    if (!measuredPairs) {
+      if (measuredFetching) return;
+      measuredFetching = true;
+      const loadingMap = map;
+      try {
+        const data = await api('/links/measured');
+        if (map !== loadingMap) return;
+        measuredPairs = (data && data.links) || [];
+      } catch (err) {
+        console.warn('[measured-links] failed to load:', err);
+        if (map !== loadingMap) return;
+        cb.checked = false;
+        setLinksHash(false);
+        return;
+      } finally {
+        measuredFetching = false;
+      }
+      if (!cb.checked) return;
+    }
+    renderMeasuredLinks();
+  }
+
+  function renderMeasuredLinks() {
+    if (!map || !measuredPairs) return;
+    clearMeasuredLinks();
+    const byKey = new Map();
+    nodes.forEach(function (n) {
+      if (n && n.public_key && n.lat && n.lon) byKey.set(n.public_key.toLowerCase(), n);
+    });
+    const layer = L.layerGroup();
+    measuredPairs.forEach(function (p) {
+      const na = byKey.get(String(p.a).toLowerCase());
+      const nb = byKey.get(String(p.b).toLowerCase());
+      if (!na || !nb) return;
+      const measured = [p.snrAB, p.snrBA].filter(function (v) { return v != null && !isNaN(Number(v)); }).map(Number);
+      const weakest = measured.length ? Math.min.apply(null, measured) : null;
+      const band = snrBand(weakest) || 'poor';
+      const dashed = !p.verified || measured.length < 2;
+      const line = L.polyline([[na.lat, na.lon], [nb.lat, nb.lon]], {
+        className: 'ml-link ml-' + band + (dashed ? ' ml-dashed' : ''),
+        weight: 3,
+        opacity: 0.85
+      });
+      const nameA = safeEsc(na.name || String(p.a).slice(0, 8));
+      const nameB = safeEsc(nb.name || String(p.b).slice(0, 8));
+      line.bindPopup('<b>Measured link</b><br>' + nameA + ' ↔ ' + nameB + '<br>' +
+        nameA + ' hears ' + nameB + ': ' + measuredSnrText(p.snrAB) + '<br>' +
+        nameB + ' hears ' + nameA + ': ' + measuredSnrText(p.snrBA) + '<br>' +
+        (measured.length ? '' : 'No SNR<br>') +
+        'Reported ' + measuredAgeText(p.ageSec) + '<br>' +
+        (p.verified ? 'verified' : 'not verified'));
+      layer.addLayer(line);
+    });
+    layer.addTo(map);
+    measuredLayer = layer;
+  }
+  // ─── End Measured links ──────────────────────────────────────────────────────
 
   registerPage('map', {
     init: function(app, routeParam) {
