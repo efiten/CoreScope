@@ -35,7 +35,7 @@ type DBStats struct {
 	// origin_id differs from the topic pubkey (#1865).
 	NeighborsOriginMismatch atomic.Int64
 	// NeighborLinksDropped counts neighbour entries beyond
-	// maxNeighborsPerReport that were not stored.
+	// maxStoredNeighbors that were not stored.
 	NeighborLinksDropped atomic.Int64
 	// RelayTouches counts nodes.last_seen refreshes driven by relay
 	// participation rather than an ADVERT (#1598).

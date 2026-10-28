@@ -43,12 +43,6 @@ const (
 	// maxHeardSecsAgo clamps neighbors[].heard_secs_ago: older than the
 	// measured_links retention default is not a current link anyway.
 	maxHeardSecsAgo = 7 * 24 * 3600
-	// maxNeighborStatusLen caps neighbors[].status; longer values are stored
-	// as "unknown". Real values are short words such as "responded".
-	maxNeighborStatusLen = 32
-	// maxNeighborsPerReport caps the neighbour entries processed per report.
-	// The firmware caps the whole report at 10 kB (#1865).
-	maxNeighborsPerReport = 512
 )
 
 const (

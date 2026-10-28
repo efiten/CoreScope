@@ -2122,51 +2122,40 @@ func recordNeighborLinks(store *Store, tag string, verifiesObservers bool, obser
 		log.Printf("MQTT [%s] neighbors report insert error for %.8s: %v", tag, reporter, err)
 	}
 
-	// An oversized report gets no links, and a long list is cut at
-	// maxNeighborsPerReport: the report is unauthenticated, and each link is
-	// a write inside the MQTT handler.
+	// An oversized report gets no links, and sanitizeNeighbors cuts a long
+	// list at maxStoredNeighbors: the report is unauthenticated, and each
+	// link is a write inside the MQTT handler.
 	var neighbors []interface{}
 	if len(raw) <= maxNeighborReportPayload {
 		neighbors, _ = msg["neighbors"].([]interface{})
 	}
-	if len(neighbors) > maxNeighborsPerReport {
-		dropped := len(neighbors) - maxNeighborsPerReport
+	if len(neighbors) > maxStoredNeighbors {
+		dropped := len(neighbors) - maxStoredNeighbors
 		store.Stats.NeighborLinksDropped.Add(int64(dropped))
 		if store.neighborsOverflowLog.allow(reporter) {
-			log.Printf("[neighbors] %.8s: report lists %d neighbours, keeping the first %d", reporter, len(neighbors), maxNeighborsPerReport)
+			log.Printf("[neighbors] %.8s: report lists %d neighbours, keeping the first %d", reporter, len(neighbors), maxStoredNeighbors)
 		}
-		neighbors = neighbors[:maxNeighborsPerReport]
+		neighbors = neighbors[:maxStoredNeighbors]
 	}
-	links := make([]MeasuredLink, 0, len(neighbors))
-	for _, item := range neighbors {
-		n, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		pubkey, _ := n["pubkey"].(string)
-		pubkey = strings.ToLower(pubkey)
+	entries := sanitizeNeighbors(neighbors)
+	links := make([]MeasuredLink, 0, len(entries))
+	for _, n := range entries {
 		// A node is not its own neighbour: a self-loop is a bad row.
-		if !targetPubkeyRe.MatchString(pubkey) || pubkey == reporter {
+		if n.Pubkey == reporter || n.HeardSecsAgo == nil {
 			continue
 		}
-		ago, ok := n["heard_secs_ago"].(float64)
-		if !ok {
-			continue
-		}
-		ago = math.Max(0, math.Min(ago, maxHeardSecsAgo))
+		ago := math.Min(float64(*n.HeardSecsAgo), maxHeardSecsAgo)
 		l := MeasuredLink{
 			Reporter:   reporter,
-			Neighbor:   pubkey,
+			Neighbor:   n.Pubkey,
 			HeardAt:    reportTime.Add(-time.Duration(ago) * time.Second).Format(time.RFC3339),
 			ReportedAt: reportedAt,
 			Verified:   verified,
+			SNR:        n.SNR,
 			Status:     "unknown",
 		}
-		if snr, ok := n["snr"].(float64); ok {
-			l.SNR = &snr
-		}
-		if st, ok := n["status"].(string); ok && st != "" && len(st) <= maxNeighborStatusLen {
-			l.Status = st
+		if n.Status != "" {
+			l.Status = n.Status
 		}
 		links = append(links, l)
 	}

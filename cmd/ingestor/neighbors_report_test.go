@@ -458,9 +458,9 @@ func TestNeighborsReportBadFields(t *testing.T) {
 		{"pubkey":"`+strings.Repeat("f", 64)+`","snr":1,"heard_secs_ago":1,"status":"`+strings.Repeat("s", 100)+`"}
 	]}`)
 
-	a, ok := readLink(t, store, nrOrigin, nrNbA)
-	if !ok || a.snr.Valid || a.heardAt != "2026-07-26T11:00:00Z" || a.status != "unknown" {
-		t.Errorf("neighbour A (bad snr, negative age, numeric status) = %+v ok=%v", a, ok)
+	// A negative age fails sanitizeNeighbors, as on the observer page.
+	if a, ok := readLink(t, store, nrOrigin, nrNbA); ok {
+		t.Errorf("neighbour A (bad snr, negative age, numeric status) was stored: %+v", a)
 	}
 	b, ok := readLink(t, store, nrOrigin, nrNbB)
 	if !ok || b.snr.Valid || b.heardAt != "2026-07-19T11:00:00Z" || b.status != "responded" {
@@ -475,8 +475,8 @@ func TestNeighborsReportBadFields(t *testing.T) {
 	if f, ok := readLink(t, store, nrOrigin, strings.Repeat("f", 64)); !ok || f.status != "unknown" {
 		t.Errorf("oversized status = %+v ok=%v, want unknown", f, ok)
 	}
-	if n := countRows(t, store, "measured_links"); n != 3 {
-		t.Errorf("measured_links rows = %d, want 3", n)
+	if n := countRows(t, store, "measured_links"); n != 2 {
+		t.Errorf("measured_links rows = %d, want 2", n)
 	}
 	var total, truncated sql.NullInt64
 	if err := store.db.QueryRow(`SELECT total, truncated FROM neighbor_reports`).Scan(&total, &truncated); err != nil {
@@ -587,11 +587,11 @@ func TestNeighborsReportCapsNeighbours(t *testing.T) {
 	ingestReport(t, store, nrOriginUpper, sb.String())
 	ingestReport(t, store, nrOriginUpper, sb.String())
 
-	if n := countRows(t, store, "measured_links"); n != maxNeighborsPerReport {
-		t.Errorf("measured_links rows = %d, want %d", n, maxNeighborsPerReport)
+	if n := countRows(t, store, "measured_links"); n != maxStoredNeighbors {
+		t.Errorf("measured_links rows = %d, want %d", n, maxStoredNeighbors)
 	}
-	if n := store.Stats.NeighborLinksDropped.Load(); n != 2*(600-maxNeighborsPerReport) {
-		t.Errorf("dropped = %d, want %d", n, 2*(600-maxNeighborsPerReport))
+	if n := store.Stats.NeighborLinksDropped.Load(); n != 2*(600-maxStoredNeighbors) {
+		t.Errorf("dropped = %d, want %d", n, 2*(600-maxStoredNeighbors))
 	}
 	if n := strings.Count(buf.String(), "report lists 600 neighbours"); n != 1 {
 		t.Errorf("overflow logged %d times, want once per reporter:\n%s", n, buf.String())
