@@ -99,19 +99,22 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
     assert((await r.locator('.nb-snr-poor').count()) === 1, 'poor band at -8 dB');
   });
 
-  await test('Measured column sorts by the weaker SNR', async () => {
+  await test('Measured column sorts by the weaker SNR, and a second click reverses it', async () => {
     const th = page.locator('#fullNeighborsContent th[data-sort-key="measured"]');
-    await th.click();
-    const weakest = await page.locator(rows).evaluateAll((trs) => trs.map((tr) => {
+    const weakest = async () => (await page.locator(rows).evaluateAll((trs) => trs.map((tr) => {
       const c = tr.querySelector('.nb-measured');
       return c ? c.closest('td').getAttribute('data-value') : '';
-    }));
-    const nums = weakest.filter((v) => v !== '').map(Number);
-    assert(nums.length === 3, 'three measured values: ' + weakest.join(','));
-    const asc = nums.slice().sort((a, b) => a - b).join(',');
-    const desc = nums.slice().sort((a, b) => b - a).join(',');
-    assert(nums.join(',') === asc || nums.join(',') === desc, 'order ' + nums.join(','));
-    assert(nums.slice().sort((a, b) => a - b).join(',') === '-8,-2,7.25', 'weaker side per row: ' + nums.join(','));
+    }))).filter((v) => v !== '').map(Number);
+    await th.click();
+    const first = await weakest();
+    assert(first.length === 3, 'three measured values: ' + first.join(','));
+    const asc = [-8, -2, 7.25];
+    const isAsc = first.join(',') === asc.join(',');
+    const isDesc = first.join(',') === asc.slice().reverse().join(',');
+    assert(isAsc || isDesc, 'sorted after first click: ' + first.join(','));
+    await th.click();
+    const second = await weakest();
+    assert(second.join(',') === first.slice().reverse().join(','), 'second click reverses: ' + first.join(',') + ' -> ' + second.join(','));
   });
 
   await test('report summary reads "3 of 5 neighbours queried" and "list cut short"', async () => {
