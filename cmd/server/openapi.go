@@ -213,6 +213,7 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/analytics/subpaths-bulk":   {Summary: "Bulk subpath analysis", Tag: "analytics"},
 		"GET /api/analytics/subpath-detail":  {Summary: "Subpath detail", Tag: "analytics"},
 		"GET /api/analytics/neighbor-graph":  {Summary: "Neighbor graph", Description: "Full neighbor affinity graph for visualization.", Tag: "analytics"},
+		"GET /api/links/measured":            {Summary: "Measured links", Description: "#1865: every link measured by the observers' neighbours reports, merged per unordered pair, for the map. Only pairs whose two nodes have a position are listed. Reloaded from the database every 60 s.", Tag: "analytics", Response: schemaRef("MeasuredLinksResponse")},
 		"GET /api/analytics/retransmissions": {Summary: "Retransmission pressure over time", Description: "Collision-pressure proxy (#1699): per time bucket, the average number of distinct repeaters in the union of all observed paths of each flood event (route types 0/1, TRACE excluded). A transmission's observations are split into flood events at gaps of more than 5 minutes; each event is bucketed by its first observation, and events before the store retention floor are left out. Hop prefixes are not resolved: a prefix counts once per event, so colliding 1-byte prefixes make this a lower bound. Only repeaters some observer heard are counted, so the value also follows observer coverage; each bucket carries its observer count.", Tag: "analytics",
 			QueryParams: []paramMeta{
 				{Name: "region", Description: "Comma-separated IATA codes; only observations from observers in the region are counted. A region with no known observers is not filtered", Type: "string"},
@@ -327,6 +328,9 @@ func componentSchemas() map[string]interface{} {
 					"type": "string", "enum": []string{"A", "B", "C", "D", "F"},
 					"description": "Letter grade derived from usefulness_score. Repeater/room only.",
 				},
+				"default_flood_scope":        openAPISchema{Type: "string", Description: "#1865: the scope this node floods under by default, from its own neighbours report ('*' = unscoped). Null when it never reported one."},
+				"default_flood_scope_at":     openAPISchema{Type: "string", Description: "#1865: RFC3339 time of the report behind default_flood_scope. Null with it."},
+				"neighbor_report":            schemaRef("NeighborReportSummary"),
 				"declared_regions_truncated": map[string]interface{}{"type": "boolean", "description": "Repeater/room only (#1862): present, and true, only when the answer behind declared_regions was flagged as truncated, so that list is partial. GET /api/scope-audit shows the same flag as truncated. Absent otherwise, including for a source that does not record truncation, so absence does not mean the list is complete."},
 			},
 		},
@@ -401,6 +405,48 @@ func componentSchemas() map[string]interface{} {
 				"ambiguous":      map[string]interface{}{"type": "boolean"},
 				"unresolved":     map[string]interface{}{"type": "boolean"},
 				"candidates":     map[string]interface{}{"type": "array", "items": schemaRef("CandidateEntry")},
+				"measured":       schemaRef("MeasuredInfo"),
+				"inferred":       openAPISchema{Type: "boolean", Description: "#1865: present, and false, only on a neighbour known from a neighbours report alone (no inferred edge). Such an entry has count 0, and name and role null when the node is unknown."},
+			},
+		},
+		"MeasuredInfo": openAPISchema{
+			Type:        "object",
+			Description: "#1865: the link as measured by the neighbours reports. Absent when neither node reported the other.",
+			Properties: map[string]openAPISchema{
+				"snrIn":      {Type: "number", Description: "SNR (dB) at which the queried node hears this neighbour. Null when the queried node did not report it."},
+				"snrOut":     {Type: "number", Description: "SNR (dB) at which this neighbour hears the queried node. Null when the neighbour did not report it."},
+				"heardAt":    {Type: "string", Description: "RFC3339, newest heard time of the measured directions."},
+				"reportedAt": {Type: "string", Description: "RFC3339, newest report time of the measured directions."},
+				"verified":   {Type: "boolean", Description: "True only when every measured direction came from a verified report."},
+				"status":     {Type: "string", Description: "Scope-query result the queried node reported for this neighbour (e.g. responded, timeout). Empty when only the neighbour reported the link."},
+			},
+		},
+		"MeasuredLinksResponse": openAPISchema{
+			Type: "object",
+			Properties: map[string]openAPISchema{
+				"links": {Type: "array", Items: &openAPISchema{
+					Type:        "object",
+					Description: "One unordered measured pair, a < b.",
+					Properties: map[string]openAPISchema{
+						"a":        {Type: "string", Description: "Lower public key of the pair."},
+						"b":        {Type: "string", Description: "Higher public key of the pair."},
+						"snrAB":    {Type: "number", Description: "SNR (dB) at which a hears b. Null when not measured."},
+						"snrBA":    {Type: "number", Description: "SNR (dB) at which b hears a. Null when not measured."},
+						"verified": {Type: "boolean", Description: "True only when every measured direction came from a verified report."},
+						"ageSec":   {Type: "integer", Description: "Seconds since the newest report of the two directions."},
+					},
+				}},
+			},
+		},
+		"NeighborReportSummary": openAPISchema{
+			Type:        "object",
+			Description: "#1865: the newest neighbours report this node sent. Absent when the node never reported.",
+			Properties: map[string]openAPISchema{
+				"reportedAt": {Type: "string", Description: "RFC3339 report time."},
+				"total":      {Type: "integer", Description: "Neighbours the node knows. Null when not reported."},
+				"queried":    {Type: "integer", Description: "Neighbours queried for scopes. Null when not reported."},
+				"truncated":  {Type: "boolean", Description: "True when the node cut the list short. Null when not reported."},
+				"verified":   {Type: "boolean", Description: "True when the report came from a verified observer login."},
 			},
 		},
 		"NodeNeighborsResponse": map[string]interface{}{

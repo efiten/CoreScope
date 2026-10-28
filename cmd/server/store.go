@@ -511,6 +511,10 @@ type PacketStore struct {
 	// (issue #1203 sub-fix).
 	graph atomic.Pointer[NeighborGraph]
 
+	// Measured links from the observers' neighbours reports (#1865), loaded
+	// at startup and swapped with the graph on every recompute tick.
+	measured atomic.Pointer[measuredLinkIndex]
+
 	// Singleflight state for ensureNeighborGraph. These were package-globals
 	// in #1203 r0 — moved to per-store fields (PR #1208 review) so parallel
 	// tests with independent *PacketStore values don't share rebuild state
