@@ -227,6 +227,7 @@ func main() {
 		store.graph.Store(loadNeighborEdgesFromDB(database.conn))
 		log.Printf("[neighbor] loaded persisted neighbor graph")
 	}
+	store.measured.Store(loadMeasuredLinks(database.conn))
 
 	// #1009: chunked Load with early HTTP readiness. RunStartupLoad runs
 	// asynchronously and signals FirstChunkReady after the first chunk

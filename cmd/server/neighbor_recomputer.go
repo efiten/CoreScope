@@ -74,7 +74,8 @@ func (s *PacketStore) StartNeighborGraphRecomputer(interval time.Duration) func(
 }
 
 // refreshNeighborGraphFromSnapshot re-reads neighbor_edges through
-// the read-only DB handle and atomic-swaps a freshly built graph.
+// the read-only DB handle and atomic-swaps a freshly built graph, and
+// does the same for measured_links (#1865).
 // Panics are swallowed defensively — the previous snapshot remains
 // valid if a read fails.
 func (s *PacketStore) refreshNeighborGraphFromSnapshot() {
@@ -86,6 +87,7 @@ func (s *PacketStore) refreshNeighborGraphFromSnapshot() {
 	if g != nil {
 		s.graph.Store(g)
 	}
+	s.measured.Store(loadMeasuredLinks(s.db.conn))
 }
 
 // resetNeighborRecomputerForTest is a test helper — production code

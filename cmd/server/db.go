@@ -51,6 +51,9 @@ type DB struct {
 	hasScopeName            bool   // transmissions.scope_name column exists (#899)
 	hasDefaultScope         bool   // nodes.default_scope column exists (#899)
 	hasConfiguredScope      bool   // nodes.configured_scope column exists (#1865)
+	hasDefaultFloodScope    bool   // nodes.default_flood_scope column exists (#1865)
+	hasDefaultFloodScopeAt  bool   // nodes.default_flood_scope_at column exists (#1865)
+	hasNeighborReports      bool   // neighbor_reports table exists (#1865)
 	hasDeclaredRegionsTable bool   // node_declared_regions table exists at startup (#1975); read via declaredRegionsTablePresent
 	hasMultibyteSupCols     bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
 	hasLastSeen             bool   // transmissions.last_seen column exists (#1690)
@@ -284,6 +287,11 @@ func (db *DB) detectSchema(ctx context.Context, q rowQuerier) error {
 	db.hasDefaultScope = nodes["default_scope"]
 	db.hasMultibyteSupCols = nodes["multibyte_sup"]
 	db.hasConfiguredScope = nodes["configured_scope"]
+	db.hasDefaultFloodScope = nodes["default_flood_scope"]
+	db.hasDefaultFloodScopeAt = nodes["default_flood_scope_at"]
+
+	nr, nrErr := schemaColumns(ctx, q, "neighbor_reports")
+	db.hasNeighborReports = nrErr == nil && len(nr) > 0
 
 	// #1975: an optional second confirmed-scope source. Absent on a stock
 	// install, so schemaColumns returns nothing and the flag stays false;
@@ -342,6 +350,12 @@ func (db *DB) nodeSelectCols() string {
 	// #1865: confirmed scopes appended after default_scope; scan order must match.
 	if db.hasConfiguredScope {
 		cols += ", configured_scope, configured_scope_at"
+	}
+	if db.hasDefaultFloodScope {
+		cols += ", default_flood_scope"
+	}
+	if db.hasDefaultFloodScopeAt {
+		cols += ", default_flood_scope_at"
 	}
 	return cols
 }
@@ -2706,6 +2720,7 @@ func (db *DB) scanNodeRow(rows *sql.Rows) map[string]interface{} {
 	var foreign sql.NullInt64
 	var defaultScope sql.NullString
 	var configuredScope, configuredScopeAt sql.NullString
+	var defaultFloodScope, defaultFloodScopeAt sql.NullString
 
 	scanArgs := []interface{}{&pk, &name, &role, &lat, &lon, &lastSeen, &firstSeen, &advertCount, &batteryMv, &temperatureC, &foreign}
 	if db.hasDefaultScope {
@@ -2713,6 +2728,12 @@ func (db *DB) scanNodeRow(rows *sql.Rows) map[string]interface{} {
 	}
 	if db.hasConfiguredScope {
 		scanArgs = append(scanArgs, &configuredScope, &configuredScopeAt)
+	}
+	if db.hasDefaultFloodScope {
+		scanArgs = append(scanArgs, &defaultFloodScope)
+	}
+	if db.hasDefaultFloodScopeAt {
+		scanArgs = append(scanArgs, &defaultFloodScopeAt)
 	}
 	if err := rows.Scan(scanArgs...); err != nil {
 		return nil
@@ -2747,6 +2768,12 @@ func (db *DB) scanNodeRow(rows *sql.Rows) map[string]interface{} {
 	if db.hasConfiguredScope {
 		m["configured_scope"] = nullStr(configuredScope)
 		m["configured_scope_at"] = nullStr(configuredScopeAt)
+	}
+	if db.hasDefaultFloodScope {
+		m["default_flood_scope"] = nullStr(defaultFloodScope)
+	}
+	if db.hasDefaultFloodScopeAt {
+		m["default_flood_scope_at"] = nullStr(defaultFloodScopeAt)
 	}
 	return m
 }
