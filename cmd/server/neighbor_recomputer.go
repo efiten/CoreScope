@@ -87,7 +87,9 @@ func (s *PacketStore) refreshNeighborGraphFromSnapshot() {
 	if g != nil {
 		s.graph.Store(g)
 	}
-	s.measured.Store(loadMeasuredLinks(s.db.conn))
+	if ix := loadMeasuredLinks(s.db.conn); ix != nil {
+		s.measured.Store(ix)
+	}
 }
 
 // resetNeighborRecomputerForTest is a test helper — production code

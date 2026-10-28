@@ -279,6 +279,109 @@ func TestNodeDetailDefaultFloodScope(t *testing.T) {
 	}
 }
 
+// TestMeasuredRefreshKeepsIndexOnReadFailure: a read that fails must not
+// replace the loaded index with an empty or partial one. Here measured_links
+// exists but the SELECT fails (a column is missing).
+func TestMeasuredRefreshKeepsIndexOnReadFailure(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	if _, err := srv.db.conn.Exec(`CREATE TABLE measured_links (reporter TEXT, neighbor TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if ix := loadMeasuredLinks(srv.db.conn); ix != nil {
+		t.Fatalf("loadMeasuredLinks on a failing read = %+v, want nil", ix)
+	}
+	prev := &measuredLinkIndex{byNode: map[string][]measuredLink{mlA: {{Reporter: mlA, Neighbor: mlB}}}}
+	srv.store.measured.Store(prev)
+	srv.store.refreshNeighborGraphFromSnapshot()
+	if got := srv.store.measured.Load(); got != prev {
+		t.Errorf("refresh after a failed read replaced the index with %+v", got)
+	}
+}
+
+// TestMeasuredRefreshAbsentTableStoresEmpty: no table is not a failure, the
+// refresh stores an empty index.
+func TestMeasuredRefreshAbsentTableStoresEmpty(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.store.refreshNeighborGraphFromSnapshot()
+	got := srv.store.measured.Load()
+	if got == nil || len(got.byNode) != 0 {
+		t.Errorf("index after refresh without measured_links = %+v, want empty and non-nil", got)
+	}
+}
+
+func TestMeasuredLinksBulkOmitsHiddenNodes(t *testing.T) {
+	srv, router := setupMeasuredServer(t)
+	insertMeasuredNode(t, srv.db.conn, mlA, "node-a", 51.0, 4.0)
+	insertMeasuredNode(t, srv.db.conn, mlB, "node-b", 51.1, 4.1)
+	insertMeasuredNode(t, srv.db.conn, mlC, "hide-c", 51.2, 4.2)
+	srv.store.rebuildNodeCache()
+	srv.cfg.SetHiddenNamePrefixes([]string{"hide-"})
+
+	ts := time.Now().UTC().Format(time.RFC3339)
+	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(1), ts, 1, "responded")
+	insertMeasuredLink(t, srv.db.conn, mlA, mlC, f64(2), ts, 1, "responded")
+	insertMeasuredLink(t, srv.db.conn, mlC, mlB, f64(3), ts, 1, "responded")
+	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn))
+
+	var resp struct {
+		Links []MeasuredPair `json:"links"`
+	}
+	getJSON(t, router, "/api/links/measured", &resp)
+	if len(resp.Links) != 1 || resp.Links[0].A != mlA || resp.Links[0].B != mlB {
+		t.Errorf("links = %+v, want only A-B (C is hidden)", resp.Links)
+	}
+
+	var nb struct {
+		Neighbors []NeighborEntry `json:"neighbors"`
+	}
+	getJSON(t, router, "/api/nodes/"+mlA+"/neighbors", &nb)
+	for _, n := range nb.Neighbors {
+		if n.Pubkey != nil && *n.Pubkey == mlC {
+			t.Errorf("hidden node C appended as a measured neighbour: %+v", n)
+		}
+	}
+}
+
+// TestNodeNeighborsMeasuredMatchesAmbiguousEntry: a graph entry without a
+// resolved pubkey whose candidate (or prefix) is the measured neighbour gets
+// `measured`; the neighbour is not appended a second time.
+func TestNodeNeighborsMeasuredMatchesAmbiguousEntry(t *testing.T) {
+	srv, router := setupMeasuredServer(t)
+	insertMeasuredNode(t, srv.db.conn, mlA, "node-a", 51.0, 4.0)
+	srv.store.rebuildNodeCache()
+
+	now := time.Now().UTC()
+	srv.neighborGraph = makeTestGraph(
+		newAmbiguousEdge(mlA, "bb", []string{strings.ToUpper(mlB), "bbff000000000000000000000000000000000000000000000000000000000000"}, 8, now),
+		newAmbiguousEdge(mlA, "cc", nil, 5, now),
+	)
+	ts := now.Format(time.RFC3339)
+	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(3.5), ts, 1, "responded")
+	insertMeasuredLink(t, srv.db.conn, mlA, mlC, f64(-1), ts, 1, "responded")
+	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn))
+
+	var resp struct {
+		Neighbors []NeighborEntry `json:"neighbors"`
+	}
+	getJSON(t, router, "/api/nodes/"+mlA+"/neighbors", &resp)
+	if len(resp.Neighbors) != 2 {
+		t.Fatalf("got %d rows, want 2 (no appended duplicates): %+v", len(resp.Neighbors), resp.Neighbors)
+	}
+	for _, n := range resp.Neighbors {
+		if n.Pubkey != nil || n.Inferred != nil {
+			t.Errorf("row %+v: want the graph entry, not an appended one", n)
+		}
+		if n.Measured == nil || n.Measured.SNRIn == nil {
+			t.Errorf("row prefix %q has no measured: %+v", n.Prefix, n)
+			continue
+		}
+		want := map[string]float64{"bb": 3.5, "cc": -1}[n.Prefix]
+		if *n.Measured.SNRIn != want {
+			t.Errorf("row prefix %q snrIn = %v, want %v", n.Prefix, *n.Measured.SNRIn, want)
+		}
+	}
+}
+
 func BenchmarkLoadMeasuredLinks(b *testing.B) {
 	db := setupTestDB(b)
 	if err := dbschema.Apply(db.conn, nil); err != nil {
