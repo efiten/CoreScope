@@ -526,7 +526,7 @@
             <label for="mcScopeOverlay" title="Colour repeater markers by their region-scope configuration"><input type="checkbox" id="mcScopeOverlay"> Scope config colours</label>
             <label for="mcEstimated" title="Repeaters that never sent an advert, placed from where mobile companions heard them. Dashed circle = uncertainty. Follows the repeater role filter only, not the area, region or last-heard filters."><input type="checkbox" id="mcEstimated"> Estimated positions <span class="mc-est-legend" aria-hidden="true">≈</span></label>
             <label for="mcLinks" title="Links between repeaters from their neighbour reports, coloured by the weaker SNR. Dashed = not verified or measured one way only."><input type="checkbox" id="mcLinks"> Measured links</label>
-            <label id="mcGeoFilterLabel"for="mcGeoFilter" style="display:none"><input type="checkbox" id="mcGeoFilter"> Mesh live area</label>
+            <label id="mcGeoFilterLabel" for="mcGeoFilter" style="display:none"><input type="checkbox" id="mcGeoFilter"> Mesh live area</label>
           </fieldset>
           <div id="mapAreaFilter"></div>
           <fieldset class="mc-section">
@@ -2107,6 +2107,12 @@
     if (_renderingMarkers) return;
     _renderingMarkers = true;
     try { _renderMarkersInner(); } finally { _renderingMarkers = false; }
+    // Marker filters (role, area, last heard...) changed what is shown: redraw
+    // the links from the cached pairs so none dangles to a hidden node.
+    if (measuredPairs) {
+      const cb = document.getElementById("mcLinks");
+      if (cb && cb.checked) renderMeasuredLinks();
+    }
   }
 
   function _renderMarkersInner() {
@@ -2749,7 +2755,7 @@
   // ─── End Important Links ─────────────────────────────────────────────────────
 
   // ─── Measured links (#1865) ──────────────────────────────────────────────────
-  // One L.polyline per pair in one layerGroup (Task 7: well under 2000 links, no
+  // One L.polyline per pair in one layerGroup (well under 2000 links, no
   // canvas renderer). Colour and dashes come from CSS classes (style.css) so the
   // palette stays in the --link-snr-* variables.
   function setLinksHash(on) {
@@ -2808,8 +2814,9 @@
     if (!map || !measuredPairs) return;
     clearMeasuredLinks();
     const byKey = new Map();
+    const filterCtx = { selectedReferenceNode, neighborPubkeys };
     nodes.forEach(function (n) {
-      if (n && n.public_key && n.lat && n.lon) byKey.set(n.public_key.toLowerCase(), n);
+      if (n && n.public_key && nodePassesMapFilters(n, filters, filterCtx)) byKey.set(n.public_key.toLowerCase(), n);
     });
     const layer = L.layerGroup();
     measuredPairs.forEach(function (p) {
