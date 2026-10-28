@@ -234,7 +234,8 @@ func main() {
 		log.Printf("[neighbor] loaded persisted neighbor graph")
 	}
 	// #1865: a failed first read starts empty; the recomputer retries every 60 s.
-	measured := loadMeasuredLinks(database.conn)
+	store.measuredLinkDays = cfg.MeasuredLinkDaysOrDefault()
+	measured := loadMeasuredLinks(database.conn, store.measuredLinkDays)
 	if measured == nil {
 		measured = &measuredLinkIndex{byNode: map[string][]measuredLink{}}
 	}

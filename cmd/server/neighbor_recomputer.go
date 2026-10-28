@@ -87,7 +87,7 @@ func (s *PacketStore) refreshNeighborGraphFromSnapshot() {
 	if g != nil {
 		s.graph.Store(g)
 	}
-	if ix := loadMeasuredLinks(s.db.conn); ix != nil {
+	if ix := loadMeasuredLinks(s.db.conn, s.measuredLinkDays); ix != nil {
 		s.measured.Store(ix)
 	}
 }

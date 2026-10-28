@@ -94,6 +94,9 @@ type Store struct {
 	neighborsMismatchLog  reporterLogLimiter
 	neighborsOverflowLog  reporterLogLimiter
 	neighborsTimestampLog reporterLogLimiter
+	// measuredLinkDays is retention.measuredLinkDays: a /neighbors report
+	// older than this writes no measured_links (recordNeighborLinks).
+	measuredLinkDays int
 
 	stmtGetTxByHash            *sql.Stmt
 	stmtInsertTransmission     *sql.Stmt
@@ -187,7 +190,7 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 		return nil, fmt.Errorf("dbschema.Apply: %w", err)
 	}
 
-	s := &Store{db: db, path: dbPath, sampleIntervalSec: sampleIntervalSec}
+	s := &Store{db: db, path: dbPath, sampleIntervalSec: sampleIntervalSec, measuredLinkDays: defaultMeasuredLinkDays}
 	if err := s.prepareStatements(); err != nil {
 		return nil, fmt.Errorf("preparing statements: %w", err)
 	}

@@ -415,7 +415,7 @@ An observer only publishes a neighbours report when told to:
 
 What CoreScope shows from them is described in the user guide: the Measured column in [Nodes](user-guide/nodes.md#neighbours-card) and the Measured links layer in [Map](user-guide/map.md#measured-links).
 
-Retention, both consumed by the ingestor:
+Retention, both consumed by the ingestor (the server also reads `measuredLinkDays` and shows no link older than it):
 
 | Key | Default | Removes |
 |---|---|---|
@@ -423,3 +423,5 @@ Retention, both consumed by the ingestor:
 | `retention.measuredLinkDays` | 7 | Links no report has mentioned for that long |
 
 A neighbour missing from a report never removes its link: the firmware truncates long reports at 10 kB. A link goes away only when it expires after `measuredLinkDays`.
+
+Only a current report creates or refreshes links. A retained replay, a report without a valid `timestamp` and a report older than `measuredLinkDays` are kept in the journal and change no link.

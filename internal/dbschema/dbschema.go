@@ -607,7 +607,7 @@ func ensureNeighborReportTables(rw *sql.DB, logf Logger) error {
 			default_scope TEXT,
 			payload TEXT NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_neighbor_reports_reporter ON neighbor_reports(reporter, received_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_neighbor_reports_reporter ON neighbor_reports(reporter, reported_at, received_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_neighbor_reports_received ON neighbor_reports(received_at)`,
 		`CREATE TABLE IF NOT EXISTS measured_links (
 			reporter TEXT NOT NULL,

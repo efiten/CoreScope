@@ -396,6 +396,10 @@ type RetentionConfig struct {
 	ObserverDays int `json:"observerDays"`
 	PacketDays   int `json:"packetDays"`
 	MetricsDays  int `json:"metricsDays"`
+	// MeasuredLinkDays is the ingestor's measured_links retention window.
+	// The server loads only links reported inside it, so a row the daily
+	// prune has not removed yet never shows as current. 0 or unset = 7.
+	MeasuredLinkDays int `json:"measuredLinkDays"`
 }
 
 // DBConfig is the shared SQLite vacuum/maintenance config (#919, #921).
@@ -462,6 +466,18 @@ func defaultTimestampConfig() TimestampConfig {
 		CustomFormat:      "",
 		AllowCustomFormat: false,
 	}
+}
+
+// defaultMeasuredLinkDays is retention.measuredLinkDays when unset, as in
+// the ingestor.
+const defaultMeasuredLinkDays = 7
+
+// MeasuredLinkDaysOrDefault returns retention.measuredLinkDays or 7.
+func (c *Config) MeasuredLinkDaysOrDefault() int {
+	if c.Retention != nil && c.Retention.MeasuredLinkDays > 0 {
+		return c.Retention.MeasuredLinkDays
+	}
+	return defaultMeasuredLinkDays
 }
 
 // NodeDaysOrDefault returns the configured retention.nodeDays or 7 if not set.

@@ -79,6 +79,7 @@ func main() {
 		log.Fatalf("db: %v", err)
 	}
 	defer store.Close()
+	store.measuredLinkDays = cfg.MeasuredLinkDaysOrDefault()
 	log.Printf("SQLite opened: %s", cfg.DBPath)
 
 	// Async backfill: path_json from raw_hex (#888) — must not block MQTT startup
@@ -1032,7 +1033,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// metadata (region-independent), so the per-source packet IATA filter below
 	// does not apply.
 	if len(parts) >= 4 && parts[3] == "neighbors" {
-		if !handleNeighborsReport(store, tag, source.VerifiesObservers, parts[2], msg, m.Payload()) {
+		if !handleNeighborsReport(store, tag, source.VerifiesObservers, m.Retained(), parts[2], msg, m.Payload()) {
 			return
 		}
 		// #2270/#2271: keep the report itself for the observer pages. A
@@ -2020,7 +2021,7 @@ func init() {
 // neighbour upserted into measured_links (recordNeighborLinks). A report whose
 // origin_id names another node than the topic is dropped before any write,
 // and handleNeighborsReport returns false so the caller stores nothing either.
-func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, observerID string, msg map[string]interface{}, raw []byte) bool {
+func handleNeighborsReport(store *Store, tag string, verifiesObservers, retained bool, observerID string, msg map[string]interface{}, raw []byte) bool {
 	reportedAt, _ := msg["timestamp"].(string)
 
 	// self: the observer's own configured scopes.
@@ -2033,7 +2034,7 @@ func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, obs
 		}
 		return false
 	}
-	recordNeighborLinks(store, tag, verifiesObservers, observerID, msg, raw)
+	recordNeighborLinks(store, tag, verifiesObservers, retained, observerID, msg, raw)
 	if originID == "" {
 		originID = observerID
 	}
@@ -2083,7 +2084,13 @@ func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, obs
 // link: links expire by age (PruneMeasuredLinks), never by omission. A
 // report is verified only when it came through a source with
 // verifiesObservers set and the topic pubkey is a confirmed observer.
-func recordNeighborLinks(store *Store, tag string, verifiesObservers bool, observerID string, msg map[string]interface{}, raw []byte) {
+//
+// Only a current report writes links and default_flood_scope. A retained
+// replay, a report without a usable timestamp and one older than
+// store.measuredLinkDays are journalled and nothing more: behind the
+// mosquitto bridge the retain flag is lost (statusIsLiveness), so the
+// report's own age is the guard that keeps a replay from refreshing a link.
+func recordNeighborLinks(store *Store, tag string, verifiesObservers, retained bool, observerID string, msg map[string]interface{}, raw []byte) {
 	reporter := strings.ToLower(observerID)
 	if !targetPubkeyRe.MatchString(reporter) {
 		return
@@ -2094,6 +2101,7 @@ func recordNeighborLinks(store *Store, tag string, verifiesObservers bool, obser
 	if reportTooFarInFuture(reportedAt) {
 		return
 	}
+	current := !retained && reportedAt != ""
 	if reportedAt == "" {
 		if tsRaw, ok := msg["timestamp"]; ok && tsRaw != nil && tsRaw != "" && store.neighborsTimestampLog.allow(reporter) {
 			log.Printf("[neighbors] %.8s: unparseable timestamp %q, using ingest time", reporter, sanitizeLogString(fmt.Sprint(tsRaw)))
@@ -2101,6 +2109,9 @@ func recordNeighborLinks(store *Store, tag string, verifiesObservers bool, obser
 		reportedAt = now.Format(time.RFC3339)
 	}
 	reportTime, _ := time.Parse(time.RFC3339, reportedAt)
+	if reportTime.Before(now.Add(-time.Duration(store.measuredLinkDays) * 24 * time.Hour)) {
+		current = false
+	}
 	verified := verifiesObservers && store.confirmedObservers != nil && store.confirmedObservers.Has(reporter)
 
 	r := NeighborReport{
@@ -2124,6 +2135,9 @@ func recordNeighborLinks(store *Store, tag string, verifiesObservers bool, obser
 	}
 	if err := store.InsertNeighborReport(r); err != nil {
 		log.Printf("MQTT [%s] neighbors report insert error for %.8s: %v", tag, reporter, err)
+	}
+	if !current {
+		return
 	}
 
 	// An oversized report gets no links, and sanitizeNeighbors cuts a long

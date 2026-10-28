@@ -69,7 +69,7 @@ func ingestReportFrom(t *testing.T, store *Store, verifiesObservers bool, topicI
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatalf("sample does not parse: %v", err)
 	}
-	handleNeighborsReport(store, "test", verifiesObservers, topicID, msg, []byte(raw))
+	handleNeighborsReport(store, "test", verifiesObservers, false, topicID, msg, []byte(raw))
 }
 
 type nrLinkRow struct {
@@ -93,6 +93,9 @@ func readLink(t *testing.T, store *Store, reporter, neighbor string) (nrLinkRow,
 	}
 	return r, true
 }
+
+// nrNow is a clock within the measured-link window of the samples above.
+var nrNow = time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 
 func fixReportNow(t *testing.T, at time.Time) {
 	t.Helper()
@@ -167,6 +170,7 @@ func TestNeighborsReportStoresLinks(t *testing.T) {
 }
 
 func TestNeighborsReportOriginMismatchDropped(t *testing.T) {
+	fixReportNow(t, nrNow)
 	store := openNeighborsStore(t)
 	seedNode(t, store, nrOrigin)
 	seedNode(t, store, nrNbC)
@@ -225,6 +229,80 @@ func TestNeighborsTopicOriginMismatchStoresNoObserverReport(t *testing.T) {
 	}
 }
 
+// lastReportedAt is reported_at of the newest neighbor_reports row.
+func lastReportedAt(t *testing.T, store *Store) string {
+	t.Helper()
+	var at string
+	if err := store.db.QueryRow(`SELECT reported_at FROM neighbor_reports ORDER BY id DESC LIMIT 1`).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+// A retained replay is journalled but writes no link and no
+// default_flood_scope: it is not evidence the link exists now.
+func TestNeighborsReportRetainedWritesNoLinks(t *testing.T) {
+	fixReportNow(t, nrNow)
+	store := openNeighborsStore(t)
+	seedNode(t, store, nrOrigin)
+	msg := &mockMessage{topic: "meshcore/TST/" + nrOriginUpper + "/neighbors", payload: []byte(sampleOpenHop), retained: true}
+	handleMessage(store, "test", MQTTSource{Name: "test"}, msg, nil, nil, &Config{})
+
+	if n := countRows(t, store, "neighbor_reports"); n != 1 {
+		t.Errorf("neighbor_reports rows = %d, want 1", n)
+	}
+	if n := countRows(t, store, "measured_links"); n != 0 {
+		t.Errorf("measured_links rows = %d, want 0", n)
+	}
+	var sc sql.NullString
+	if err := store.db.QueryRow(`SELECT default_flood_scope FROM nodes WHERE public_key = ?`, nrOrigin).Scan(&sc); err != nil {
+		t.Fatal(err)
+	}
+	if sc.Valid {
+		t.Errorf("retained report set default_flood_scope = %v", sc)
+	}
+
+	// The same report live does write.
+	msg.retained = false
+	handleMessage(store, "test", MQTTSource{Name: "test"}, msg, nil, nil, &Config{})
+	if n := countRows(t, store, "measured_links"); n != 2 {
+		t.Errorf("live report: measured_links rows = %d, want 2", n)
+	}
+}
+
+// A report older than retention.measuredLinkDays is journalled but writes
+// no link and no default_flood_scope; one inside the window does.
+func TestNeighborsReportOutsideWindowWritesNoLinks(t *testing.T) {
+	fixReportNow(t, nrNow)
+	store := openNeighborsStore(t)
+	seedNode(t, store, nrOrigin)
+	store.measuredLinkDays = 7
+
+	report := func(ts, nb string) string {
+		return `{"timestamp":"` + ts + `","origin_id":"` + nrOriginUpper + `","self":{"default_scope":"#be"},"neighbors":[
+			{"pubkey":"` + nb + `","snr":1,"heard_secs_ago":0,"status":"timeout"}]}`
+	}
+	ingestReport(t, store, nrOriginUpper, report("2026-07-18T12:00:00Z", nrNbA)) // 8 days old
+	if n := countRows(t, store, "neighbor_reports"); n != 1 {
+		t.Errorf("neighbor_reports rows = %d, want 1", n)
+	}
+	if n := countRows(t, store, "measured_links"); n != 0 {
+		t.Errorf("8-day-old report: measured_links rows = %d, want 0", n)
+	}
+	var sc sql.NullString
+	if err := store.db.QueryRow(`SELECT default_flood_scope FROM nodes WHERE public_key = ?`, nrOrigin).Scan(&sc); err != nil {
+		t.Fatal(err)
+	}
+	if sc.Valid {
+		t.Errorf("8-day-old report set default_flood_scope = %v", sc)
+	}
+
+	ingestReport(t, store, nrOriginUpper, report("2026-07-19T13:00:00Z", nrNbB)) // 6 days 23 h old
+	if _, ok := readLink(t, store, nrOrigin, nrNbB); !ok {
+		t.Error("report inside the window stored no link")
+	}
+}
+
 func TestNeighborsReportMismatchLogIsBounded(t *testing.T) {
 	var l reporterLogLimiter
 	now := time.Date(2026, 7, 26, 9, 0, 0, 0, time.UTC)
@@ -248,6 +326,7 @@ func TestNeighborsReportMismatchLogIsBounded(t *testing.T) {
 }
 
 func TestNeighborsReportOmissionKeepsLink(t *testing.T) {
+	fixReportNow(t, nrNow)
 	store := openNeighborsStore(t)
 	ingestReport(t, store, nrOriginUpper, sample1865)
 	ingestReport(t, store, nrOriginUpper, `{"timestamp":"2026-07-25T22:46:14Z","origin_id":"`+nrOriginUpper+`","neighbors":[
@@ -265,6 +344,7 @@ func TestNeighborsReportOmissionKeepsLink(t *testing.T) {
 }
 
 func TestNeighborsReportOlderReportDoesNotOverwrite(t *testing.T) {
+	fixReportNow(t, nrNow)
 	store := openNeighborsStore(t)
 	newer := `{"timestamp":"2026-07-26T10:00:00Z","origin_id":"` + nrOriginUpper + `","neighbors":[
 		{"pubkey":"` + nrNbA + `","snr":10,"heard_secs_ago":0,"status":"responded"}]}`
@@ -299,6 +379,7 @@ const testObserverBindingsDDL = `CREATE TABLE IF NOT EXISTS observer_bindings (
 )`
 
 func TestNeighborsReportVerifiedFlag(t *testing.T) {
+	fixReportNow(t, nrNow)
 	const unconfirmed = "AB00000000000000000000000000000000000000000000000000000000000001"
 	const orphan = "AB00000000000000000000000000000000000000000000000000000000000002"
 	path := filepath.Join(t.TempDir(), "users.db")
@@ -421,6 +502,8 @@ func TestConfirmedObserverQueryMatchesUsersSchema(t *testing.T) {
 }
 
 func TestNeighborsReportDefaultFloodScope(t *testing.T) {
+	// Late enough for the direct writes below, dated up to 2026-07-28.
+	fixReportNow(t, time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC))
 	store := openNeighborsStore(t)
 	seedNode(t, store, nrOrigin)
 	ingestReport(t, store, nrOriginUpper, sampleOpenHop)
@@ -507,14 +590,18 @@ func TestNeighborsReportBadFields(t *testing.T) {
 		t.Errorf("non-numeric counter / non-bool truncated stored: %v %v", total, truncated)
 	}
 
-	// Missing timestamp: ingest time.
+	// Missing timestamp: journalled at ingest time, no link (it cannot be
+	// told apart from a replay).
 	ingestReport(t, store, nrOriginUpper, `{"origin_id":"`+nrOriginUpper+`","neighbors":[
 		{"pubkey":"`+strings.Repeat("1", 64)+`","snr":1,"heard_secs_ago":60,"status":"timeout"}]}`)
-	if got, _ := readLink(t, store, nrOrigin, strings.Repeat("1", 64)); got.reportedAt != "2026-07-26T12:00:00Z" || got.heardAt != "2026-07-26T11:59:00Z" {
-		t.Errorf("no timestamp: link = %+v, want ingest time", got)
+	if got, ok := readLink(t, store, nrOrigin, strings.Repeat("1", 64)); ok {
+		t.Errorf("no timestamp: link stored: %+v", got)
+	}
+	if at := lastReportedAt(t, store); at != "2026-07-26T12:00:00Z" {
+		t.Errorf("no timestamp: journal reported_at = %q, want ingest time", at)
 	}
 
-	// Unparseable timestamp: ingest time too, logged once per reporter.
+	// Unparseable timestamp: the same, logged once per reporter.
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
@@ -522,8 +609,11 @@ func TestNeighborsReportBadFields(t *testing.T) {
 		ingestReport(t, store, nrOriginUpper, `{"timestamp":"yesterday","origin_id":"`+nrOriginUpper+`","neighbors":[
 			{"pubkey":"`+strings.Repeat("5", 64)+`","snr":1,"heard_secs_ago":0,"status":"timeout"}]}`)
 	}
-	if got, _ := readLink(t, store, nrOrigin, strings.Repeat("5", 64)); got.reportedAt != "2026-07-26T12:00:00Z" {
-		t.Errorf("unparseable timestamp: reported_at = %q, want ingest time", got.reportedAt)
+	if got, ok := readLink(t, store, nrOrigin, strings.Repeat("5", 64)); ok {
+		t.Errorf("unparseable timestamp: link stored: %+v", got)
+	}
+	if at := lastReportedAt(t, store); at != "2026-07-26T12:00:00Z" {
+		t.Errorf("unparseable timestamp: journal reported_at = %q, want ingest time", at)
 	}
 	if n := strings.Count(buf.String(), `[neighbors] feedca4a: unparseable timestamp "yesterday", using ingest time`); n != 1 {
 		t.Errorf("unparseable timestamp logged %d times, want once:\n%s", n, buf.String())
@@ -588,6 +678,7 @@ func TestNeighborsReportSkipsSelfLoop(t *testing.T) {
 }
 
 func TestNeighborsReportCapsNeighbours(t *testing.T) {
+	fixReportNow(t, nrNow)
 	store := openNeighborsStore(t)
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
@@ -620,6 +711,7 @@ func TestNeighborsReportCapsNeighbours(t *testing.T) {
 }
 
 func TestNeighborsReportFractionalOffsetTimestamp(t *testing.T) {
+	fixReportNow(t, nrNow)
 	store := openNeighborsStore(t)
 	ingestReport(t, store, nrOriginUpper, `{"timestamp":"2026-07-26T08:00:00.123456+00:00","origin_id":"`+nrOriginUpper+`","neighbors":[
 		{"pubkey":"`+nrNbA+`","snr":1,"heard_secs_ago":0,"status":"timeout"}]}`)

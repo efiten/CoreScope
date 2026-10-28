@@ -55,7 +55,7 @@ func TestLoadMeasuredLinksBothDirections(t *testing.T) {
 	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(5.5), now, 1, "responded")
 	insertMeasuredLink(t, srv.db.conn, mlB, mlA, f64(-2), now, 1, "timeout")
 
-	ix := loadMeasuredLinks(srv.db.conn)
+	ix := loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays)
 	info := measuredInfoByNeighbor(mlA, ix.forNode(mlA))
 	got, ok := info[mlB]
 	if !ok {
@@ -89,13 +89,55 @@ func TestLoadMeasuredLinksIgnoresSelfLoop(t *testing.T) {
 	insertMeasuredLink(t, srv.db.conn, mlA, strings.ToUpper(mlA), f64(9), now, 1, "responded")
 	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(5.5), now, 1, "responded")
 
-	ix := loadMeasuredLinks(srv.db.conn)
+	ix := loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays)
 	links := ix.forNode(mlA)
 	if len(links) != 1 || links[0].Neighbor != mlB {
 		t.Fatalf("forNode(A) = %+v, want only the link to B", links)
 	}
 	if _, ok := measuredInfoByNeighbor(mlA, links)[mlA]; ok {
 		t.Error("A lists itself as a measured neighbour")
+	}
+}
+
+// A row older than retention.measuredLinkDays that the ingestor's daily prune
+// has not removed yet is not loaded; a row inside the window is.
+func TestLoadMeasuredLinksWindow(t *testing.T) {
+	srv, _ := setupMeasuredServer(t)
+	now := time.Now().UTC()
+	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(1), now.Add(-8*24*time.Hour).Format(time.RFC3339), 1, "responded")
+	insertMeasuredLink(t, srv.db.conn, mlA, mlC, f64(2), now.Add(-6*24*time.Hour).Format(time.RFC3339), 1, "responded")
+
+	links := loadMeasuredLinks(srv.db.conn, 7).forNode(mlA)
+	if len(links) != 1 || links[0].Neighbor != mlC {
+		t.Fatalf("forNode(A) with a 7-day window = %+v, want only the link to C", links)
+	}
+	if links := loadMeasuredLinks(srv.db.conn, 9).forNode(mlA); len(links) != 2 {
+		t.Errorf("forNode(A) with a 9-day window = %d links, want 2", len(links))
+	}
+}
+
+// latestNeighborReport picks the newest reported_at, not the last arrival:
+// a replay of an old report received later is not the latest.
+func TestLatestNeighborReportByReportedAt(t *testing.T) {
+	srv, _ := setupMeasuredServer(t)
+	for _, r := range []struct {
+		received, reported string
+		total              int
+	}{
+		{"2026-10-28T10:00:00Z", "2026-10-28T09:59:00Z", 12},
+		{"2026-10-28T11:00:00Z", "2026-10-20T09:59:00Z", 3}, // replay
+	} {
+		if _, err := srv.db.conn.Exec(`INSERT INTO neighbor_reports (reporter, received_at, reported_at, verified, total, payload)
+			VALUES (?, ?, ?, 0, ?, '{}')`, mlA, r.received, r.reported, r.total); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nr, ok, err := srv.db.latestNeighborReport(mlA)
+	if err != nil || !ok {
+		t.Fatalf("latestNeighborReport: ok=%v err=%v", ok, err)
+	}
+	if nr.ReportedAt != "2026-10-28T09:59:00Z" || nr.Total == nil || *nr.Total != 12 {
+		t.Errorf("latest = %+v, want the report of 2026-10-28T09:59:00Z", nr)
 	}
 }
 
@@ -113,7 +155,7 @@ func TestNodeNeighborsAddsMeasured(t *testing.T) {
 	ts := now.Format(time.RFC3339)
 	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(7.25), ts, 0, "responded")
 	insertMeasuredLink(t, srv.db.conn, mlA, mlC, nil, ts, 1, "timeout")
-	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn))
+	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays))
 
 	var resp struct {
 		Neighbors []struct {
@@ -178,7 +220,7 @@ func TestMeasuredLinksBulkSkipsUnpositioned(t *testing.T) {
 	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(4), recent, 0, "responded")
 	insertMeasuredLink(t, srv.db.conn, mlA, mlC, f64(1), recent, 1, "responded") // C has no nodes row
 	insertMeasuredLink(t, srv.db.conn, mlA, mlD, f64(2), recent, 1, "responded") // D has no position
-	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn))
+	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays))
 
 	var resp struct {
 		Links []MeasuredPair `json:"links"`
@@ -204,7 +246,7 @@ func TestMeasuredLinksBulkSkipsUnpositioned(t *testing.T) {
 
 func TestMeasuredLinksAbsentTable(t *testing.T) {
 	srv, router := setupTestServer(t)
-	ix := loadMeasuredLinks(srv.db.conn)
+	ix := loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays)
 	if ix == nil {
 		t.Fatal("loadMeasuredLinks returned nil on a database without measured_links")
 	}
@@ -306,7 +348,7 @@ func TestMeasuredRefreshKeepsIndexOnReadFailure(t *testing.T) {
 	if _, err := srv.db.conn.Exec(`CREATE TABLE measured_links (reporter TEXT, neighbor TEXT)`); err != nil {
 		t.Fatal(err)
 	}
-	if ix := loadMeasuredLinks(srv.db.conn); ix != nil {
+	if ix := loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays); ix != nil {
 		t.Fatalf("loadMeasuredLinks on a failing read = %+v, want nil", ix)
 	}
 	prev := &measuredLinkIndex{byNode: map[string][]measuredLink{mlA: {{Reporter: mlA, Neighbor: mlB}}}}
@@ -340,7 +382,7 @@ func TestMeasuredLinksBulkOmitsHiddenNodes(t *testing.T) {
 	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(1), ts, 1, "responded")
 	insertMeasuredLink(t, srv.db.conn, mlA, mlC, f64(2), ts, 1, "responded")
 	insertMeasuredLink(t, srv.db.conn, mlC, mlB, f64(3), ts, 1, "responded")
-	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn))
+	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays))
 
 	var resp struct {
 		Links []MeasuredPair `json:"links"`
@@ -377,7 +419,7 @@ func TestNodeNeighborsMeasuredMatchesAmbiguousEntry(t *testing.T) {
 	ts := now.Format(time.RFC3339)
 	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(3.5), ts, 1, "responded")
 	insertMeasuredLink(t, srv.db.conn, mlA, mlC, f64(-1), ts, 1, "responded")
-	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn))
+	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays))
 
 	var resp struct {
 		Neighbors []NeighborEntry `json:"neighbors"`
@@ -425,7 +467,7 @@ func BenchmarkLoadMeasuredLinks(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ix := loadMeasuredLinks(db.conn)
+		ix := loadMeasuredLinks(db.conn, defaultMeasuredLinkDays)
 		if len(ix.forNode(fmt.Sprintf("%064x", 0))) != 100 {
 			b.Fatal("unexpected link count")
 		}
