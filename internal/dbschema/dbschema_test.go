@@ -153,6 +153,69 @@ func TestAssertReady_RequiresOptionalColumns(t *testing.T) {
 	}
 }
 
+// TestApplyCreatesNeighborReportTables pins the #1865 measured-links schema:
+// the report journal, the current-link table and the default flood scope
+// columns, all owned by Apply and asserted by AssertReady.
+func TestApplyCreatesNeighborReportTables(t *testing.T) {
+	db := minimalDB(t)
+	defer db.Close()
+
+	if err := Apply(db, nil); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := AssertReady(db); err != nil {
+		t.Fatalf("AssertReady after Apply: %v", err)
+	}
+	for _, c := range []struct{ table, col string }{
+		{"nodes", "default_flood_scope"},
+		{"nodes", "default_flood_scope_at"},
+		{"inactive_nodes", "default_flood_scope"},
+		{"inactive_nodes", "default_flood_scope_at"},
+		{"neighbor_reports", "reporter"},
+		{"neighbor_reports", "received_at"},
+		{"neighbor_reports", "reported_at"},
+		{"neighbor_reports", "verified"},
+		{"neighbor_reports", "total"},
+		{"neighbor_reports", "queried"},
+		{"neighbor_reports", "truncated"},
+		{"neighbor_reports", "default_scope"},
+		{"neighbor_reports", "payload"},
+		{"measured_links", "reporter"},
+		{"measured_links", "neighbor"},
+		{"measured_links", "snr"},
+		{"measured_links", "heard_at"},
+		{"measured_links", "reported_at"},
+		{"measured_links", "verified"},
+		{"measured_links", "status"},
+	} {
+		has, err := TableHasColumn(db, c.table, c.col)
+		if err != nil {
+			t.Fatalf("probe %s.%s: %v", c.table, c.col, err)
+		}
+		if !has {
+			t.Errorf("%s.%s missing after Apply", c.table, c.col)
+		}
+	}
+	for _, name := range []string{"neighbor_reports_v1", "nodes_default_flood_scope_v1"} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM _migrations WHERE name=?`, name).Scan(&n); err != nil || n != 1 {
+			t.Errorf("_migrations %q: count=%d err=%v", name, n, err)
+		}
+	}
+
+	if _, err := db.Exec(`INSERT INTO measured_links (reporter, neighbor, snr, heard_at, reported_at, verified, status) VALUES ('a','b',1.5,'t','t',1,'ok')`); err != nil {
+		t.Fatalf("insert measured_links: %v", err)
+	}
+	// Second Apply must be a no-op that keeps the data.
+	if err := Apply(db, nil); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM measured_links`).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("measured_links after second Apply: rows=%d err=%v", rows, err)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {
