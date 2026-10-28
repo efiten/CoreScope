@@ -434,6 +434,8 @@ func componentSchemas() map[string]interface{} {
 						"snrBA":    {Type: "number", Description: "SNR (dB) at which b hears a. Null when not measured."},
 						"verified": {Type: "boolean", Description: "True only when every measured direction came from a verified report."},
 						"ageSec":   {Type: "integer", Description: "Seconds since the newest report of the two directions."},
+						"ageSecAB": {Type: "integer", Description: "Seconds since the report in which a heard b. Null when that direction has no row."},
+						"ageSecBA": {Type: "integer", Description: "Seconds since the report in which b heard a. Null when that direction has no row."},
 					},
 				}},
 			},

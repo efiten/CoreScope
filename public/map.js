@@ -2783,6 +2783,12 @@
     return v == null || isNaN(Number(v)) ? 'not measured' : Number(v).toFixed(1) + ' dB';
   }
 
+  // One direction of a pair: its SNR, then its own report age when the
+  // direction has a row (ageSec null: never reported, no age).
+  function measuredDirText(snr, ageSec) {
+    return measuredSnrText(snr) + (ageSec == null ? '' : ', reported ' + measuredAgeText(ageSec));
+  }
+
   // Draws, fetches (once) or clears, following the checkbox.
   async function syncMeasuredLinks() {
     const cb = document.getElementById('mcLinks');
@@ -2835,10 +2841,9 @@
       const nameA = safeEsc(na.name || String(p.a).slice(0, 8));
       const nameB = safeEsc(nb.name || String(p.b).slice(0, 8));
       line.bindPopup('<b>Measured link</b><br>' + nameA + ' ↔ ' + nameB + '<br>' +
-        nameA + ' hears ' + nameB + ': ' + measuredSnrText(p.snrAB) + '<br>' +
-        nameB + ' hears ' + nameA + ': ' + measuredSnrText(p.snrBA) + '<br>' +
+        nameA + ' hears ' + nameB + ': ' + measuredDirText(p.snrAB, p.ageSecAB) + '<br>' +
+        nameB + ' hears ' + nameA + ': ' + measuredDirText(p.snrBA, p.ageSecBA) + '<br>' +
         (measured.length ? '' : 'No SNR<br>') +
-        'Reported ' + measuredAgeText(p.ageSec) + '<br>' +
         (p.verified ? 'verified' : 'not verified'));
       layer.addLayer(line);
     });

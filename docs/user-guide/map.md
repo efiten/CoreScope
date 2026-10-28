@@ -57,7 +57,7 @@ Tick **Measured links** to draw the links between nodes from their neighbours re
 - The colour follows the weaker of the two SNRs: good (5 dB or more), fair (-5 dB or more), poor (below that, or no SNR at all).
 - A solid line is verified and measured in both directions. A dashed line is not verified, measured in one direction only, or has no SNR.
 - A line is drawn only when both nodes are on the map right now, so the role, status, last heard and other filters also hide their links.
-- Click a line for the SNR in each direction, the age of the report and whether it is verified.
+- Click a line for the SNR in each direction with the age of that direction's report, and whether it is verified.
 
 ## Show Route
 
