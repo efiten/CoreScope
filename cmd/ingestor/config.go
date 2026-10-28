@@ -29,6 +29,9 @@ type MQTTSource struct {
 	Region             string   `json:"region,omitempty"`
 	// ClientID is the MQTT ClientID; empty means corescope-<name>-<random>.
 	ClientID string `json:"clientId,omitempty"`
+	// VerifiesObservers marks the broker that runs the CoreScope observer
+	// login hook: only neighbours reports from such a source can be verified.
+	VerifiesObservers bool `json:"verifiesObservers,omitempty"`
 }
 
 // ConnectTimeoutOrDefault returns the per-source connect timeout in seconds,
