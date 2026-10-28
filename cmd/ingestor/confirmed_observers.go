@@ -12,6 +12,18 @@ package main
 // verified, matching the broker hook.
 const confirmedObserversQuery = `SELECT pubkey FROM observer_bindings WHERE confirmed_at IS NOT NULL AND user_id IS NOT NULL`
 
+// newConfirmedObserverFilter returns the confirmed-observer set read from
+// cfg's users.db, or nil when no MQTT source has verifiesObservers set: no
+// report can be verified then, so users.db is not read for it.
+func newConfirmedObserverFilter(cfg *Config) *usersKeySet {
+	for _, src := range cfg.MQTTSources {
+		if src.VerifiesObservers {
+			return newConfirmedObserverSet(cfg.UsersDBPath())
+		}
+	}
+	return nil
+}
+
 // newConfirmedObserverSet returns the set of confirmed observers. Until the
 // first successful read nothing is verified: a missing users.db, a server
 // without user management or one older than observer bindings means every

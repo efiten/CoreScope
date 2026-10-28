@@ -115,11 +115,14 @@ func main() {
 		store.linkedCompanions = lc
 		go lc.refreshLoop()
 	}
-	// Verified /neighbors reports (#1865): always on; without users.db or
-	// observer bindings every report is simply unverified.
-	store.confirmedObservers = newConfirmedObserverSet(cfg.UsersDBPath())
-	store.confirmedObservers.refresh()
-	go store.confirmedObservers.refreshLoop()
+	// Verified /neighbors reports (#1865): only when a source has
+	// verifiesObservers; without users.db or observer bindings every report
+	// is simply unverified.
+	if cs := newConfirmedObserverFilter(cfg); cs != nil {
+		store.confirmedObservers = cs
+		cs.refresh()
+		go cs.refreshLoop()
+	}
 
 	regionSet := newRegionKeySet(cfg)
 	if cfg.AutoRegionKeysEnabled() {
