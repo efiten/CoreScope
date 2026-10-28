@@ -5926,3 +5926,10 @@ body.embed #app.app-fixed {
 .nb-unverified { color: var(--text-muted); border-style: dashed; }
 .nb-measured[title] { cursor: help; }
 .nb-age { font-size: 11px; }
+
+/* Measured links map layer (#1865): colour by the weaker SNR, dashed when not verified or one-way. */
+path.ml-link { stroke: var(--link-snr-poor); }
+path.ml-link.ml-good { stroke: var(--link-snr-good); }
+path.ml-link.ml-fair { stroke: var(--link-snr-fair); }
+path.ml-link.ml-poor { stroke: var(--link-snr-poor); }
+path.ml-link.ml-dashed { stroke-dasharray: 6 5; }
