@@ -1,9 +1,9 @@
 /**
  * Measured neighbours on the node page (#1865).
  * Route-mocks /api/nodes/<pk> and /api/nodes/<pk>/neighbors with one measured,
- * one measured-only and one timeout neighbour, then checks the Measured cells,
- * the verified badges, the report summary, the "Floods under" row and axe on
- * the neighbours card.
+ * two measured-only (one per direction) and one timeout neighbour, then checks
+ * the Measured cells, the verified badges, the report summary, the "Floods
+ * under" row and axe on the neighbours card.
  * Usage: BASE_URL=http://localhost:13581 node tests/e2e/test-node-neighbors-measured-e2e.js
  * Defaults to localhost:3000, never point it at a public instance.
  */
@@ -15,6 +15,7 @@ const BASE = process.env.BASE_URL || 'http://localhost:3000';
 const PK = 'aabbccdd11223344556677889900aabbccddeeff00112233445566778899001122';
 const NB_MEASURED = '1111111111111111111111111111111111111111111111111111111111111111';
 const NB_TIMEOUT = '3333333333333333333333333333333333333333333333333333333333333333';
+const NB_REPORTED = '4444444444444444444444444444444444444444444444444444444444444444';
 const NOW = Date.now();
 const iso = (agoMs) => new Date(NOW - agoMs).toISOString();
 
@@ -39,6 +40,8 @@ const neighbors = {
     { pubkey: NB_TIMEOUT, prefix: '33', name: 'Silent-One', role: 'repeater', count: 5, score: 0.4, ambiguous: false,
       last_seen: iso(90000), inferred: true,
       measured: { snrIn: -8, snrOut: null, heardAt: iso(900000), reportedAt: iso(900000), verified: true, status: 'timeout' } },
+    { pubkey: NB_REPORTED, prefix: '44', name: null, role: null, count: 0, score: 0, ambiguous: false, inferred: false,
+      measured: { snrIn: 3, snrOut: null, heardAt: iso(700000), reportedAt: iso(700000), verified: true, status: 'responded' } },
   ],
   total_observations: 45,
 };
@@ -69,8 +72,8 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
   const rows = '#fullNeighborsContent .neighbor-sort-table tbody tr';
   const rowFor = (text) => page.locator(rows, { hasText: text });
 
-  await test('three neighbour rows, Measured header present', async () => {
-    assert((await page.locator(rows).count()) === 3, 'row count');
+  await test('four neighbour rows, Measured header present', async () => {
+    assert((await page.locator(rows).count()) === 4, 'row count');
     assert((await page.locator('#fullNeighborsContent th', { hasText: 'Measured' }).count()) === 1, 'header');
   });
 
@@ -87,10 +90,16 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
   await test('measured-only neighbour is named by prefix, flags the missing side, not verified', async () => {
     const r = rowFor('22…');
     const t = await r.innerText();
-    assert(t.includes('(heard only by this neighbour)'), t);
+    assert(t.includes('22… (only known from neighbour reports)'), t);
     assert(t.includes('in not measured'), t);
     assert(t.includes('out 7.3 dB') || t.includes('out 7.2 dB'), t);
     assert((await r.locator('.nb-unverified', { hasText: 'not verified' }).count()) === 1, 'not verified badge');
+  });
+
+  await test('measured-only neighbour from the node\'s own report gets the same label', async () => {
+    const t = await rowFor('44…').innerText();
+    assert(t.includes('44… (only known from neighbour reports)'), t);
+    assert(t.includes('in 3.0 dB') && t.includes('out not measured'), t);
   });
 
   await test('timeout neighbour explains it does not answer scope queries', async () => {
@@ -107,8 +116,8 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
     }))).filter((v) => v !== '').map(Number);
     await th.click();
     const first = await weakest();
-    assert(first.length === 3, 'three measured values: ' + first.join(','));
-    const asc = [-8, -2, 7.25];
+    assert(first.length === 4, 'four measured values: ' + first.join(','));
+    const asc = [-8, -2, 3, 7.25];
     const isAsc = first.join(',') === asc.join(',');
     const isDesc = first.join(',') === asc.slice().reverse().join(',');
     assert(isAsc || isDesc, 'sorted after first click: ' + first.join(','));
