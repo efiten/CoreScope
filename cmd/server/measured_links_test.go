@@ -242,6 +242,37 @@ func TestMeasuredLinksBulkSkipsUnpositioned(t *testing.T) {
 	if l.AgeSec < 9*60 || l.AgeSec > 11*60 {
 		t.Errorf("ageSec = %d, want about 600 (newest of the two directions)", l.AgeSec)
 	}
+	if l.AgeSecAB == nil || *l.AgeSecAB < 9*60 || *l.AgeSecAB > 11*60 {
+		t.Errorf("ageSecAB = %v, want about 600 (A hears B, recent)", l.AgeSecAB)
+	}
+	if l.AgeSecBA == nil || *l.AgeSecBA < 119*60 || *l.AgeSecBA > 121*60 {
+		t.Errorf("ageSecBA = %v, want about 7200 (B hears A, old)", l.AgeSecBA)
+	}
+}
+
+// A one-way pair carries no age for the direction without a row.
+func TestMeasuredLinksBulkOneWayAge(t *testing.T) {
+	srv, router := setupMeasuredServer(t)
+	insertMeasuredNode(t, srv.db.conn, mlA, "node-a", 51.0, 4.0)
+	insertMeasuredNode(t, srv.db.conn, mlB, "node-b", 51.1, 4.1)
+	srv.store.rebuildNodeCache()
+	insertMeasuredLink(t, srv.db.conn, mlB, mlA, f64(-3), time.Now().UTC().Format(time.RFC3339), 1, "responded")
+	srv.store.measured.Store(loadMeasuredLinks(srv.db.conn, defaultMeasuredLinkDays))
+
+	var resp struct {
+		Links []map[string]interface{} `json:"links"`
+	}
+	getJSON(t, router, "/api/links/measured", &resp)
+	if len(resp.Links) != 1 {
+		t.Fatalf("got %d links, want 1", len(resp.Links))
+	}
+	l := resp.Links[0]
+	if v, ok := l["ageSecAB"]; !ok || v != nil {
+		t.Errorf("ageSecAB = %v (present %v), want null", v, ok)
+	}
+	if v, ok := l["ageSecBA"].(float64); !ok || v < 0 || v > 60 {
+		t.Errorf("ageSecBA = %v, want a few seconds", l["ageSecBA"])
+	}
 }
 
 func TestMeasuredLinksAbsentTable(t *testing.T) {

@@ -38,7 +38,8 @@ type MeasuredInfo struct {
 // SNR at which A hears B (the row reporter=A, neighbor=B), SNRBA the SNR at
 // which B hears A; either is null when that direction is not measured.
 // Verified is true only when every measured direction is verified. AgeSec is
-// the age of the newest reported_at of the two directions.
+// the age of the newest reported_at of the two directions; AgeSecAB and
+// AgeSecBA are the age of each direction, null when it has no row.
 type MeasuredPair struct {
 	A        string   `json:"a"`
 	B        string   `json:"b"`
@@ -46,6 +47,8 @@ type MeasuredPair struct {
 	SNRBA    *float64 `json:"snrBA"`
 	Verified bool     `json:"verified"`
 	AgeSec   int64    `json:"ageSec"`
+	AgeSecAB *int64   `json:"ageSecAB"`
+	AgeSecBA *int64   `json:"ageSecBA"`
 }
 
 // MeasuredLinksResponse is the body of GET /api/links/measured.
@@ -326,8 +329,8 @@ func (s *Server) measuredPairs(now time.Time) []MeasuredPair {
 	}
 
 	type acc struct {
-		pair     MeasuredPair
-		reported string
+		pair                   MeasuredPair
+		reported, repAB, repBA string
 	}
 	pairs := make(map[measuredPairKey]*acc)
 	for key, links := range ix.byNode {
@@ -349,18 +352,30 @@ func (s *Server) measuredPairs(now time.Time) []MeasuredPair {
 			}
 			if l.Reporter == k.a {
 				p.pair.SNRAB = l.SNR
+				p.repAB = l.ReportedAt
 			} else {
 				p.pair.SNRBA = l.SNR
+				p.repBA = l.ReportedAt
 			}
 			p.pair.Verified = p.pair.Verified && l.Verified
 			p.reported = newerTimestamp(p.reported, l.ReportedAt)
 		}
 	}
 
-	for _, p := range pairs {
-		if t := parseTimestamp(p.reported); !t.IsZero() {
-			p.pair.AgeSec = int64(now.Sub(t).Seconds())
+	ageSec := func(ts string) *int64 {
+		t := parseTimestamp(ts)
+		if t.IsZero() {
+			return nil
 		}
+		v := int64(now.Sub(t).Seconds())
+		return &v
+	}
+	for _, p := range pairs {
+		if v := ageSec(p.reported); v != nil {
+			p.pair.AgeSec = *v
+		}
+		p.pair.AgeSecAB = ageSec(p.repAB)
+		p.pair.AgeSecBA = ageSec(p.repBA)
 		out = append(out, p.pair)
 	}
 	sort.Slice(out, func(i, j int) bool {

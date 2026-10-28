@@ -20,10 +20,10 @@ const NODES = [
   { public_key: pk('d'), name: 'Node-D', role: 'companion', lat: 50.75, lon: 4.45 },
 ].map((n) => Object.assign({ last_seen: new Date().toISOString(), advert_count: 1 }, n));
 const LINKS = { links: [
-  { a: pk('a'), b: pk('b'), snrAB: 8, snrBA: 6.5, verified: true, ageSec: 120 },
-  { a: pk('a'), b: pk('c'), snrAB: null, snrBA: -2, verified: true, ageSec: 3700 },
-  { a: pk('b'), b: pk('d'), snrAB: -9, snrBA: 1, verified: false, ageSec: 90000 },
-  { a: pk('a'), b: pk('e'), snrAB: null, snrBA: null, verified: true, ageSec: 30 },
+  { a: pk('a'), b: pk('b'), snrAB: 8, snrBA: 6.5, verified: true, ageSec: 120, ageSecAB: 120, ageSecBA: 7300 },
+  { a: pk('a'), b: pk('c'), snrAB: null, snrBA: -2, verified: true, ageSec: 3700, ageSecAB: null, ageSecBA: 3700 },
+  { a: pk('b'), b: pk('d'), snrAB: -9, snrBA: 1, verified: false, ageSec: 90000, ageSecAB: 90000, ageSecBA: 90000 },
+  { a: pk('a'), b: pk('e'), snrAB: null, snrBA: null, verified: true, ageSec: 30, ageSecAB: 30, ageSecBA: null },
 ] };
 
 const results = [];
@@ -101,9 +101,17 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
     const t = await page.locator('.leaflet-popup-content').innerText();
     assert(t.includes('Node-A') && t.includes('Node-C<i>'), t);
     assert(!html.includes('<i>'), 'unescaped name');
-    assert(t.includes('not measured') && t.includes('-2.0 dB'), t);
+    assert(/Node-A hears Node-C<i>: not measured\s*$/m.test(t), 'unmeasured direction carries no age: ' + t);
+    assert(/Node-C<i> hears Node-A: -2\.0 dB, reported 1 h ago/.test(t), 'measured direction with its age: ' + t);
     assert(t.includes('verified') && !t.includes('not verified'), t);
-    assert(/1 h/.test(t), 'age: ' + t);
+  });
+
+  await test('popup shows the age of each direction', async () => {
+    await page.locator('path.ml-good').first().dispatchEvent('click');
+    await page.waitForFunction(() => /Node-B hears/.test((document.querySelector('.leaflet-popup-content') || {}).innerText || ''), null, { timeout: 5000 });
+    const t = await page.locator('.leaflet-popup-content').innerText();
+    assert(/Node-A hears Node-B: 8\.0 dB, reported 2 min ago/.test(t), t);
+    assert(/Node-B hears Node-A: 6\.5 dB, reported 2 h ago/.test(t), t);
   });
 
   await test('a pair with no SNR is poor and dashed, popup says No SNR', async () => {
