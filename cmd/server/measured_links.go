@@ -116,15 +116,17 @@ func loadMeasuredLinks(conn *sql.DB) *measuredLinkIndex {
 		}
 		l.Reporter = strings.ToLower(l.Reporter)
 		l.Neighbor = strings.ToLower(l.Neighbor)
+		if l.Neighbor == l.Reporter {
+			// A node is not its own neighbour.
+			continue
+		}
 		if snr.Valid {
 			v := snr.Float64
 			l.SNR = &v
 		}
 		l.Verified = verified != 0
 		ix.byNode[l.Reporter] = append(ix.byNode[l.Reporter], l)
-		if l.Neighbor != l.Reporter {
-			ix.byNode[l.Neighbor] = append(ix.byNode[l.Neighbor], l)
-		}
+		ix.byNode[l.Neighbor] = append(ix.byNode[l.Neighbor], l)
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("[measured-links] failed to load measured_links: %v", err)

@@ -2137,7 +2137,8 @@ func recordNeighborLinks(store *Store, tag string, verifiesObservers bool, obser
 		}
 		pubkey, _ := n["pubkey"].(string)
 		pubkey = strings.ToLower(pubkey)
-		if !targetPubkeyRe.MatchString(pubkey) {
+		// A node is not its own neighbour: a self-loop is a bad row.
+		if !targetPubkeyRe.MatchString(pubkey) || pubkey == reporter {
 			continue
 		}
 		ago, ok := n["heard_secs_ago"].(float64)

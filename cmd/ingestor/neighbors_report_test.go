@@ -549,6 +549,23 @@ func TestNeighborsReportBadFields(t *testing.T) {
 	}
 }
 
+// A report that lists its own reporter as a neighbour stores no self-loop
+// link, in any case of the key, and keeps the other neighbours.
+func TestNeighborsReportSkipsSelfLoop(t *testing.T) {
+	fixReportNow(t, time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC))
+	store := openNeighborsStore(t)
+	ingestReport(t, store, nrOriginUpper, `{"timestamp":"2026-07-26T11:00:00Z","origin_id":"`+nrOriginUpper+`","neighbors":[
+		{"pubkey":"`+nrOriginUpper+`","snr":9,"heard_secs_ago":1,"status":"responded"},
+		{"pubkey":"`+nrOrigin+`","snr":9,"heard_secs_ago":1,"status":"responded"},
+		{"pubkey":"`+nrNbA+`","snr":1,"heard_secs_ago":1,"status":"timeout"}]}`)
+	if _, ok := readLink(t, store, nrOrigin, nrOrigin); ok {
+		t.Error("self-loop link stored")
+	}
+	if n := countRows(t, store, "measured_links"); n != 1 {
+		t.Errorf("measured_links rows = %d, want 1", n)
+	}
+}
+
 func TestNeighborsReportCapsNeighbours(t *testing.T) {
 	store := openNeighborsStore(t)
 	var buf bytes.Buffer
