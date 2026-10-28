@@ -453,8 +453,8 @@
       var m = nb.measured || null;
       var name = nb.name;
       if (!name) {
-        // Measured-only rows carry no packet evidence: say who heard whom.
-        name = nb.prefix + (m && !nb.count && m.snrIn == null ? '… (heard only by this neighbour)' : '… (unknown)');
+        // Measured-only rows carry no packet evidence, whichever side reported.
+        name = nb.prefix + (m && !nb.count ? '… (only known from neighbour reports)' : '… (unknown)');
       }
       var nameHtml = nb.pubkey
         ? '<a href="#/nodes/' + encodeURIComponent(nb.pubkey) + '">' + escapeHtml(name) + '</a>'
