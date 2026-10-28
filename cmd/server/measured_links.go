@@ -78,7 +78,8 @@ type measuredLink struct {
 // measuredLinkIndex maps a lowercase pubkey to every row it appears in, as
 // reporter or as neighbour. Built once per load and never mutated after, so
 // readers need no lock. Size is one entry per row per endpoint; measured_links
-// is bounded by the ingestor (retention.measuredLinkDays, 512 links per report).
+// is bounded by the ingestor (retention.measuredLinkDays, and at most
+// maxStoredNeighbors = 500 links per report).
 type measuredLinkIndex struct {
 	byNode map[string][]measuredLink
 }

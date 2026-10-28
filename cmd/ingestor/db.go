@@ -2087,7 +2087,7 @@ func (s *Store) backfillTransportCodes(batchSize int) (int, error) {
 
 // LogStats logs current operational metrics.
 func (s *Store) LogStats() {
-	log.Printf("[stats] tx_inserted=%d tx_dupes=%d obs_inserted=%d node_upserts=%d observer_upserts=%d write_errors=%d sig_drops=%d",
+	log.Printf("[stats] tx_inserted=%d tx_dupes=%d obs_inserted=%d node_upserts=%d observer_upserts=%d write_errors=%d sig_drops=%d neighbors_origin_mismatch=%d neighbor_links_dropped=%d",
 		s.Stats.TransmissionsInserted.Load(),
 		s.Stats.DuplicateTransmissions.Load(),
 		s.Stats.ObservationsInserted.Load(),
@@ -2095,6 +2095,8 @@ func (s *Store) LogStats() {
 		s.Stats.ObserverUpserts.Load(),
 		s.Stats.WriteErrors.Load(),
 		s.Stats.SignatureDrops.Load(),
+		s.Stats.NeighborsOriginMismatch.Load(),
+		s.Stats.NeighborLinksDropped.Load(),
 	)
 }
 

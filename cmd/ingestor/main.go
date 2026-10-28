@@ -2099,6 +2099,9 @@ func recordNeighborLinks(store *Store, tag string, verifiesObservers, retained b
 	ts, _ := msg["timestamp"].(string)
 	reportedAt := normalizeReportTS(ts)
 	if reportTooFarInFuture(reportedAt) {
+		if store.neighborsTimestampLog.allow(reporter) {
+			log.Printf("[neighbors] %.8s: report stamped %s is more than %s ahead of our clock, dropped", reporter, reportedAt, maxReportFuture)
+		}
 		return
 	}
 	current := !retained && reportedAt != ""

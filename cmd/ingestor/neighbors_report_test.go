@@ -303,6 +303,42 @@ func TestNeighborsReportOutsideWindowWritesNoLinks(t *testing.T) {
 	}
 }
 
+// A report stamped too far ahead is dropped, logged once per reporter.
+func TestNeighborsReportFutureStampLogged(t *testing.T) {
+	fixReportNow(t, nrNow)
+	store := openNeighborsStore(t)
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	for i := 0; i < 2; i++ {
+		ingestReport(t, store, nrOriginUpper, `{"timestamp":"2026-07-26T12:06:00Z","origin_id":"`+nrOriginUpper+`","neighbors":[
+			{"pubkey":"`+nrNbA+`","snr":1,"heard_secs_ago":1,"status":"timeout"}]}`)
+	}
+	for _, table := range []string{"neighbor_reports", "measured_links"} {
+		if n := countRows(t, store, table); n != 0 {
+			t.Errorf("%s rows = %d, want 0", table, n)
+		}
+	}
+	const line = "[neighbors] feedca4a: report stamped 2026-07-26T12:06:00Z is more than 5m0s ahead of our clock, dropped"
+	if n := strings.Count(buf.String(), line); n != 1 {
+		t.Errorf("future stamp logged %d times, want once:\n%s", n, buf.String())
+	}
+}
+
+// The periodic stats line carries the /neighbors drop counters.
+func TestLogStatsNeighborCounters(t *testing.T) {
+	store := openNeighborsStore(t)
+	store.Stats.NeighborsOriginMismatch.Add(3)
+	store.Stats.NeighborLinksDropped.Add(200)
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	store.LogStats()
+	if !strings.Contains(buf.String(), "neighbors_origin_mismatch=3 neighbor_links_dropped=200") {
+		t.Errorf("stats line lacks the neighbour counters:\n%s", buf.String())
+	}
+}
+
 func TestNeighborsReportMismatchLogIsBounded(t *testing.T) {
 	var l reporterLogLimiter
 	now := time.Date(2026, 7, 26, 9, 0, 0, 0, time.UTC)
