@@ -84,6 +84,12 @@ func Apply(rw *sql.DB, logf Logger) error {
 	if err := ensureConfiguredScopeColumns(rw, logf); err != nil {
 		return fmt.Errorf("ensure configured_scope: %w", err)
 	}
+	if err := ensureDefaultFloodScopeColumns(rw, logf); err != nil {
+		return fmt.Errorf("ensure default_flood_scope: %w", err)
+	}
+	if err := ensureNeighborReportTables(rw, logf); err != nil {
+		return fmt.Errorf("ensure neighbor report tables: %w", err)
+	}
 	if err := ensureObservationsRawHexColumn(rw, logf); err != nil {
 		return fmt.Errorf("ensure observations.raw_hex: %w", err)
 	}
@@ -176,6 +182,10 @@ func AssertReady(ro *sql.DB) error {
 	// #1865: confirmed region scopes from the observer /neighbors report.
 	mustCol("nodes", "configured_scope")
 	mustCol("inactive_nodes", "configured_scope")
+	mustCol("nodes", "default_flood_scope")
+	mustCol("inactive_nodes", "default_flood_scope")
+	mustTable("neighbor_reports")
+	mustTable("measured_links")
 	mustCol("observations", "raw_hex")
 	// Multi-byte capability cache (#1324 follow-up; PR #903 surface).
 	// Owned by ingestor — server reads these for O(1) /api/nodes
@@ -543,6 +553,80 @@ func ensureConfiguredScopeColumns(rw *sql.DB, logf Logger) error {
 	}
 	if _, err := rw.Exec(`INSERT OR IGNORE INTO _migrations (name) VALUES ('nodes_configured_scope_v1')`); err != nil {
 		return fmt.Errorf("record nodes_configured_scope_v1: %w", err)
+	}
+	return nil
+}
+
+// ensureDefaultFloodScopeColumns adds nodes.default_flood_scope +
+// nodes.default_flood_scope_at (and mirrors on inactive_nodes) for #1865: the
+// default flood scope a node reports for itself in the observer /neighbors
+// report. Kept apart from configured_scope (region scopes) and default_scope
+// (inferred from observed adverts).
+func ensureDefaultFloodScopeColumns(rw *sql.DB, logf Logger) error {
+	if err := ensureMigrationsTable(rw); err != nil {
+		return err
+	}
+	for _, table := range []string{"nodes", "inactive_nodes"} {
+		for _, col := range []string{"default_flood_scope", "default_flood_scope_at"} {
+			has, err := TableHasColumn(rw, table, col)
+			if err != nil {
+				return fmt.Errorf("inspect %s.%s: %w", table, col, err)
+			}
+			if has {
+				continue
+			}
+			if _, err := rw.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT DEFAULT NULL`, table, col)); err != nil {
+				return fmt.Errorf("alter %s add %s: %w", table, col, err)
+			}
+			logf("[dbschema] added %s column to %s (#1865)", col, table)
+		}
+	}
+	if _, err := rw.Exec(`INSERT OR IGNORE INTO _migrations (name) VALUES ('nodes_default_flood_scope_v1')`); err != nil {
+		return fmt.Errorf("record nodes_default_flood_scope_v1: %w", err)
+	}
+	return nil
+}
+
+// ensureNeighborReportTables creates neighbor_reports (journal of observer
+// /neighbors reports) and measured_links (latest measured SNR per directed
+// reporter-hears-neighbor pair) for #1865.
+func ensureNeighborReportTables(rw *sql.DB, logf Logger) error {
+	if err := ensureMigrationsTable(rw); err != nil {
+		return err
+	}
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS neighbor_reports (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			reporter TEXT NOT NULL,
+			received_at TEXT NOT NULL,
+			reported_at TEXT NOT NULL,
+			verified INTEGER NOT NULL,
+			total INTEGER, queried INTEGER, truncated INTEGER,
+			default_scope TEXT,
+			payload TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_neighbor_reports_reporter ON neighbor_reports(reporter, received_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_neighbor_reports_received ON neighbor_reports(received_at)`,
+		`CREATE TABLE IF NOT EXISTS measured_links (
+			reporter TEXT NOT NULL,
+			neighbor TEXT NOT NULL,
+			snr REAL,
+			heard_at TEXT NOT NULL,
+			reported_at TEXT NOT NULL,
+			verified INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			PRIMARY KEY (reporter, neighbor)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_measured_links_neighbor ON measured_links(neighbor)`,
+		`CREATE INDEX IF NOT EXISTS idx_measured_links_reported ON measured_links(reported_at)`,
+	}
+	for _, s := range stmts {
+		if _, err := rw.Exec(s); err != nil {
+			return fmt.Errorf("neighbor report schema: %w", err)
+		}
+	}
+	if _, err := rw.Exec(`INSERT OR IGNORE INTO _migrations (name) VALUES ('neighbor_reports_v1')`); err != nil {
+		return fmt.Errorf("record neighbor_reports_v1: %w", err)
 	}
 	return nil
 }
