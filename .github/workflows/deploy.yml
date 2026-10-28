@@ -693,6 +693,7 @@ jobs:
           suite 3 test-issue-1640-compare-discovery-e2e.js CHROMIUM_REQUIRE=1 BASE_URL=$B
           suite 3 test-observer-detail-ownership-e2e.js BASE_URL=$B
           suite 2 test-neighbor-map-btn-clip-e2e.js CHROMIUM_REQUIRE=1
+          suite 2 test-node-neighbors-measured-e2e.js CHROMIUM_REQUIRE=1 BASE_URL=$B
           suite 3 test-rx-coverage-viewport-e2e.js BASE_URL=$B
           suite 1 test-rx-coverage-noise-e2e.js BASE_URL=$B
           # Issue #2037: these eight sat in tests/e2e/ with no runner at all.
