@@ -126,6 +126,9 @@
     statusGreenText: '--status-green-text',
     statusYellow: '--status-yellow',
     statusRed: '--status-red',
+    linkSnrGood: '--link-snr-good',
+    linkSnrFair: '--link-snr-fair',
+    linkSnrPoor: '--link-snr-poor',
     // Advanced (derived from basic by default)
     accentHover: '--accent-hover',
     navBg2: '--nav-bg2',
