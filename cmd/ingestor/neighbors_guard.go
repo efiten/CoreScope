@@ -38,7 +38,7 @@ func reportTooFarInFuture(canonical string) bool {
 const (
 	// maxNeighborReportPayload caps the raw report stored in
 	// neighbor_reports.payload. The firmware sends at most 10 kB (#1865); a
-	// larger payload is processed but not journalled.
+	// larger report is journalled without payload and stores no links.
 	maxNeighborReportPayload = 64 << 10
 	// maxHeardSecsAgo clamps neighbors[].heard_secs_ago: older than the
 	// measured_links retention default is not a current link anyway.
@@ -46,6 +46,9 @@ const (
 	// maxNeighborStatusLen caps neighbors[].status; longer values are stored
 	// as "unknown". Real values are short words such as "responded".
 	maxNeighborStatusLen = 32
+	// maxNeighborsPerReport caps the neighbour entries processed per report.
+	// The firmware caps the whole report at 10 kB (#1865).
+	maxNeighborsPerReport = 512
 )
 
 const (

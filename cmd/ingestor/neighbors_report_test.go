@@ -431,6 +431,21 @@ func TestNeighborsReportBadFields(t *testing.T) {
 		t.Errorf("no timestamp: link = %+v, want ingest time", got)
 	}
 
+	// Unparseable timestamp: ingest time too, logged once per reporter.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	for i := 0; i < 2; i++ {
+		ingestReport(t, store, nrOriginUpper, `{"timestamp":"yesterday","origin_id":"`+nrOriginUpper+`","neighbors":[
+			{"pubkey":"`+strings.Repeat("5", 64)+`","snr":1,"heard_secs_ago":0,"status":"timeout"}]}`)
+	}
+	if got, _ := readLink(t, store, nrOrigin, strings.Repeat("5", 64)); got.reportedAt != "2026-07-26T12:00:00Z" {
+		t.Errorf("unparseable timestamp: reported_at = %q, want ingest time", got.reportedAt)
+	}
+	if n := strings.Count(buf.String(), `[neighbors] feedca4a: unparseable timestamp "yesterday", using ingest time`); n != 1 {
+		t.Errorf("unparseable timestamp logged %d times, want once:\n%s", n, buf.String())
+	}
+
 	// A report stamped far in the future writes nothing.
 	before := countRows(t, store, "neighbor_reports")
 	ingestReport(t, store, nrOriginUpper, `{"timestamp":"2027-07-26T12:00:00Z","origin_id":"`+nrOriginUpper+`","neighbors":[
@@ -453,14 +468,15 @@ func TestNeighborsReportBadFields(t *testing.T) {
 		t.Error("report from a non-pubkey topic id stored a link")
 	}
 
-	// Oversized payload: rows processed, payload not stored.
+	// Oversized payload: the report row is journalled without payload, and
+	// no links are stored.
 	var sb strings.Builder
 	sb.WriteString(`{"timestamp":"2026-07-26T11:30:00Z","origin_id":"` + nrOriginUpper + `","neighbors":[`)
 	sb.WriteString(`{"pubkey":"` + strings.Repeat("4", 64) + `","snr":1,"heard_secs_ago":1,"status":"timeout"}`)
 	sb.WriteString(`],"pad":"` + strings.Repeat("p", maxNeighborReportPayload) + `"}`)
 	ingestReport(t, store, nrOriginUpper, sb.String())
-	if _, ok := readLink(t, store, nrOrigin, strings.Repeat("4", 64)); !ok {
-		t.Error("oversized report: link not stored")
+	if _, ok := readLink(t, store, nrOrigin, strings.Repeat("4", 64)); ok {
+		t.Error("oversized report stored a link")
 	}
 	var payload string
 	if err := store.db.QueryRow(`SELECT payload FROM neighbor_reports ORDER BY id DESC LIMIT 1`).Scan(&payload); err != nil {
@@ -468,6 +484,54 @@ func TestNeighborsReportBadFields(t *testing.T) {
 	}
 	if payload != "" {
 		t.Errorf("oversized payload stored (%d bytes)", len(payload))
+	}
+}
+
+func TestNeighborsReportCapsNeighbours(t *testing.T) {
+	store := openNeighborsStore(t)
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	var sb strings.Builder
+	sb.WriteString(`{"timestamp":"2026-07-26T11:00:00Z","origin_id":"` + nrOriginUpper + `","neighbors":[`)
+	for i := 0; i < 600; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `{"pubkey":"%064x","heard_secs_ago":1}`, i+1)
+	}
+	sb.WriteString(`]}`)
+	if sb.Len() > maxNeighborReportPayload {
+		t.Fatalf("fixture is %d bytes, over the payload cap", sb.Len())
+	}
+	ingestReport(t, store, nrOriginUpper, sb.String())
+	ingestReport(t, store, nrOriginUpper, sb.String())
+
+	if n := countRows(t, store, "measured_links"); n != maxNeighborsPerReport {
+		t.Errorf("measured_links rows = %d, want %d", n, maxNeighborsPerReport)
+	}
+	if n := store.Stats.NeighborLinksDropped.Load(); n != 2*(600-maxNeighborsPerReport) {
+		t.Errorf("dropped = %d, want %d", n, 2*(600-maxNeighborsPerReport))
+	}
+	if n := strings.Count(buf.String(), "report lists 600 neighbours"); n != 1 {
+		t.Errorf("overflow logged %d times, want once per reporter:\n%s", n, buf.String())
+	}
+}
+
+func TestNeighborsReportFractionalOffsetTimestamp(t *testing.T) {
+	store := openNeighborsStore(t)
+	ingestReport(t, store, nrOriginUpper, `{"timestamp":"2026-07-26T08:00:00.123456+00:00","origin_id":"`+nrOriginUpper+`","neighbors":[
+		{"pubkey":"`+nrNbA+`","snr":1,"heard_secs_ago":0,"status":"timeout"}]}`)
+	if got, _ := readLink(t, store, nrOrigin, nrNbA); got.reportedAt != "2026-07-26T08:00:00Z" {
+		t.Errorf("link reported_at = %q, want 2026-07-26T08:00:00Z", got.reportedAt)
+	}
+	var at string
+	if err := store.db.QueryRow(`SELECT reported_at FROM neighbor_reports`).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	if at != "2026-07-26T08:00:00Z" {
+		t.Errorf("report reported_at = %q, want 2026-07-26T08:00:00Z", at)
 	}
 }
 

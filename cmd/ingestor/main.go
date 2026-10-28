@@ -2081,6 +2081,9 @@ func recordNeighborLinks(store *Store, tag, observerID string, msg map[string]in
 		return
 	}
 	if reportedAt == "" {
+		if tsRaw, ok := msg["timestamp"]; ok && tsRaw != nil && tsRaw != "" && store.neighborsTimestampLog.allow(reporter) {
+			log.Printf("[neighbors] %.8s: unparseable timestamp %q, using ingest time", reporter, sanitizeLogString(fmt.Sprint(tsRaw)))
+		}
 		reportedAt = now.Format(time.RFC3339)
 	}
 	reportTime, _ := time.Parse(time.RFC3339, reportedAt)
@@ -2109,7 +2112,22 @@ func recordNeighborLinks(store *Store, tag, observerID string, msg map[string]in
 		log.Printf("MQTT [%s] neighbors report insert error for %.8s: %v", tag, reporter, err)
 	}
 
-	neighbors, _ := msg["neighbors"].([]interface{})
+	// An oversized report gets no links, and a long list is cut at
+	// maxNeighborsPerReport: the report is unauthenticated, and each link is
+	// a write inside the MQTT handler.
+	var neighbors []interface{}
+	if len(raw) <= maxNeighborReportPayload {
+		neighbors, _ = msg["neighbors"].([]interface{})
+	}
+	if len(neighbors) > maxNeighborsPerReport {
+		dropped := len(neighbors) - maxNeighborsPerReport
+		store.Stats.NeighborLinksDropped.Add(int64(dropped))
+		if store.neighborsOverflowLog.allow(reporter) {
+			log.Printf("[neighbors] %.8s: report lists %d neighbours, keeping the first %d", reporter, len(neighbors), maxNeighborsPerReport)
+		}
+		neighbors = neighbors[:maxNeighborsPerReport]
+	}
+	links := make([]MeasuredLink, 0, len(neighbors))
 	for _, item := range neighbors {
 		n, ok := item.(map[string]interface{})
 		if !ok {
@@ -2139,9 +2157,10 @@ func recordNeighborLinks(store *Store, tag, observerID string, msg map[string]in
 		if st, ok := n["status"].(string); ok && st != "" && len(st) <= maxNeighborStatusLen {
 			l.Status = st
 		}
-		if err := store.UpsertMeasuredLink(l); err != nil {
-			log.Printf("MQTT [%s] measured link error %.8s -> %.8s: %v", tag, reporter, pubkey, err)
-		}
+		links = append(links, l)
+	}
+	if err := store.UpsertMeasuredLinks(links); err != nil {
+		log.Printf("MQTT [%s] measured links error for %.8s: %v", tag, reporter, err)
 	}
 
 	if r.DefaultScope != nil {
