@@ -1032,7 +1032,9 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// metadata (region-independent), so the per-source packet IATA filter below
 	// does not apply.
 	if len(parts) >= 4 && parts[3] == "neighbors" {
-		handleNeighborsReport(store, tag, source.VerifiesObservers, parts[2], msg, m.Payload())
+		if !handleNeighborsReport(store, tag, source.VerifiesObservers, parts[2], msg, m.Payload()) {
+			return
+		}
 		// #2270/#2271: keep the report itself for the observer pages. A
 		// retained replay must not pose as a fresh report.
 		if err := store.UpsertNeighborReport(clampObserverField(parts[2], maxObserverIDLen), msg, m.Retained(), time.Now()); err != nil {
@@ -2016,8 +2018,9 @@ func init() {
 //
 // Every report is also journalled in neighbor_reports and each listed
 // neighbour upserted into measured_links (recordNeighborLinks). A report whose
-// origin_id names another node than the topic is dropped before any write.
-func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, observerID string, msg map[string]interface{}, raw []byte) {
+// origin_id names another node than the topic is dropped before any write,
+// and handleNeighborsReport returns false so the caller stores nothing either.
+func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, observerID string, msg map[string]interface{}, raw []byte) bool {
 	reportedAt, _ := msg["timestamp"].(string)
 
 	// self: the observer's own configured scopes.
@@ -2028,7 +2031,7 @@ func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, obs
 			log.Printf("MQTT [%s] neighbors report dropped: origin_id %.8s does not match topic %.8s (logged once per hour per reporter)",
 				tag, sanitizeLogString(originID), sanitizeLogString(observerID))
 		}
-		return
+		return false
 	}
 	recordNeighborLinks(store, tag, verifiesObservers, observerID, msg, raw)
 	if originID == "" {
@@ -2069,6 +2072,7 @@ func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, obs
 			log.Printf("MQTT [%s] neighbors scope error for %.8s: %v", tag, pubkey, err)
 		}
 	}
+	return true
 }
 
 // recordNeighborLinks journals a /neighbors report and upserts one
