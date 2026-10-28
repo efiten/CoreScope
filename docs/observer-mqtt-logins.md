@@ -403,3 +403,21 @@ On that broker, every login handed to observer owners other than their personal 
 must be listed in `sharedUsernames`; an unlisted one can publish as a confirmed observer and its
 reports count as verified. Other broker users (bridges, operator users) are trusted by the
 operator: what they publish under a confirmed pubkey is verified too.
+
+### Neighbour reports: how observers send them
+
+An observer only publishes a neighbours report when told to:
+
+- Firmware observer: `set mqtt.neighbors on`. The interval is 12 to 336 hours, default 24 hours.
+- OpenHop: switch on "Publish Neighbours" on the broker form.
+
+What CoreScope shows from them is described in the user guide: the Measured column in [Nodes](user-guide/nodes.md#neighbours-card) and the Measured links layer in [Map](user-guide/map.md#measured-links).
+
+Retention, both consumed by the ingestor:
+
+| Key | Default | Removes |
+|---|---|---|
+| `retention.neighborReportsDays` | 90 | The report journal, by receive time |
+| `retention.measuredLinkDays` | 7 | Links no report has mentioned for that long |
+
+A neighbour missing from a report never removes its link: the firmware truncates long reports at 10 kB. A link goes away only when it expires after `measuredLinkDays`.
