@@ -55,14 +55,21 @@ const sampleOpenHop = `{
 }`
 
 // ingestReport runs the handler the way handleMessage does: raw bytes in,
-// unmarshalled map alongside.
+// unmarshalled map alongside, from a source without verifiesObservers.
 func ingestReport(t *testing.T, store *Store, topicID, raw string) {
+	t.Helper()
+	ingestReportFrom(t, store, false, topicID, raw)
+}
+
+// ingestReportFrom is ingestReport through a source whose verifiesObservers
+// is the given value.
+func ingestReportFrom(t *testing.T, store *Store, verifiesObservers bool, topicID, raw string) {
 	t.Helper()
 	var msg map[string]interface{}
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatalf("sample does not parse: %v", err)
 	}
-	handleNeighborsReport(store, "test", topicID, msg, []byte(raw))
+	handleNeighborsReport(store, "test", verifiesObservers, topicID, msg, []byte(raw))
 }
 
 type nrLinkRow struct {
@@ -289,9 +296,9 @@ func TestNeighborsReportVerifiedFlag(t *testing.T) {
 		return `{"timestamp":"2026-07-26T10:00:00Z","origin_id":"` + origin + `","neighbors":[
 			{"pubkey":"` + nrNbA + `","snr":1,"heard_secs_ago":1,"status":"timeout"}]}`
 	}
-	ingestReport(t, store, nrOriginUpper, report(nrOriginUpper))
-	ingestReport(t, store, unconfirmed, report(unconfirmed))
-	ingestReport(t, store, orphan, report(orphan))
+	ingestReportFrom(t, store, true, nrOriginUpper, report(nrOriginUpper))
+	ingestReportFrom(t, store, true, unconfirmed, report(unconfirmed))
+	ingestReportFrom(t, store, true, orphan, report(orphan))
 
 	if _, err := cs.db.Exec(`UPDATE observer_bindings SET confirmed_at = 1`); err == nil || !strings.Contains(strings.ToLower(err.Error()), "readonly") {
 		t.Fatalf("write through the confirmed-observer users.db handle: err = %v; want a read-only refusal", err)
@@ -313,15 +320,70 @@ func TestNeighborsReportVerifiedFlag(t *testing.T) {
 		}
 	}
 
-	// No confirmed set at all: unverified.
+	lastVerified := func() int {
+		t.Helper()
+		var v int
+		if err := store.db.QueryRow(`SELECT verified FROM neighbor_reports ORDER BY id DESC LIMIT 1`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	// The same confirmed pubkey through a source without verifiesObservers:
+	// unverified, and the link it refreshes is downgraded with it.
+	later := `{"timestamp":"2026-07-26T11:00:00Z","origin_id":"` + nrOriginUpper + `","neighbors":[
+		{"pubkey":"` + nrNbA + `","snr":1,"heard_secs_ago":1,"status":"timeout"}]}`
+	ingestReportFrom(t, store, false, nrOriginUpper, later)
+	if v := lastVerified(); v != 0 {
+		t.Errorf("unflagged source: report verified = %d, want 0", v)
+	}
+	if got, _ := readLink(t, store, nrOrigin, nrNbA); got.verified != 0 {
+		t.Errorf("unflagged source: link verified = %d, want 0", got.verified)
+	}
+
+	// No confirmed set at all: unverified, even through a flagged source.
 	store.confirmedObservers = nil
-	ingestReport(t, store, nrOriginUpper, report(nrOriginUpper))
-	var v int
-	if err := store.db.QueryRow(`SELECT verified FROM neighbor_reports ORDER BY id DESC LIMIT 1`).Scan(&v); err != nil {
+	ingestReportFrom(t, store, true, nrOriginUpper, report(nrOriginUpper))
+	if v := lastVerified(); v != 0 {
+		t.Errorf("nil confirmed set: verified = %d, want 0", v)
+	}
+}
+
+// The MQTT source's verifiesObservers flag reaches the report through
+// handleMessage: the same confirmed pubkey is verified only via a flagged
+// source.
+func TestNeighborsReportVerifiedNeedsFlaggedSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "users.db")
+	execUsersDB(t, path, testObserverBindingsDDL,
+		`INSERT INTO observer_bindings VALUES ('`+nrOriginUpper+`', 1, 10, 'auto', 10)`)
+	store := openNeighborsStore(t)
+	cs := newConfirmedObserverSet(path)
+	t.Cleanup(cs.Close)
+	cs.refresh()
+	store.confirmedObservers = cs
+
+	var cfg Config
+	if err := json.Unmarshal([]byte(`{"mqttSources":[{"name":"hooked","broker":"tcp://x:1883","topics":["meshcore/#"],"verifiesObservers":true},{"name":"other","broker":"tcp://y:1883","topics":["meshcore/#"]}]}`), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if v != 0 {
-		t.Errorf("nil confirmed set: verified = %d, want 0", v)
+	if !cfg.MQTTSources[0].VerifiesObservers || cfg.MQTTSources[1].VerifiesObservers {
+		t.Fatalf("verifiesObservers parsed as %v, %v; want true, false (default)", cfg.MQTTSources[0].VerifiesObservers, cfg.MQTTSources[1].VerifiesObservers)
+	}
+
+	topic := "meshcore/BRU/" + nrOriginUpper + "/neighbors"
+	for i, c := range []struct {
+		source MQTTSource
+		want   int
+	}{{cfg.MQTTSources[0], 1}, {cfg.MQTTSources[1], 0}} {
+		payload := fmt.Sprintf(`{"timestamp":"2026-07-26T1%d:00:00Z","origin_id":"%s","neighbors":[{"pubkey":"%s","snr":1,"heard_secs_ago":1,"status":"timeout"}]}`, i, nrOriginUpper, nrNbA)
+		handleMessage(store, c.source.Name, c.source, newMockMsg(topic, payload), nil, nil, &Config{})
+		var v int
+		if err := store.db.QueryRow(`SELECT verified FROM neighbor_reports ORDER BY id DESC LIMIT 1`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		if v != c.want {
+			t.Errorf("source %s: verified = %d, want %d", c.source.Name, v, c.want)
+		}
 	}
 }
 

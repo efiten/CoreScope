@@ -1029,7 +1029,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// metadata (region-independent), so the per-source packet IATA filter below
 	// does not apply.
 	if len(parts) >= 4 && parts[3] == "neighbors" {
-		handleNeighborsReport(store, tag, parts[2], msg, m.Payload())
+		handleNeighborsReport(store, tag, source.VerifiesObservers, parts[2], msg, m.Payload())
 		return
 	}
 
@@ -2009,7 +2009,7 @@ func init() {
 // Every report is also journalled in neighbor_reports and each listed
 // neighbour upserted into measured_links (recordNeighborLinks). A report whose
 // origin_id names another node than the topic is dropped before any write.
-func handleNeighborsReport(store *Store, tag string, observerID string, msg map[string]interface{}, raw []byte) {
+func handleNeighborsReport(store *Store, tag string, verifiesObservers bool, observerID string, msg map[string]interface{}, raw []byte) {
 	reportedAt, _ := msg["timestamp"].(string)
 
 	// self: the observer's own configured scopes.
@@ -2022,7 +2022,7 @@ func handleNeighborsReport(store *Store, tag string, observerID string, msg map[
 		}
 		return
 	}
-	recordNeighborLinks(store, tag, observerID, msg, raw)
+	recordNeighborLinks(store, tag, verifiesObservers, observerID, msg, raw)
 	if originID == "" {
 		originID = observerID
 	}
@@ -2068,8 +2068,10 @@ func handleNeighborsReport(store *Store, tag string, observerID string, msg map[
 // docs/superpowers/specs/2026-10-28-measured-neighbour-links-design.md). The
 // reporter is the topic pubkey, which handleNeighborsReport has already
 // matched against origin_id. A neighbour missing from the report keeps its
-// link: links expire by age (PruneMeasuredLinks), never by omission.
-func recordNeighborLinks(store *Store, tag, observerID string, msg map[string]interface{}, raw []byte) {
+// link: links expire by age (PruneMeasuredLinks), never by omission. A
+// report is verified only when it came through a source with
+// verifiesObservers set and the topic pubkey is a confirmed observer.
+func recordNeighborLinks(store *Store, tag string, verifiesObservers bool, observerID string, msg map[string]interface{}, raw []byte) {
 	reporter := strings.ToLower(observerID)
 	if !targetPubkeyRe.MatchString(reporter) {
 		return
@@ -2087,7 +2089,7 @@ func recordNeighborLinks(store *Store, tag, observerID string, msg map[string]in
 		reportedAt = now.Format(time.RFC3339)
 	}
 	reportTime, _ := time.Parse(time.RFC3339, reportedAt)
-	verified := store.confirmedObservers != nil && store.confirmedObservers.Has(reporter)
+	verified := verifiesObservers && store.confirmedObservers != nil && store.confirmedObservers.Has(reporter)
 
 	r := NeighborReport{
 		Reporter:   reporter,

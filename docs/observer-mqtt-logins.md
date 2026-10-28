@@ -375,3 +375,27 @@ here, or watch the CoreScope log for the `confirmed owner` line.
 first published as it, "not yet" for a binding that is not confirmed, and a dash for an observer
 without a binding. `GET /api/admin/observer-logins` has the same value as `confirmedAt` on each
 binding (null when unconfirmed).
+
+### Verified neighbour reports
+
+The ingestor marks a neighbours report (`meshcore/<iata>/<pubkey>/neighbors`) and the links it
+carries as verified only when both hold:
+
+- the report arrived through an MQTT source with `"verifiesObservers": true` in the ingestor's
+  `mqttSources[]` entry, and
+- the topic pubkey has a confirmed binding (see above).
+
+Set `verifiesObservers` only on the source that reads the broker running this hook. Every other
+source (a second broker, a bridge, the `MQTT_BROKER` environment source) defaults to `false`, and
+its reports are never verified.
+
+```json
+"mqttSources": [
+  { "name": "emqx", "broker": "mqtts://broker.example:8883", "topics": ["meshcore/#"], "verifiesObservers": true }
+]
+```
+
+On that broker, every login handed to observer owners other than their personal `obs_` login
+must be listed in `sharedUsernames`; an unlisted one can publish as a confirmed observer and its
+reports count as verified. Other broker users (bridges, operator users) are trusted by the
+operator: what they publish under a confirmed pubkey is verified too.
