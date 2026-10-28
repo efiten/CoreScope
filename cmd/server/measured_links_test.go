@@ -80,6 +80,25 @@ func TestLoadMeasuredLinksBothDirections(t *testing.T) {
 	}
 }
 
+// A row whose neighbour is its own reporter (a crafted report) is not
+// indexed: a node never lists itself as a measured neighbour.
+func TestLoadMeasuredLinksIgnoresSelfLoop(t *testing.T) {
+	srv, _ := setupMeasuredServer(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	insertMeasuredLink(t, srv.db.conn, mlA, mlA, f64(9), now, 1, "responded")
+	insertMeasuredLink(t, srv.db.conn, mlA, strings.ToUpper(mlA), f64(9), now, 1, "responded")
+	insertMeasuredLink(t, srv.db.conn, mlA, mlB, f64(5.5), now, 1, "responded")
+
+	ix := loadMeasuredLinks(srv.db.conn)
+	links := ix.forNode(mlA)
+	if len(links) != 1 || links[0].Neighbor != mlB {
+		t.Fatalf("forNode(A) = %+v, want only the link to B", links)
+	}
+	if _, ok := measuredInfoByNeighbor(mlA, links)[mlA]; ok {
+		t.Error("A lists itself as a measured neighbour")
+	}
+}
+
 func TestNodeNeighborsAddsMeasured(t *testing.T) {
 	srv, router := setupMeasuredServer(t)
 	insertMeasuredNode(t, srv.db.conn, mlA, "node-a", 51.0, 4.0)
