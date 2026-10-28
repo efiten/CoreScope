@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // Limits on the unauthenticated /neighbors report (#1865). Any MQTT publisher
 // can send one, so the values it carries are bounded before they reach the
@@ -30,4 +33,63 @@ func reportTooFarInFuture(canonical string) bool {
 		return false
 	}
 	return t.After(reportNow().Add(maxReportFuture))
+}
+
+const (
+	// maxNeighborReportPayload caps the raw report stored in
+	// neighbor_reports.payload. The firmware sends at most 10 kB (#1865); a
+	// larger payload is processed but not journalled.
+	maxNeighborReportPayload = 64 << 10
+	// maxHeardSecsAgo clamps neighbors[].heard_secs_ago: older than the
+	// measured_links retention default is not a current link anyway.
+	maxHeardSecsAgo = 7 * 24 * 3600
+	// maxNeighborStatusLen caps neighbors[].status; longer values are stored
+	// as "unknown". Real values are short words such as "responded".
+	maxNeighborStatusLen = 32
+)
+
+const (
+	// reporterLogLimiterCap bounds the reporters remembered for log
+	// throttling; reporterLogInterval is how long one is remembered.
+	reporterLogLimiterCap = 1024
+	reporterLogInterval   = time.Hour
+)
+
+// reporterLogLimiter allows one log line per reporter per
+// reporterLogInterval, so a publisher repeating a bad report cannot fill the
+// log. The zero value is ready to use.
+type reporterLogLimiter struct {
+	mu   sync.Mutex
+	now  func() time.Time // nil: time.Now
+	seen map[string]time.Time
+}
+
+// allow reports whether a line for reporter may be logged now. Entries older
+// than the interval are evicted when the map is full; when it is still full,
+// nothing is logged (the caller still counts the event).
+func (l *reporterLogLimiter) allow(reporter string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if l.now != nil {
+		now = l.now()
+	}
+	if l.seen == nil {
+		l.seen = make(map[string]time.Time)
+	}
+	if at, ok := l.seen[reporter]; ok && now.Sub(at) < reporterLogInterval {
+		return false
+	}
+	if _, ok := l.seen[reporter]; !ok && len(l.seen) >= reporterLogLimiterCap {
+		for k, at := range l.seen {
+			if now.Sub(at) >= reporterLogInterval {
+				delete(l.seen, k)
+			}
+		}
+		if len(l.seen) >= reporterLogLimiterCap {
+			return false
+		}
+	}
+	l.seen[reporter] = now
+	return true
 }
