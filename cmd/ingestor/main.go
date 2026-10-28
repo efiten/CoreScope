@@ -115,6 +115,11 @@ func main() {
 		store.linkedCompanions = lc
 		go lc.refreshLoop()
 	}
+	// Verified /neighbors reports (#1865): always on; without users.db or
+	// observer bindings every report is simply unverified.
+	store.confirmedObservers = newConfirmedObserverSet(cfg.UsersDBPath())
+	store.confirmedObservers.refresh()
+	go store.confirmedObservers.refreshLoop()
 
 	regionSet := newRegionKeySet(cfg)
 	if cfg.AutoRegionKeysEnabled() {
@@ -642,6 +647,33 @@ func main() {
 		log.Printf("[neighbor-prune] auto-prune enabled: edges older than %d days", nDays)
 	}
 
+	// Daily neighbor_reports + measured_links retention (#1865).
+	{
+		reportDays := cfg.NeighborReportsDaysOrDefault()
+		linkDays := cfg.MeasuredLinkDaysOrDefault()
+		prune := func() {
+			if n, err := store.PruneNeighborReports(reportDays); err != nil {
+				log.Printf("[neighbor-reports-prune] error: %v", err)
+			} else if n > 0 {
+				log.Printf("[neighbor-reports-prune] pruned %d reports older than %d days", n, reportDays)
+			}
+			if n, err := store.PruneMeasuredLinks(linkDays); err != nil {
+				log.Printf("[measured-links-prune] error: %v", err)
+			} else if n > 0 {
+				log.Printf("[measured-links-prune] pruned %d links older than %d days", n, linkDays)
+			}
+		}
+		ticker := time.NewTicker(24 * time.Hour)
+		go func() {
+			time.Sleep(5 * time.Minute) // stagger
+			prune()
+			for range ticker.C {
+				prune()
+			}
+		}()
+		log.Printf("[neighbor-reports-prune] auto-prune enabled: reports older than %d days, measured links older than %d days", reportDays, linkDays)
+	}
+
 	// Periodic stats logging (every 5 minutes)
 	statsTicker := time.NewTicker(5 * time.Minute)
 	go func() {
@@ -997,7 +1029,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// metadata (region-independent), so the per-source packet IATA filter below
 	// does not apply.
 	if len(parts) >= 4 && parts[3] == "neighbors" {
-		handleNeighborsReport(store, tag, parts[2], msg)
+		handleNeighborsReport(store, tag, parts[2], msg, m.Payload())
 		return
 	}
 
@@ -1973,11 +2005,24 @@ func init() {
 // by ordering, so absent != gone). Report pubkeys are uppercase; nodes.public_key
 // is lowercase hex, so keys are lowercased before the UPDATE. Unknown neighbors
 // are a no-op (the UPDATE matches no row) until a later advert creates the node.
-func handleNeighborsReport(store *Store, tag string, observerID string, msg map[string]interface{}) {
+//
+// Every report is also journalled in neighbor_reports and each listed
+// neighbour upserted into measured_links (recordNeighborLinks). A report whose
+// origin_id names another node than the topic is dropped before any write.
+func handleNeighborsReport(store *Store, tag string, observerID string, msg map[string]interface{}, raw []byte) {
 	reportedAt, _ := msg["timestamp"].(string)
 
 	// self: the observer's own configured scopes.
 	originID, _ := msg["origin_id"].(string)
+	if originID != "" && !strings.EqualFold(originID, observerID) {
+		store.Stats.NeighborsOriginMismatch.Add(1)
+		if store.neighborsMismatchLog.allow(observerID) {
+			log.Printf("MQTT [%s] neighbors report dropped: origin_id %.8s does not match topic %.8s (logged once per hour per reporter)",
+				tag, sanitizeLogString(originID), sanitizeLogString(observerID))
+		}
+		return
+	}
+	recordNeighborLinks(store, tag, observerID, msg, raw)
 	if originID == "" {
 		originID = observerID
 	}
@@ -2016,6 +2061,104 @@ func handleNeighborsReport(store *Store, tag string, observerID string, msg map[
 			log.Printf("MQTT [%s] neighbors scope error for %.8s: %v", tag, pubkey, err)
 		}
 	}
+}
+
+// recordNeighborLinks journals a /neighbors report and upserts one
+// measured_links row per listed neighbour (#1865,
+// docs/superpowers/specs/2026-10-28-measured-neighbour-links-design.md). The
+// reporter is the topic pubkey, which handleNeighborsReport has already
+// matched against origin_id. A neighbour missing from the report keeps its
+// link: links expire by age (PruneMeasuredLinks), never by omission.
+func recordNeighborLinks(store *Store, tag, observerID string, msg map[string]interface{}, raw []byte) {
+	reporter := strings.ToLower(observerID)
+	if !targetPubkeyRe.MatchString(reporter) {
+		return
+	}
+	now := reportNow().UTC()
+	ts, _ := msg["timestamp"].(string)
+	reportedAt := normalizeReportTS(ts)
+	if reportTooFarInFuture(reportedAt) {
+		return
+	}
+	if reportedAt == "" {
+		reportedAt = now.Format(time.RFC3339)
+	}
+	reportTime, _ := time.Parse(time.RFC3339, reportedAt)
+	verified := store.confirmedObservers != nil && store.confirmedObservers.Has(reporter)
+
+	r := NeighborReport{
+		Reporter:   reporter,
+		ReceivedAt: now.Format(time.RFC3339),
+		ReportedAt: reportedAt,
+		Verified:   verified,
+		Total:      reportCount(msg["total_neighbors"]),
+		Queried:    reportCount(msg["queried_neighbors"]),
+	}
+	if b, ok := msg["truncated"].(bool); ok {
+		r.Truncated = &b
+	}
+	if self, ok := msg["self"].(map[string]interface{}); ok {
+		if sc, ok := self["default_scope"].(string); ok && len(sc) <= maxConfiguredScopeLen {
+			r.DefaultScope = &sc
+		}
+	}
+	if len(raw) <= maxNeighborReportPayload {
+		r.Payload = string(raw)
+	}
+	if err := store.InsertNeighborReport(r); err != nil {
+		log.Printf("MQTT [%s] neighbors report insert error for %.8s: %v", tag, reporter, err)
+	}
+
+	neighbors, _ := msg["neighbors"].([]interface{})
+	for _, item := range neighbors {
+		n, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		pubkey, _ := n["pubkey"].(string)
+		pubkey = strings.ToLower(pubkey)
+		if !targetPubkeyRe.MatchString(pubkey) {
+			continue
+		}
+		ago, ok := n["heard_secs_ago"].(float64)
+		if !ok {
+			continue
+		}
+		ago = math.Max(0, math.Min(ago, maxHeardSecsAgo))
+		l := MeasuredLink{
+			Reporter:   reporter,
+			Neighbor:   pubkey,
+			HeardAt:    reportTime.Add(-time.Duration(ago) * time.Second).Format(time.RFC3339),
+			ReportedAt: reportedAt,
+			Verified:   verified,
+			Status:     "unknown",
+		}
+		if snr, ok := n["snr"].(float64); ok {
+			l.SNR = &snr
+		}
+		if st, ok := n["status"].(string); ok && st != "" && len(st) <= maxNeighborStatusLen {
+			l.Status = st
+		}
+		if err := store.UpsertMeasuredLink(l); err != nil {
+			log.Printf("MQTT [%s] measured link error %.8s -> %.8s: %v", tag, reporter, pubkey, err)
+		}
+	}
+
+	if r.DefaultScope != nil {
+		if err := store.UpdateNodeDefaultFloodScope(reporter, *r.DefaultScope, reportedAt); err != nil {
+			log.Printf("MQTT [%s] neighbors default flood scope error for %.8s: %v", tag, reporter, err)
+		}
+	}
+}
+
+// reportCount returns a non-negative whole JSON number as an int, else nil.
+func reportCount(v interface{}) *int {
+	f, ok := v.(float64)
+	if !ok || f < 0 || f > math.MaxInt32 || f != math.Trunc(f) {
+		return nil
+	}
+	n := int(f)
+	return &n
 }
 
 // shouldUpdateDefaultScope returns true when the packet carries a transport
