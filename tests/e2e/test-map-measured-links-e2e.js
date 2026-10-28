@@ -16,12 +16,14 @@ const NODES = [
   { public_key: pk('a'), name: 'Node-A', role: 'repeater', lat: 50.80, lon: 4.30 },
   { public_key: pk('b'), name: 'Node-B', role: 'repeater', lat: 50.85, lon: 4.40 },
   { public_key: pk('c'), name: 'Node-C<i>', role: 'repeater', lat: 50.90, lon: 4.35 },
-  { public_key: pk('d'), name: 'Node-D', role: 'repeater', lat: 50.75, lon: 4.45 },
+  { public_key: pk('e'), name: 'Node-E', role: 'repeater', lat: 50.70, lon: 4.25 },
+  { public_key: pk('d'), name: 'Node-D', role: 'companion', lat: 50.75, lon: 4.45 },
 ].map((n) => Object.assign({ last_seen: new Date().toISOString(), advert_count: 1 }, n));
 const LINKS = { links: [
   { a: pk('a'), b: pk('b'), snrAB: 8, snrBA: 6.5, verified: true, ageSec: 120 },
   { a: pk('a'), b: pk('c'), snrAB: null, snrBA: -2, verified: true, ageSec: 3700 },
   { a: pk('b'), b: pk('d'), snrAB: -9, snrBA: 1, verified: false, ageSec: 90000 },
+  { a: pk('a'), b: pk('e'), snrAB: null, snrBA: null, verified: true, ageSec: 30 },
 ] };
 
 const results = [];
@@ -44,7 +46,7 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
     r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(LINKS) });
   });
   await page.route(/\/api\/nodes\?/, (r) => r.fulfill({ status: 200, contentType: 'application/json',
-    body: JSON.stringify({ nodes: NODES, total: NODES.length, has_more: false, counts: { repeaters: 4, rooms: 0, companions: 0, sensors: 0 } }) }));
+    body: JSON.stringify({ nodes: NODES, total: NODES.length, has_more: false, counts: { repeaters: 4, rooms: 0, companions: 1, sensors: 0 } }) }));
 
   const paths = 'path.ml-link';
   const hash = () => page.evaluate(() => location.hash);
@@ -66,9 +68,9 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
     assert(linkFetches === 0, 'fetched ' + linkFetches);
   });
 
-  await test('toggle on draws three paths, sets links=1 in the hash, fetches once', async () => {
+  await test('toggle on draws four paths, sets links=1 in the hash, fetches once', async () => {
     await page.locator('#mcLinks').check();
-    await waitPaths(3);
+    await waitPaths(4);
     assert((await hash()).includes('links=1'), 'hash ' + (await hash()));
     assert(linkFetches === 1, 'fetches ' + linkFetches);
   });
@@ -76,14 +78,14 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
   await test('colour classes follow the weaker SNR', async () => {
     const cls = await classes();
     const has = (c) => cls.filter((x) => x.includes(c)).length;
-    assert(has('ml-good') === 1 && has('ml-fair') === 1 && has('ml-poor') === 1, JSON.stringify(cls));
+    assert(has('ml-good') === 1 && has('ml-fair') === 1 && has('ml-poor') === 2, JSON.stringify(cls));
   });
 
-  await test('two paths are dashed: one-way and unverified', async () => {
+  await test('three paths are dashed: one-way, unverified and no SNR', async () => {
     const cls = await classes();
-    assert(cls.filter((x) => x.includes('ml-dashed')).length === 2, JSON.stringify(cls));
+    assert(cls.filter((x) => x.includes('ml-dashed')).length === 3, JSON.stringify(cls));
     const dashes = await page.locator(paths).evaluateAll((els) => els.map((e) => getComputedStyle(e).strokeDasharray));
-    assert(dashes.filter((d) => d && d !== 'none').length === 2, dashes.join(' | '));
+    assert(dashes.filter((d) => d && d !== 'none').length === 3, dashes.join(' | '));
   });
 
   await test('stroke colour comes from the CSS variable', async () => {
@@ -104,10 +106,29 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
     assert(/1 h/.test(t), 'age: ' + t);
   });
 
+  await test('a pair with no SNR is poor and dashed, popup says No SNR', async () => {
+    const cls = await classes();
+    const both = cls.filter((x) => x.includes('ml-poor') && x.includes('ml-dashed'));
+    assert(both.length === 2, JSON.stringify(cls));
+    const idx = cls.findIndex((x, i) => x.includes('ml-poor') && i === 3);
+    await page.locator(paths).nth(3).dispatchEvent('click');
+    await page.waitForFunction(() => /No SNR/.test((document.querySelector('.leaflet-popup-content') || {}).innerText || ''), null, { timeout: 5000 });
+    assert(idx === 3, 'order');
+  });
+
+  await test('filtering a role out removes the pair to that node, with no refetch', async () => {
+    const before = linkFetches;
+    await page.locator('input[data-role="companion"]').uncheck();
+    await waitPaths(3);
+    assert(linkFetches === before, 'refetched');
+    await page.locator('input[data-role="companion"]').check();
+    await waitPaths(4);
+  });
+
   await test('reload with the hash restores the layer', async () => {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await waitMap();
-    await waitPaths(3);
+    await waitPaths(4);
     assert(await page.locator('#mcLinks').isChecked(), 'checkbox');
   });
 
@@ -120,7 +141,7 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
   await test('toggling on again reuses the cached response', async () => {
     const before = linkFetches;
     await page.locator('#mcLinks').check();
-    await waitPaths(3);
+    await waitPaths(4);
     assert(linkFetches === before, 'refetched');
   });
 
