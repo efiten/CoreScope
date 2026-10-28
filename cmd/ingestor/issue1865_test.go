@@ -71,7 +71,7 @@ func TestHandleNeighborsReportWritesSelfAndResponded(t *testing.T) {
 			map[string]interface{}{"pubkey": respUpper, "scopes": "de,eu", "status": "responded"},
 		},
 	}
-	handleNeighborsReport(store, "test", "obs-topic-id", report)
+	handleNeighborsReport(store, "test", originUpper, report, nil)
 
 	// self scopes written under the lowercased origin_id.
 	if sc, _ := configuredScope(t, store, originLower); !sc.Valid || sc.String != "*" {
@@ -96,7 +96,7 @@ func TestHandleNeighborsReportUnknownNeighborIsNoop(t *testing.T) {
 			map[string]interface{}{"pubkey": "aa" + "00000000000000000000000000000000000000000000000000000000000000"[2:], "scopes": "de", "status": "responded"},
 		},
 	}
-	handleNeighborsReport(store, "test", "obs", report)
+	handleNeighborsReport(store, "test", "obs", report, nil)
 	var n int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&n); err != nil {
 		t.Fatal(err)
@@ -117,7 +117,7 @@ func TestHandleNeighborsReportRespondedEmptyScopeIsStored(t *testing.T) {
 			map[string]interface{}{"pubkey": pk, "scopes": "", "status": "responded"},
 		},
 	}
-	handleNeighborsReport(store, "test", "obs", report)
+	handleNeighborsReport(store, "test", "obs", report, nil)
 	sc, at := configuredScope(t, store, pk)
 	if !sc.Valid || sc.String != "" {
 		t.Errorf("responded-empty configured_scope = %v, want stored empty string", sc)

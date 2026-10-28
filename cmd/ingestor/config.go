@@ -279,6 +279,30 @@ type RetentionConfig struct {
 	// trigger on every observation insert. Reach windows longer than this fall
 	// back to the substring scan.
 	HopIndexDays int `json:"hopIndexDays"`
+	// NeighborReportsDays is the retention window (by received_at) for the
+	// neighbor_reports journal of observer /neighbors reports (#1865).
+	// 0 or unset = default 90.
+	NeighborReportsDays int `json:"neighborReportsDays"`
+	// MeasuredLinkDays is the retention window (by reported_at) for
+	// measured_links: a link no report has mentioned for this long is gone.
+	// 0 or unset = default 7.
+	MeasuredLinkDays int `json:"measuredLinkDays"`
+}
+
+// NeighborReportsDaysOrDefault returns retention.neighborReportsDays or 90.
+func (c *Config) NeighborReportsDaysOrDefault() int {
+	if c.Retention != nil && c.Retention.NeighborReportsDays > 0 {
+		return c.Retention.NeighborReportsDays
+	}
+	return 90
+}
+
+// MeasuredLinkDaysOrDefault returns retention.measuredLinkDays or 7.
+func (c *Config) MeasuredLinkDaysOrDefault() int {
+	if c.Retention != nil && c.Retention.MeasuredLinkDays > 0 {
+		return c.Retention.MeasuredLinkDays
+	}
+	return 7
 }
 
 // HopIndexDaysOrZero returns retention.hopIndexDays, or 0 (off) when unset.

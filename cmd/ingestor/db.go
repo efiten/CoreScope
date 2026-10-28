@@ -31,6 +31,9 @@ type DBStats struct {
 	// ClientUnlinkedDropped counts meshcore/client/<pubkey>/... messages
 	// dropped by the linked-only filter (clientRxCoverage.requireLinkedCompanion).
 	ClientUnlinkedDropped atomic.Int64
+	// NeighborsOriginMismatch counts /neighbors reports dropped because
+	// origin_id differs from the topic pubkey (#1865).
+	NeighborsOriginMismatch atomic.Int64
 	// RelayTouches counts nodes.last_seen refreshes driven by relay
 	// participation rather than an ADVERT (#1598).
 	RelayTouches atomic.Int64
@@ -80,6 +83,11 @@ type Store struct {
 	// linkedCompanions is the linked-only ingest filter
 	// (linked_companions.go); nil means off.
 	linkedCompanions *linkedCompanionSet
+	// confirmedObservers marks /neighbors reports verified
+	// (confirmed_observers.go); nil means none is.
+	confirmedObservers *usersKeySet
+	// neighborsMismatchLog throttles the origin_id mismatch log line.
+	neighborsMismatchLog reporterLogLimiter
 
 	stmtGetTxByHash            *sql.Stmt
 	stmtInsertTransmission     *sql.Stmt
@@ -2506,6 +2514,110 @@ func (s *Store) UpdateNodeConfiguredScope(pubkey, scope, reportedAt string) erro
 		`UPDATE inactive_nodes SET configured_scope = ?, configured_scope_at = ? WHERE public_key = ?`,
 		scope, reportedAt, pubkey)
 	return err
+}
+
+// NeighborReport is one observer /neighbors report as journalled in
+// neighbor_reports (#1865). Times are canonical UTC RFC3339.
+type NeighborReport struct {
+	Reporter     string
+	ReceivedAt   string
+	ReportedAt   string
+	Verified     bool
+	Total        *int
+	Queried      *int
+	Truncated    *bool
+	DefaultScope *string
+	Payload      string
+}
+
+// InsertNeighborReport journals one report.
+func (s *Store) InsertNeighborReport(r NeighborReport) error {
+	_, err := s.db.Exec(`INSERT INTO neighbor_reports
+		(reporter, received_at, reported_at, verified, total, queried, truncated, default_scope, payload)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.Reporter, r.ReceivedAt, r.ReportedAt, r.Verified, r.Total, r.Queried, r.Truncated, r.DefaultScope, r.Payload)
+	return err
+}
+
+// MeasuredLink is one directed link: Reporter hears Neighbor at SNR (dB),
+// last at HeardAt, according to the report of ReportedAt.
+type MeasuredLink struct {
+	Reporter   string
+	Neighbor   string
+	SNR        *float64
+	HeardAt    string
+	ReportedAt string
+	Verified   bool
+	Status     string
+}
+
+// UpsertMeasuredLink stores the latest measurement of a link. An older report
+// arriving late does not overwrite a newer one; an equal reported_at does.
+func (s *Store) UpsertMeasuredLink(l MeasuredLink) error {
+	_, err := s.db.Exec(`INSERT INTO measured_links
+		(reporter, neighbor, snr, heard_at, reported_at, verified, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(reporter, neighbor) DO UPDATE SET
+			snr = excluded.snr, heard_at = excluded.heard_at, reported_at = excluded.reported_at,
+			verified = excluded.verified, status = excluded.status
+		WHERE excluded.reported_at >= measured_links.reported_at`,
+		l.Reporter, l.Neighbor, l.SNR, l.HeardAt, l.ReportedAt, l.Verified, l.Status)
+	return err
+}
+
+// UpdateNodeDefaultFloodScope records the scope a node puts on its own
+// outgoing floods, from self.default_scope of its /neighbors report ("*" is
+// unscoped). Last-write-wins on default_flood_scope_at, like
+// UpdateNodeConfiguredScope, mirrored to inactive_nodes. Unknown nodes are a
+// no-op.
+func (s *Store) UpdateNodeDefaultFloodScope(pubkey, scope, reportedAt string) error {
+	if pubkey == "" || len(scope) > maxConfiguredScopeLen {
+		return nil
+	}
+	reportedAt = normalizeReportTS(reportedAt)
+	if reportTooFarInFuture(reportedAt) {
+		return nil
+	}
+	if reportedAt != "" {
+		var curAt sql.NullString
+		row := s.db.QueryRow(`SELECT default_flood_scope_at FROM nodes WHERE public_key = ?`, pubkey)
+		if row.Scan(&curAt) == nil && curAt.Valid && curAt.String != "" && curAt.String >= reportedAt {
+			return nil
+		}
+	}
+	if _, err := s.db.Exec(
+		`UPDATE nodes SET default_flood_scope = ?, default_flood_scope_at = ? WHERE public_key = ?`,
+		scope, reportedAt, pubkey); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(
+		`UPDATE inactive_nodes SET default_flood_scope = ?, default_flood_scope_at = ? WHERE public_key = ?`,
+		scope, reportedAt, pubkey)
+	return err
+}
+
+// PruneNeighborReports deletes journalled reports received more than days
+// ago; days <= 0 keeps everything.
+func (s *Store) PruneNeighborReports(days int) (int64, error) {
+	return s.pruneBefore(`DELETE FROM neighbor_reports WHERE received_at < ?`, days)
+}
+
+// PruneMeasuredLinks deletes links whose latest report is more than days
+// old: links expire by age, never by omission from a report.
+func (s *Store) PruneMeasuredLinks(days int) (int64, error) {
+	return s.pruneBefore(`DELETE FROM measured_links WHERE reported_at < ?`, days)
+}
+
+func (s *Store) pruneBefore(stmt string, days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
+	res, err := s.db.Exec(stmt, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // RecordNaiveSkew is called when resolveRxTime() clamps a packet's envelope
