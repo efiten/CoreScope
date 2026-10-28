@@ -184,6 +184,8 @@ func AssertReady(ro *sql.DB) error {
 	mustCol("inactive_nodes", "configured_scope")
 	mustCol("nodes", "default_flood_scope")
 	mustCol("inactive_nodes", "default_flood_scope")
+	mustCol("nodes", "default_flood_scope_at")
+	mustCol("inactive_nodes", "default_flood_scope_at")
 	mustTable("neighbor_reports")
 	mustTable("measured_links")
 	mustCol("observations", "raw_hex")
