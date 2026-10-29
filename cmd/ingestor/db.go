@@ -2417,8 +2417,9 @@ func (s *Store) UpdateNodeDefaultScope(pubkey, scope string) error {
 
 // normalizeReportTS parses an observer report timestamp and returns it in
 // canonical UTC RFC3339 form ("2006-01-02T15:04:05Z"). It accepts both the
-// firmware's fractional/offset form (e.g. "2026-07-26T09:43:48.000000+00:00")
-// and plain "Z"/offset variants. An empty or unparseable input returns "" so
+// firmware's fractional/offset form (e.g. "2026-07-26T09:43:48.000000+00:00"),
+// plain "Z"/offset variants and the naive form without a zone (#1478), read as
+// UTC like parseEnvelopeTime does. An empty or unparseable input returns "" so
 // the caller writes an empty configured_scope_at and skips the ordering guard;
 // this keeps every stored timestamp either canonical or empty, never a mix of
 // offset/precision formats that would break lexicographic last-write-wins.
@@ -2426,12 +2427,11 @@ func normalizeReportTS(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
-		if t, err := time.Parse(layout, raw); err == nil {
-			return t.UTC().Format(time.RFC3339)
-		}
+	t, _, err := parseEnvelopeTime(raw)
+	if err != nil {
+		return ""
 	}
-	return ""
+	return t.UTC().Format(time.RFC3339)
 }
 
 // normalizeScopeList canonicalises the comma-separated region-scope string an

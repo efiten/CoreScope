@@ -763,6 +763,22 @@ func TestNeighborsReportFractionalOffsetTimestamp(t *testing.T) {
 	}
 }
 
+// A naive timestamp (no zone, #1478) is read as UTC, the same way
+// parseEnvelopeTime reads it for status liveness and the observer report.
+func TestNeighborsReportNaiveTimestamp(t *testing.T) {
+	fixReportNow(t, nrNow)
+	store := openNeighborsStore(t)
+	ingestReport(t, store, nrOriginUpper, `{"timestamp":"2026-07-26T08:00:00.123456","origin_id":"`+nrOriginUpper+`","neighbors":[
+		{"pubkey":"`+nrNbA+`","snr":1,"heard_secs_ago":0,"status":"timeout"}]}`)
+	got, ok := readLink(t, store, nrOrigin, nrNbA)
+	if !ok {
+		t.Fatal("naive timestamp: no measured link written")
+	}
+	if got.reportedAt != "2026-07-26T08:00:00Z" {
+		t.Errorf("link reported_at = %q, want 2026-07-26T08:00:00Z", got.reportedAt)
+	}
+}
+
 func TestConfirmedObserverSetMissingDB(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "users.db")
 	s := newConfirmedObserverSet(path)
