@@ -4125,6 +4125,7 @@ function makeNodesSandbox(opts) {
   ctx.debouncedOnWS = (fn) => fn;
   ctx.invalidateApiCache = () => {};
   ctx.favStar = () => '';
+  ctx.locodeAttr = () => '';
   ctx.bindFavStars = () => {};
   if (opts.liveGetFavorites) {
     ctx.getFavorites = () => {
