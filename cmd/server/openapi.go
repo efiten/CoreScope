@@ -55,6 +55,10 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/perf":        {Summary: "Performance statistics", Description: "Returns per-endpoint request timing and slow query log.", Tag: "admin"},
 		"GET /api/mqtt/status": {Summary: "MQTT source status", Description: "Returns per-MQTT-source connection state and counters (lastConnectUnix, lastPacketUnix, packetsTotal, etc.). Broker URL passwords are masked. Sourced from the ingestor stats file; empty list when unavailable. (#1043)", Tag: "admin"},
 		"POST /api/perf/reset": {Summary: "Reset performance stats", Tag: "admin", Auth: true, Session: true},
+
+		"GET /api/perf/io":            {Summary: "Process disk I/O rates", Description: "Per-second server disk I/O rates from /proc/self/io (Linux): read/write/cancelled-write bytes and read/write syscall rates. The first server sample has zero rates. Includes an ingestor object when a usable, recent ingestor I/O sample is available; omits it when unavailable.", Tag: "admin"},
+		"GET /api/perf/sqlite":        {Summary: "SQLite diagnostic metrics", Description: "Returns SQLite WAL sizes (walSize in bytes; walSizeMB in MiB), pageCount, pageSize and cacheSize. cacheHitRate is the PacketStore row-cache hit ratio, not a SQLite cache counter. Unavailable database/WAL measurements remain zero; failures reading these diagnostics do not change the 200 status.", Tag: "admin"},
+		"GET /api/perf/write-sources": {Summary: "Ingestor write counters", Description: "Returns ingestor write counters under sources and the published timestamp as sampleAt. Backfill counters use backfill_ prefixes. Successfully decoded stats also include writer_perf (empty when no writer metrics were published). An unreadable or malformed stats file returns 200 with empty sources, an empty sampleAt and no writer_perf. No freshness check is applied to the published timestamp.", Tag: "admin"},
 		// "POST /api/admin/prune" removed in #1283 (ingestor owns prune).
 		"GET /api/debug/affinity": {Summary: "Debug neighbor affinity scores", Tag: "admin", Auth: true, Session: true},
 		"GET /api/backup":         {Summary: "Download SQLite backup", Description: "Streams a consistent SQLite snapshot of the analyzer DB (VACUUM INTO). Response is application/octet-stream with attachment filename corescope-backup-<unix>.db.", Tag: "admin", Auth: true, Session: true},
@@ -125,15 +129,24 @@ func routeDescriptions() map[string]routeMeta {
 		// Packets
 		"GET /api/packets": {Summary: "List packets", Description: "Returns decoded packets with filtering, sorting, and pagination.", Tag: "packets",
 			QueryParams: []paramMeta{
-				{Name: "limit", Description: "Max packets to return", Type: "integer"},
-				{Name: "offset", Description: "Pagination offset", Type: "integer"},
-				{Name: "sort", Description: "Sort field", Type: "string"},
-				{Name: "order", Description: "Sort order (asc/desc)", Type: "string"},
-				{Name: "type", Description: "Filter by packet type", Type: "string"},
-				{Name: "observer", Description: "Filter by observer ID", Type: "string"},
-				{Name: "timeRange", Description: "Time range filter (e.g. 1h, 24h, 7d)", Type: "string"},
-				{Name: "search", Description: "Full-text search", Type: "string"},
-				{Name: "groupByHash", Description: "Group duplicate packets by hash", Type: "boolean"},
+				{Name: "limit", Description: "Maximum transmissions per page. Defaults to 50 for omitted, invalid or non-positive values. Positive values are capped by listLimits.packetsMax (10000 by default).", Type: "integer"},
+				{Name: "offset", Description: "Pagination offset. Defaults to 0 when omitted or invalid; use a non-negative integer.", Type: "integer"},
+				{Name: "order", Description: "Sort by ingest ID: asc selects ascending; any other value selects descending. Defaults to desc. Ignored when groupByHash=true.", Type: "string"},
+				{Name: "type", Description: "Filter by numeric payload_type value.", Type: "integer"},
+				{Name: "route", Description: "Filter by numeric route_type value.", Type: "integer"},
+				{Name: "observer", Description: "Comma-separated observer IDs; matches transmissions heard by any listed observer. Whitespace around IDs is trimmed.", Type: "string"},
+				{Name: "excludeTx", Description: "Set exactly true to require an observation whose direction is not tx, from one of the selected observer IDs when observer is set, otherwise from any observer. Missing/empty directions remain eligible. Filters transmission membership only; displayed direction and signal values still come from the representative observation. Defaults to false; ignored in multi-node mode.", Type: "boolean"},
+				{Name: "radio", Description: "Only packets some observer heard on this radio setting, \"MHz,kHz,SF,CR\" (e.g. 869.618,62.5,8,8). Resolved from each observer's radio history at the time of the observation (#1869); every observation and packet (grouped rows: their header observation) carries the resolved value as radio. Combined with observer, only those observers' observations count. Served from the in-memory window only: a since/until before it does not fall back to SQL for a radio query.", Type: "string"},
+				{Name: "hash", Description: "Exact transmission hash, with input lowercased before matching. This is not a prefix search.", Type: "string"},
+				{Name: "since", Description: "Lower time bound; RFC3339 recommended. In-memory lists require first_seen > since; SQL uses observations >= since for RFC3339 values, otherwise first_seen > since. Multi-node mode uses first_seen >= since. Omit for no lower bound.", Type: "string"},
+				{Name: "until", Description: "Upper time bound; RFC3339 recommended. In-memory lists require first_seen < until; SQL uses observations <= until for RFC3339 values, otherwise first_seen < until. Multi-node mode uses first_seen <= until. Omit for no upper bound.", Type: "string"},
+				{Name: "region", Description: "Filter by the receiving observer's IATA region code.", Type: "string"},
+				{Name: "node", Description: "Filter by node public key or exact name. SQL fallback matches the originating node; cached results can also include indexed relay involvement.", Type: "string"},
+				{Name: "nodes", Description: "Comma-separated node public keys or exact names, up to 50 non-empty entries after trimming whitespace. Selects multi-node mode: only limit, offset, order, since and until also apply; other packet filters and modes are ignored. More than 50 entries returns 400.", Type: "string"},
+				{Name: "channel", Description: "Exact channel identifier: a decoded channel name (for example #test) or enc_<HEX> for an encrypted channel hash.", Type: "string"},
+				{Name: "area", Description: "Configured area key, filtering cached packets by the decoded originator's GPS position. The filter is ignored for unknown areas, areas with no located nodes, and SQL queries.", Type: "string"},
+				{Name: "expand", Description: "Set to observations to include observation details in in-memory, ungrouped results. Otherwise omitted; ignored in SQL queries, multi-node mode and grouped results.", Type: "string"},
+				{Name: "groupByHash", Description: "Set exactly true to return one summary per transmission hash, ordered by latest observation descending; order and expand are ignored. Defaults to false.", Type: "boolean"},
 			}},
 		"GET /api/packets/{id}":          {Summary: "Get packet detail", Tag: "packets"},
 		"GET /api/packets/timestamps":    {Summary: "Get packet timestamp ranges", Tag: "packets"},
@@ -149,6 +162,16 @@ func routeDescriptions() map[string]routeMeta {
 				{Name: "role", Description: "Filter by node role", Type: "string"},
 				{Name: "status", Description: "Filter by status (active/stale/offline)", Type: "string"},
 			}},
+		"GET /api/nodes/resolve": {
+			Summary: "Resolve a node prefix", Tag: "nodes", Response: schemaRef("NodeResolveResponse"),
+			Description: "Resolves against nodes and eligible client_node_names entries (reported nodes heard directly), counting distinct public keys across both sources. A unique visible match includes pubkey and a non-empty name when available. No match, or a unique blacklisted or hidden-name match, returns only prefix and ambiguous=false. Multiple candidates return ambiguous=true without pubkey/name. Errors use text/plain: 400 (prefix must be hex / prefix must be at least 4 hex chars), 503 (unavailable database), or 500 (query failed).",
+			QueryParams: []paramMeta{{Name: "prefix", Type: "string", Required: true, Description: "Hex prefix or full public key, 4 to 64 characters after trimming whitespace and lowercasing. Odd lengths are accepted. Missing, empty, non-hex, shorter or longer values return 400."}},
+		},
+		"GET /api/nodes/{pubkey}/battery": {
+			Summary: "Get node battery history", Tag: "nodes", Response: schemaRef("NodeBatteryResponse"),
+			Description: "Battery voltage history from observer_metrics for the exact stored pubkey. The node lookup does not normalize case or validate hex; unknown keys return 404. Observer IDs are matched in lowercase or uppercase. Samples with non-null battery_mv in the lookback window are sorted oldest first. With no samples, samples is [], latest_mv and latest_ts are null, and status is unknown. Errors use application/json objects with an error string: 404 (node not found), or 500 for node/history database query failures.",
+			QueryParams: []paramMeta{{Name: "days", Type: "integer", Description: "Lookback in whole days, 1 through 365. Defaults to 7 when omitted, invalid, non-positive or above 365; values are not clamped."}},
+		},
 		"GET /api/nodes/search":             {Summary: "Search nodes", Description: "Search nodes by name or public key prefix.", Tag: "nodes", QueryParams: []paramMeta{{Name: "q", Description: "Search query", Type: "string", Required: true}}},
 		"GET /api/nodes/reported":           {Summary: "Repeaters known only from their reported name", Description: "Repeaters that told a mobile companion their own name (client_node_names, ANON_REQ_TYPE_OWNER) have no row in nodes or inactive_nodes, and were heard directly at least once (a discover or advert reception). 404 when clientRxCoverage is disabled. Each carries its reception counts and, when companions heard it directly from at least `method.min_spots` spots at least `method.min_spread_m` apart, an `estimate`: a SNR-weighted centroid of those spots with `radius_m` (never below `method.min_radius_m`). The estimate is where companions stood, weighted, not a measured position. Cached for 5 minutes.", Tag: "nodes"},
 		"GET /api/nodes/declared-regions":   {Summary: "Every repeater's declared flood regions", Description: "One entry per repeater with a declared-regions answer (node_declared_regions, ANON_REQ_TYPE_REGIONS), newest answer per repeater: `regions` are the flood-allowed named regions without `#`, `wildcard` is true when the repeater also floods unscoped packets (`*`), `truncated` when the reply was cut off. The same answer as `declared_regions` on /api/nodes, in one response, for a mobile client choosing the flood scope of what it sends. Empty when this instance carries no declared source. Cached for 30 seconds.", Tag: "nodes"},
@@ -163,6 +186,10 @@ func routeDescriptions() map[string]routeMeta {
 				{Name: "days", Description: "Lookback window in days (default 7, clamped 1-365)", Type: "integer"},
 			}},
 		"GET /api/nodes/{pubkey}/neighbors": {Summary: "Get node neighbors", Description: "Returns the queried node's first-hop neighbors with affinity scores and observation metadata (count, SNR, distance, observers). Ambiguous edges carry candidate pubkeys.", Tag: "nodes", Response: schemaRef("NodeNeighborsResponse")},
+
+		"GET /api/nodes/clock-skew": {Summary: "Fleet clock-skew summaries", Description: "Returns an array of clock-skew summaries for nodes with available data, enriched with nodeName/nodeRole when known. Fleet rows omit samples, recentHashEvidence and calibrationSummary; use the single-node endpoint for that detail. Returns an empty array when no store or no clock-skew data is available.", Tag: "nodes", Response: schemaRef("FleetClockSkewResponse"),
+			QueryParams: []paramMeta{{Name: "area", Description: "Configured area key. Omit for the unfiltered fleet. Filtering applies only when the area resolves to a non-empty node set; unknown keys and empty results leave the fleet unfiltered.", Type: "string"}}},
+		"GET /api/nodes/{pubkey}/clock-skew": {Summary: "Get node clock skew", Description: "Returns clock-skew statistics and available sample/calibration evidence for the path pubkey. Returns 404 when the packet store is unavailable or the node has no clock-skew data.", Tag: "nodes"},
 
 		"GET /api/rf-noise": {Summary: "RF noise-floor hex grid", Description: "GeoJSON hex cells of the LoRa noise floor measured by mobile clients along their tracks, from client_rf_samples. Lower (more negative) dBm is quieter, the opposite direction to the SNR-coloured coverage layer. Stationary samples are excluded: a parked companion logs hundreds of samples at one point and would otherwise define the cell. Gated on clientRfSamples.", Tag: "coverage",
 			QueryParams: []paramMeta{
@@ -226,8 +253,10 @@ func routeDescriptions() map[string]routeMeta {
 		"GET /api/channels/{hash}/messages": {Summary: "Get channel messages", Description: "Returns messages for a specific channel.", Tag: "channels"},
 
 		// Observers
-		"GET /api/observers":                 {Summary: "List observers", Description: "Returns all known packet observers/gateways.", Tag: "observers"},
-		"GET /api/observers/{id}":            {Summary: "Get observer detail", Tag: "observers"},
+		"GET /api/observers":                 {Summary: "List observers", Description: "Returns all known packet observers/gateways. neighbors_report_at (when the latest /neighbors report arrived) and neighbors_count (how many neighbors it named) are present for observers that ever sent one (#2270).", Tag: "observers"},
+		"GET /api/observers/clock-skew":      {Summary: "Observer clock calibrations", Description: "Returns an array of observer clock calibrations: observerID, offsetSec (seconds; positive means the observer clock is ahead) and samples (number of multi-observer packet samples used). Returns an empty array when the store or calibration data is unavailable.", Tag: "observers", Response: schemaRef("ObserverClockSkewResponse")},
+		"GET /api/observers/{id}":            {Summary: "Get observer detail", Description: "radio_history lists every radio setting the observer reported, oldest first: {radio_id, radio, first_seen, last_seen}. radio_id is empty for the main radio and the node's own id for an entry of a multi-radio status radios map (#1869). neighbor_report is the latest /neighbors report (#2271): {received_at, reported_at, neighbor_count, queried_neighbors, self_scopes, self_default_scope, neighbors: [{pubkey, name, role, snr, heard_secs_ago, status, scopes}]}; name and role come from the node table when known. Absent when the observer never sent one.", Tag: "observers"},
+		"GET /api/radios":                    {Summary: "Radio settings heard on", Description: "Every radio setting (canonical \"MHz,kHz,SF,CR\") some observer has listened on, with those observers and the span of time, for the radio filter of /api/packets (#1869).", Tag: "observers"},
 		"GET /api/observers/{id}/metrics":    {Summary: "Get observer metrics", Description: "Packet rates, uptime, and performance metrics.", Tag: "observers"},
 		"GET /api/observers/{id}/analytics":  {Summary: "Get observer analytics", Tag: "observers"},
 		"GET /api/observers/metrics/summary": {Summary: "Observer metrics summary", Description: "Aggregate metrics across all observers within window (noise floor, battery, sparkline). Each row also carries tx_airtime_pct_1h / rx_airtime_pct_1h: the airtime share over the last hour regardless of window, null with under 30 minutes of samples since the last reboot or no sample in the last 15 minutes. duty_cycle_warn_pct is the configured warning threshold (dutyCycleWarnPct, default 10).", Tag: "observers", QueryParams: []paramMeta{{Name: "window", Description: "Lookback such as 1h, 24h, 7d (default 24h)", Type: "string"}, {Name: "region", Description: "IATA code to filter observers", Type: "string"}}},
@@ -246,6 +275,7 @@ func routeDescriptions() map[string]routeMeta {
 type openAPISchema struct {
 	Type        string                   `json:"type"`
 	Description string                   `json:"description,omitempty"`
+	Nullable    bool                     `json:"nullable,omitempty"`
 	Enum        []string                 `json:"enum,omitempty"`
 	Items       *openAPISchema           `json:"items,omitempty"`
 	Properties  map[string]openAPISchema `json:"properties,omitempty"`
@@ -279,6 +309,42 @@ func componentSchemas() map[string]interface{} {
 		return m
 	}
 	return map[string]interface{}{
+		"NodeResolveResponse": openAPISchema{
+			Type: "object", Required: []string{"prefix", "ambiguous"},
+			Properties: map[string]openAPISchema{
+				"prefix":    {Type: "string", Description: "Trimmed, lowercase query prefix."},
+				"pubkey":    {Type: "string", Description: "Present only for a unique visible match."},
+				"name":      {Type: "string", Description: "Present only when a unique visible match has a non-empty name."},
+				"ambiguous": {Type: "boolean", Description: "True when multiple distinct public keys match; pubkey and name are then omitted."},
+			},
+		},
+		"NodeBatteryResponse": openAPISchema{
+			Type: "object", Required: []string{"public_key", "days", "samples", "latest_mv", "latest_ts", "status", "thresholds"},
+			Properties: map[string]openAPISchema{
+				"public_key": {Type: "string", Description: "The requested public key, lowercased in the response."},
+				"days":       {Type: "integer", Description: "Effective lookback window in days."},
+				"samples": {Type: "array", Description: "Battery samples in timestamp order, oldest first; empty array when none are available.", Items: &openAPISchema{
+					Type: "object", Required: []string{"timestamp", "battery_mv"},
+					Properties: map[string]openAPISchema{
+						"timestamp":  {Type: "string", Description: "Stored sample timestamp."},
+						"battery_mv": {Type: "integer", Description: "Battery voltage in millivolts."},
+					},
+				}},
+				"latest_mv": {Type: "integer", Nullable: true, Description: "Newest sample voltage in millivolts, or null when the window is empty."},
+				"latest_ts": {Type: "string", Nullable: true, Description: "Newest sample timestamp, or null when the window is empty."},
+				"status":    {Type: "string", Enum: []string{"critical", "low", "ok", "unknown"}, Description: "critical below critical_mv; otherwise low below low_mv; otherwise ok. unknown when the window has no samples."},
+				"thresholds": {Type: "object", Required: []string{"low_mv", "critical_mv"}, Properties: map[string]openAPISchema{
+					"low_mv":      {Type: "integer", Description: "Configured low-battery threshold in millivolts; default 3300."},
+					"critical_mv": {Type: "integer", Description: "Configured critical-battery threshold in millivolts; default 3000."},
+				}},
+			},
+		},
+		"FleetClockSkewResponse": openAPISchema{
+			Type: "array", Items: &openAPISchema{Type: "object"},
+		},
+		"ObserverClockSkewResponse": openAPISchema{
+			Type: "array", Items: &openAPISchema{Type: "object"},
+		},
 		"Node": map[string]interface{}{
 			"type": "object",
 			// additionalProperties:true — the node object carries more fields
@@ -301,11 +367,12 @@ func componentSchemas() map[string]interface{} {
 				"flood_advert_count_7d":    map[string]interface{}{"type": "integer", "description": "Distinct FLOOD adverts originated in the last 7 days (zero-hop adverts excluded). Present on the node detail endpoint."},
 				"battery_mv":               map[string]interface{}{"type": "integer", "nullable": true},
 				"temperature_c":            map[string]interface{}{"type": "number", "nullable": true},
-				"relay_active":             map[string]interface{}{"type": "boolean", "description": "Repeater/room only: relayed traffic within the active window."},
+				"relay_active":             map[string]interface{}{"type": "boolean", "description": "Repeater/room only: attributed non-advert relay-hop appearance within the active window; may include shared prefixes. Unchanged legacy field, not certain liveness evidence."},
 				"relay_count_1h":           map[string]interface{}{"type": "integer", "description": "Repeater/room only: relay-hop appearances in the last hour."},
 				"relay_count_24h":          map[string]interface{}{"type": "integer", "description": "Repeater/room only: relay-hop appearances in the last 24 hours."},
 				"unscoped_relay_count_24h": map[string]interface{}{"type": "integer", "description": "Repeater/room only: subset of relay_count_24h that were unscoped floods (route_type FLOOD). A well-configured repeater sets flood.max.unscoped 0, so a non-trivial count flags a base-config problem."},
 				"last_relayed":             str("Repeater/room only: RFC3339 time this node last appeared as a relay hop."),
+				"last_certain_relay":       str("Repeater/room only: UTC RFC3339 timestamp of the newest valid transmission first_seen accepted as a certain relay. Requires a matching hop in that observation's eligible FLOOD/TRANSPORT_FLOOD frame, a unique prefix at that width and no retired namesake; excludes direct/TRACE paths and failed advert signatures. An originated advert alone does not count; forwarding another node's advert can count even when non-advert relay counts are zero. Uses first_seen, not a late observation's timestamp; uniqueness is checked when evidence is ingested. State is omitted when absent and cleared when the node's packet-store membership is evicted. Does not change relay_active or attributed relay counts."),
 				"declared_regions":         map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}, "description": "Repeater/room only (#1862): named regions from this node's newest declared-regions answer, spelled as GET /api/scope-audit declaredRegions spells them (leading '#' stripped, '*' wildcard excluded). Empty array: it answered and named no region. Absent: it never answered, this database has no declared-regions source, or the declared-regions lookup failed. Absence is not evidence the node lacks a region."},
 				"region_placement":         schemaRef("NodeRegionPlacement"),
 				"relay_window_hours":       map[string]interface{}{"type": "integer", "description": "Repeater/room only, /api/nodes/{pubkey} detail endpoint only: width (hours) of the relay-activity window the relay_count_* values cover."},

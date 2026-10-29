@@ -391,6 +391,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/observers/{id}/analytics", s.handleObserverAnalytics).Methods("GET")
 	r.HandleFunc("/api/observers/{id}", s.handleObserverDetail).Methods("GET")
 	r.HandleFunc("/api/observers", s.handleObservers).Methods("GET")
+	r.HandleFunc("/api/radios", s.handleRadios).Methods("GET")
 	r.HandleFunc("/api/traces/{hash}", s.handleTraces).Methods("GET")
 	r.HandleFunc("/api/paths/inspect", s.handlePathInspect).Methods("POST")
 	r.HandleFunc("/api/iata-coords", s.handleIATACoords).Methods("GET")
@@ -1178,6 +1179,7 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		Limit:              queryLimit(r, 50, s.cfg.ListLimits.PacketsMax),
 		Offset:             queryInt(r, "offset", 0),
 		Observer:           r.URL.Query().Get("observer"),
+		ExcludeTx:          r.URL.Query().Get("excludeTx") == "true",
 		Hash:               r.URL.Query().Get("hash"),
 		Since:              r.URL.Query().Get("since"),
 		Until:              r.URL.Query().Get("until"),
@@ -1185,6 +1187,7 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		Node:               r.URL.Query().Get("node"),
 		Channel:            r.URL.Query().Get("channel"),
 		Area:               r.URL.Query().Get("area"),
+		Radio:              canonicalRadio(r.URL.Query().Get("radio")),
 		Order:              "DESC",
 		ExpandObservations: r.URL.Query().Get("expand") == "observations",
 	}
@@ -1647,6 +1650,7 @@ func (s *Server) buildNodesResponse(r *http.Request) (NodeListResponse, error) {
 			}
 		}
 		heard, _ := s.store.LastHeardMap(pageKeys)
+		certainRelayed := s.store.LastCertainRelayMap(pageKeys)
 		for _, node := range nodes {
 			if pk, ok := node["public_key"].(string); ok {
 				node["last_heard"] = lastHeardValue(node["last_seen"], heard[pk])
@@ -1655,6 +1659,9 @@ func (s *Server) buildNodesResponse(r *http.Request) (NodeListResponse, error) {
 				EnrichNodeWithMultiByte(node, mbEntry)
 				node["region_placement"] = RegionPlacementFor(placements, pk)
 				if role, _ := node["role"].(string); role == "repeater" || role == "room" {
+					if at := certainRelayed[pk]; !at.IsZero() {
+						node["last_certain_relay"] = at.UTC().Format(time.RFC3339Nano)
+					}
 					info, _ := lookupRelayInfo(relayMap, pk)
 					info.WindowHours = relayWindow
 					if info.LastRelayed != "" {
@@ -1879,6 +1886,9 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 		heard, _ := s.store.LastHeardMap([]string{pubkey})
 		node["last_heard"] = lastHeardValue(node["last_seen"], heard[pubkey])
 		if role, _ := node["role"].(string); role == "repeater" || role == "room" {
+			if at := s.store.LastCertainRelayMap([]string{pubkey})[pubkey]; !at.IsZero() {
+				node["last_certain_relay"] = at.UTC().Format(time.RFC3339Nano)
+			}
 			ht := s.cfg.GetHealthThresholds()
 			info := s.store.GetRepeaterRelayInfo(pubkey, ht.RelayActiveHours)
 			if info.LastRelayed != "" {
@@ -3092,6 +3102,7 @@ func (s *Server) buildObserversDefaultResponse() (ObserverListResponse, error) {
 		observerIDs[i] = o.ID
 	}
 	nodeLocations := s.db.GetNodeLocationsByKeys(observerIDs)
+	neighborSummaries := s.db.GetObserverNeighborSummaries()
 
 	result := make([]ObserverResp, 0, len(observers))
 	nowTime := time.Now().UTC()
@@ -3124,6 +3135,10 @@ func (s *Server) buildObserversDefaultResponse() (ObserverListResponse, error) {
 			PacketsLastHour: plh,
 			Lat:             lat, Lon: lon, NodeRole: nodeRole,
 			CanRelay: o.CanRelay,
+		}
+		if ns, ok := neighborSummaries[o.ID]; ok {
+			at, count := ns.receivedAt, ns.count
+			resp.NeighborsReportAt, resp.NeighborsCount = &at, &count
 		}
 		applyObserverNaiveClock(&resp, o, nowTime)
 		result = append(result, resp)
@@ -3170,7 +3185,12 @@ func (s *Server) handleObserverDetail(w http.ResponseWriter, r *http.Request) {
 			PacketsLastHour: plh,
 			CanRelay:        obs.CanRelay,
 		}
+		if rep, err := s.db.GetObserverNeighborReport(obs.ID); err == nil && rep != nil {
+			at, count := rep.ReceivedAt, rep.NeighborCount
+			resp.NeighborsReportAt, resp.NeighborsCount, resp.NeighborReport = &at, &count, rep
+		}
 		applyObserverNaiveClock(&resp, obs, time.Now().UTC())
+		resp.RadioHistory = observerRadioStints(obs.ID)
 		return resp
 	}())
 }

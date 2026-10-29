@@ -68,6 +68,12 @@
     return status >= 200 && status < 300 ? 'draw' : 'error';
   }
 
+  // freshBody resolves to the parsed body, or to null when a newer request
+  // started while it was still arriving: coverageReply only saw the headers.
+  function freshBody(seq, latest, body) {
+    return body.then(function (fc) { return seq === latest() ? fc : null; });
+  }
+
   // authUser is the logged-in user, or null (accounts off, logged out, or
   // auth.js not loaded).
   function authUser(auth) {
@@ -294,7 +300,7 @@
         return null;
       }
       if (verdict === 'error') throw new Error('HTTP ' + r.status);
-      return r.json();
+      return freshBody(seq, function () { return drawSeq; }, r.json());
     });
   }
 
@@ -685,6 +691,6 @@
   }
 
   if (window.addEventListener) window.addEventListener('cs-auth-changed', onAuthChanged);
-  window.CSRxCoverage = { _test: { coverageUrl: coverageUrl, mineBtnHtml: mineBtnHtml, authUser: authUser, coverageReply: coverageReply, uplinkColorVar: uplinkColorVar, uplinkCellHtml: uplinkCellHtml } };
+  window.CSRxCoverage = { _test: { coverageUrl: coverageUrl, mineBtnHtml: mineBtnHtml, authUser: authUser, coverageReply: coverageReply, uplinkColorVar: uplinkColorVar, uplinkCellHtml: uplinkCellHtml, freshBody: freshBody } };
   registerPage('rx-coverage', { init: init, destroy: destroy });
 })();
