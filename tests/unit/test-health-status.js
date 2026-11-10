@@ -89,6 +89,8 @@ async function liveDetail(node, stats = {}, healthFailed = false) {
       return { node };
     },
     escapeHtml: String,
+    // fork-only: live.js tags the node name with its locode (locode.js)
+    locodeAttr: () => '',
     formatLiveTimestampHtml: (value) => Number.isNaN(value) ? '—' : String(value),
     activeNodeDetailKey: null,
   };

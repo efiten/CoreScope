@@ -15,6 +15,8 @@ const ctx = vm.createContext({
   ROLE_COLORS: {}, HEALTH_THRESHOLDS: { infraSilentMs: 3600000, nodeSilentMs: 3600000 },
   getNodeStatus() { return 'active'; }, getEffectiveHeardMs() { return NaN; },
   groupRecentAdverts() { return []; },
+  // fork-only: nodes.js tags node names with their locode (locode.js)
+  locodeAttr() { return ''; },
   api() { throw new Error('Rendering quick actions must not request data'); },
 });
 ctx.window = ctx;
