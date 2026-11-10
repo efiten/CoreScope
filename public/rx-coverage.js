@@ -196,10 +196,18 @@
   // inverted, opposite-direction colour axis) sits right below it.
   function subtitleHtml() {
     if (layer === 'uplink') {
-      return 'Where the mesh heard roaming companions: each cell shows the best result of the uplink pings sent there. <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a>';
+      return 'Where the mesh heard roaming companions: each cell shows the best result of the uplink pings sent there. ' + appLinkHtml(window.MC_CLIENT_RX_APP_URL);
     }
     var colourText = layer === 'noise' ? 'Colour = median RF noise floor per cell.' : 'Colour = best signal per cell.';
-    return 'Where roaming CoreScope-RX clients heard nodes. ' + colourText + ' <a href="https://github.com/efiten/corescope-rx" target="_blank" rel="noopener">Get the companion app →</a>';
+    return 'Where roaming CoreScope-RX clients heard nodes. ' + colourText + ' ' + appLinkHtml(window.MC_CLIENT_RX_APP_URL);
+  }
+
+  // appLinkHtml is the link at the end of the subtitle. With clientRxAppUrl set it
+  // opens the operator's own CoreDrive RX deployment, where the app runs straight
+  // away; without it, the project page.
+  function appLinkHtml(url) {
+    if (url) return '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener">Open CoreDrive RX →</a>';
+    return '<a href="https://github.com/efiten/coredrive-rx" target="_blank" rel="noopener">Get the companion app →</a>';
   }
 
   // appPanelHtml: the operator's CoreDrive RX deployment (clientRxAppUrl from
@@ -714,6 +722,6 @@
   }
 
   if (window.addEventListener) window.addEventListener('cs-auth-changed', onAuthChanged);
-  window.CSRxCoverage = { _test: { appPanelHtml: appPanelHtml, coverageUrl: coverageUrl, mineBtnHtml: mineBtnHtml, authUser: authUser, coverageReply: coverageReply, uplinkColorVar: uplinkColorVar, uplinkCellHtml: uplinkCellHtml, freshBody: freshBody } };
+  window.CSRxCoverage = { _test: { appLinkHtml: appLinkHtml, appPanelHtml: appPanelHtml, coverageUrl: coverageUrl, mineBtnHtml: mineBtnHtml, authUser: authUser, coverageReply: coverageReply, uplinkColorVar: uplinkColorVar, uplinkCellHtml: uplinkCellHtml, freshBody: freshBody } };
   registerPage('rx-coverage', { init: init, destroy: destroy });
 })();
