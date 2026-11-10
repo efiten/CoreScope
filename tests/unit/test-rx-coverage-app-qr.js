@@ -59,4 +59,12 @@ assert.ok(code.indexOf('appPanelHtml(window.MC_CLIENT_RX_APP_URL, window.qrcode)
 const roles = fs.readFileSync(path.join(REPO_ROOT, 'public', 'roles.js'), 'utf8');
 assert.ok(roles.indexOf("window.MC_CLIENT_RX_APP_URL = typeof cfg.clientRxAppUrl === 'string' ? cfg.clientRxAppUrl : '';") !== -1, 'roles.js must read clientRxAppUrl');
 
+// Subtitle link: the deployment when clientRxAppUrl is set, the project page otherwise.
+assert.strictEqual(t.appLinkHtml(url), '<a href="' + url + '" target="_blank" rel="noopener">Open CoreDrive RX →</a>');
+assert.ok(t.appLinkHtml('').indexOf('href="https://github.com/efiten/coredrive-rx"') !== -1, t.appLinkHtml(''));
+assert.ok(t.appLinkHtml(evil).indexOf('<img') === -1, t.appLinkHtml(evil));
+assert.ok(code.indexOf('appLinkHtml(window.MC_CLIENT_RX_APP_URL)') !== -1, 'the subtitle must use appLinkHtml');
+assert.ok(code.indexOf('efiten/corescope-rx') === -1, 'the old repository name must be gone');
+assert.ok(code.indexOf('CoreScope-RX') === -1 && code.indexOf('roaming CoreDrive RX clients') !== -1, 'the subtitle must use the app name CoreDrive RX');
+
 console.log('test-rx-coverage-app-qr: OK');
