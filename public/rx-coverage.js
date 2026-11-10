@@ -199,7 +199,7 @@
       return 'Where the mesh heard roaming companions: each cell shows the best result of the uplink pings sent there. ' + appLinkHtml(window.MC_CLIENT_RX_APP_URL);
     }
     var colourText = layer === 'noise' ? 'Colour = median RF noise floor per cell.' : 'Colour = best signal per cell.';
-    return 'Where roaming CoreScope-RX clients heard nodes. ' + colourText + ' ' + appLinkHtml(window.MC_CLIENT_RX_APP_URL);
+    return 'Where roaming CoreDrive RX clients heard nodes. ' + colourText + ' ' + appLinkHtml(window.MC_CLIENT_RX_APP_URL);
   }
 
   // appLinkHtml is the link at the end of the subtitle. With clientRxAppUrl set it

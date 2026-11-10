@@ -65,5 +65,6 @@ assert.ok(t.appLinkHtml('').indexOf('href="https://github.com/efiten/coredrive-r
 assert.ok(t.appLinkHtml(evil).indexOf('<img') === -1, t.appLinkHtml(evil));
 assert.strictEqual(code.split('appLinkHtml(window.MC_CLIENT_RX_APP_URL)').length - 1, 2, 'both subtitle variants must use appLinkHtml');
 assert.ok(code.indexOf('efiten/corescope-rx') === -1, 'the old repository name must be gone');
+assert.ok(code.indexOf('CoreScope-RX') === -1 && code.indexOf('roaming CoreDrive RX clients') !== -1, 'the subtitle must use the app name CoreDrive RX');
 
 console.log('test-rx-coverage-app-qr: OK');
