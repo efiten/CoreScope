@@ -74,7 +74,6 @@ window.ObserverDetailNaiveBanner = {
 };
 
 (function () {
-  const PAYLOAD_LABELS = { 0: 'Request', 1: 'Response', 2: 'Direct Msg', 3: 'ACK', 4: 'Advert', 5: 'Channel Msg', 7: 'Anon Req', 8: 'Path', 9: 'Trace', 11: 'Control' };
   const CHART_COLORS = ['#4a9eff', '#ff6b6b', '#51cf66', '#fcc419', '#cc5de8', '#20c997', '#ff922b', '#845ef7', '#f06595', '#339af0'];
 
   let charts = [];
@@ -117,7 +116,7 @@ window.ObserverDetailNaiveBanner = {
           <a href="#/observers" class="btn-icon" title="Back to Observers" aria-label="Back">←</a>
           <h2 style="margin:0" id="obsTitle">Observer Detail</h2>
           <a href="#/nodes/${encodeURIComponent(currentId.toLowerCase())}" class="btn-secondary" title="View this pubkey as a node" style="text-decoration:none;font-size:12px;padding:4px 10px">View node detail →</a>
-          <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;max-width:100%">
             <span class="compare-with-group">
               <label class="sr-only" for="obsCompareWithPicker">Compare with another observer</label>
               <select id="obsCompareWithPicker" data-action="compare-with-picker"
@@ -376,14 +375,14 @@ window.ObserverDetailNaiveBanner = {
     if (!el) return;
     chartDefaults();
     el.innerHTML = `
-      <div class="obs-charts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:16px">
+      <div class="obs-charts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,400px),1fr));gap:16px">
         <div class="chart-card" style="padding:12px">
           <h3 style="margin:0 0 8px;font-size:0.95em">Packets Over Time</h3>
           <canvas id="obsTimeChart" role="img" aria-label="Packets over time chart"></canvas>
         </div>
         <div class="chart-card" style="padding:12px">
           <h3 style="margin:0 0 8px;font-size:0.95em">Packet Types</h3>
-          <div style="max-width:280px;margin:0 auto"><canvas id="obsTypeChart" role="img" aria-label="Packet types chart"></canvas></div>
+          <div style="max-width:280px;aspect-ratio:1;margin:0 auto"><canvas id="obsTypeChart" role="img" aria-label="Packet types chart"></canvas></div>
         </div>
         <div class="chart-card" style="padding:12px">
           <h3 style="margin:0 0 8px;font-size:0.95em">Unique Nodes Heard</h3>
@@ -447,7 +446,7 @@ window.ObserverDetailNaiveBanner = {
   function renderTypeChart(types) {
     const ctx = document.getElementById('obsTypeChart');
     if (!ctx) return;
-    const labels = Object.keys(types).map(k => PAYLOAD_LABELS[k] || 'Type ' + k);
+    const labels = Object.keys(types).map(k => window.PayloadLabels.api.displayName(k));
     const values = Object.values(types);
     const c = new Chart(ctx, {
       type: 'doughnut',
@@ -532,7 +531,7 @@ window.ObserverDetailNaiveBanner = {
         const hops = (typeof window !== 'undefined' && window.MC_filterPathHops)
           ? window.MC_filterPathHops(rawHops)
           : rawHops;
-        const typeName = PAYLOAD_LABELS[p.payload_type] || 'Type ' + p.payload_type;
+        const typeName = window.PayloadLabels.api.displayName(p.payload_type);
         return `<tr style="cursor:pointer" tabindex="0" role="row" data-action="navigate" data-value="#/packets/${p.hash || p.id}">
           <td>${timeAgo(p.timestamp)}</td>
           <td>${typeName}</td>

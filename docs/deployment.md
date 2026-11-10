@@ -24,7 +24,10 @@ Comprehensive guide to deploying and operating CoreScope. For a quick start, see
 | Disk | 500 MB (image + DB) | 2 GB+ for long-term data |
 | CPU | 1 core | 2+ cores |
 | Architecture | `linux/amd64`, `linux/arm64` | — |
-| Docker | 20.10+ | Latest stable |
+| Docker (run the published image) | 20.10+ | Latest stable |
+| Docker (build the image yourself) | 23.0+, or 20.10+ with `DOCKER_BUILDKIT=1` | Latest stable |
+
+The Dockerfile uses BuildKit features (`# syntax=` and `RUN --mount`). BuildKit is the default builder from Docker 23.0; on 20.10 to 22.x the legacy builder is used unless `DOCKER_BUILDKIT=1` is set, and it rejects `RUN --mount`.
 
 CoreScope runs well on Raspberry Pi 4/5 (ARM64). The Go server uses ~300 MB RAM for 56K+ packets.
 
@@ -648,8 +651,9 @@ directory and at the download destination; large snapshots cost CPU and disk I/O
 
 When accounts are enabled, sign in as an administrator and open `/api/backup`
 on the same site to download a snapshot. For command-line or scheduled backups,
-configure a strong `apiKey` in `config.json` (at least 16 characters). Create a
-private header file, `~/.config/corescope/backup.header`, containing one line:
+configure a randomly generated `apiKey` in `config.json` (at least 16 characters).
+Known weak/default keys are rejected even when they meet the length requirement.
+Create a private header file, `~/.config/corescope/backup.header`, containing one line:
 `X-API-Key: <your configured key>`. Set its permissions to `600`; keep the key out
 of shell history, URLs, and scripts checked into Git.
 
@@ -663,16 +667,25 @@ only after it is complete, nonempty, and passes SQLite's consistency check:
   umask 077
   backup_dir="$HOME/corescope-backups"
   mkdir -p "$backup_dir"
-  tmp=$(mktemp "$backup_dir/corescope-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX.part")
+  tmp=$(mktemp "$backup_dir/corescope-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
   trap 'rm -f "$tmp"' EXIT
   curl -q --fail --silent --show-error \
+    --connect-timeout 30 --max-time 1800 \
     --header "@$HOME/.config/corescope/backup.header" \
     --output "$tmp" https://corescope.example.org/api/backup
   test -s "$tmp"
   test "$(sqlite3 -readonly "$tmp" 'PRAGMA quick_check;')" = ok
-  mv "$tmp" "${tmp%.part}.db"
+  mv "$tmp" "$tmp.db"
 )
 ```
+
+The temporary-file template ends in `X` characters for both GNU and BSD/macOS
+`mktemp`. The 30-minute limit is curl's client-side ceiling for generating and
+downloading the snapshot. CoreScope separately sets a 60-second HTTP write
+timeout, which the backup handler does not override; reverse proxies can impose
+their own deadlines. Raising `--max-time` does not extend those server or proxy limits.
+Timeouts fail the script and remove the incomplete download without replacing a
+previous completed backup.
 
 This is a point-in-time telemetry snapshot, not continuous replication or a full
 instance backup. Keep protected copies off the CoreScope host, and also preserve:

@@ -48,6 +48,7 @@ node tests/unit/test-compare-overlap.js
 node tests/unit/test-confidence-indicator.js
 node tests/unit/test-coverage-gate.js
 node tests/unit/test-customizer-v2.js
+node tests/unit/test-dockerfile-buildplatform.js
 node tests/unit/test-drag-manager.js
 node tests/unit/test-e2e-coverage.js
 node tests/unit/test-direct-rf-heard-by.js
@@ -83,6 +84,7 @@ node tests/unit/test-issue-1412-customizer-no-override.js
 node tests/unit/test-issue-1415-packets-layout.js
 node tests/unit/test-issue-1418-cb-preset-ramp.js
 node tests/unit/test-issue-1418-deeplink-hops-channels.js
+node tests/unit/test-map-deeplink-path-params.js
 node tests/unit/test-issue-1418-edge-weights.js
 node tests/unit/test-issue-1418-polish-review.js
 node tests/unit/test-issue-1418-raw-hex-extraction.js
@@ -188,6 +190,7 @@ node tests/unit/test-node-scopes.js
 node tests/unit/test-nodes-export-wiring.js
 node tests/unit/test-nav-drawer-version-footer.js
 node tests/unit/test-nodes-export.js
+node tests/unit/test-node-quick-actions.js
 node tests/unit/test-notifications-ui.js
 node tests/unit/test-observer-iata-1188.js
 node tests/unit/test-observer-menu-interactions.js
@@ -205,6 +208,7 @@ node tests/unit/test-panel-corner.js
 node tests/unit/test-path-inspector.js
 node tests/unit/test-payload-labels-content.js
 node tests/unit/test-payload-labels-namespace.js
+node tests/unit/test-payload-labels-surfaces.js
 node tests/unit/test-perf-anomaly.js
 node tests/unit/test-perf-disk-io-1120.js
 node tests/unit/test-perf-go-runtime.js

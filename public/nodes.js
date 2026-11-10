@@ -3,7 +3,6 @@
 
 (function () {
   let nodes = [];
-  const PAYLOAD_TYPES = {0:'Request',1:'Response',2:'Direct Msg',3:'ACK',4:'Advert',5:'Channel Msg',7:'Anon Req',8:'Path',9:'Trace'};
 
   function syncClaimedToFavorites() {
     const myNodes = JSON.parse(localStorage.getItem('meshcore-my-nodes') || '[]');
@@ -174,14 +173,10 @@
   }
 
   function renderNodeTimestampHtml(isoString) {
-    if (typeof formatTimestampWithTooltip !== 'function' || typeof getTimestampMode !== 'function') {
+    if (typeof renderTimestampHtml !== 'function') {
       return escapeHtml(typeof timeAgo === 'function' ? timeAgo(isoString) : '—');
     }
-    const f = formatTimestampWithTooltip(isoString, getTimestampMode());
-    const warn = f.isFuture
-      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
-      : '';
-    return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
+    return renderTimestampHtml(isoString);
   }
 
   function renderNodeTimestampText(isoString) {
@@ -256,6 +251,19 @@
       value += ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + escapeHtml(sizes.join(', ')) + '-byte"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg>varies</span>';
     }
     return renderNodeMetric('Hash Prefix', value, table);
+  }
+
+  function renderNodeQuickActions(n) {
+    const nodeQuery = 'node=' + encodeURIComponent(n.public_key);
+    // Reject blanks/coercible non-numbers before the shared viewport parser
+    // validates the ranges. Zero coordinates are valid navigation targets.
+    const numeric = value => typeof value === 'number' || (typeof value === 'string' && value.trim() !== '');
+    const viewport = numeric(n.lat) && numeric(n.lon)
+      ? parseViewportHash('lat=' + Number(n.lat) + '&lon=' + Number(n.lon) + '&zoom=14') : null;
+    const mapLink = viewport
+      ? '<a class="btn-primary" href="' + escapeHtml('#/map?' + nodeQuery + '&lat=' + viewport.lat + '&lon=' + viewport.lon + '&zoom=' + viewport.zoom) + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Open in Map</a>' : '';
+    return '<div class="node-quick-actions">' + mapLink +
+      '<a class="btn-primary" href="' + escapeHtml('#/packets?' + nodeQuery) + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg> View packets</a></div>';
   }
 
   function getStatusTooltip(role, status) {
@@ -829,6 +837,7 @@
             <button class="btn-primary" id="copyShortUrlBtn" title="Short URL using an 8-char pubkey prefix — easier to send over the mesh (issue #772)" style="flex:0 0 auto;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Copy short URL</button>
             <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
             <a href="#/nodes/${encodeURIComponent(n.public_key)}/reach" class="btn-primary" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Reach</a>
+            ${renderNodeQuickActions(n)}
             <a href="#/observers/${encodeURIComponent(n.public_key.toUpperCase())}" class="btn-primary" title="View this pubkey as an observer" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> Observer →</a>
             <span class="node-notify-slot" id="nodeNotifySlotFull"></span>
           </div>
@@ -1883,9 +1892,12 @@
             + '"]');
         },
         onClose: function () {
+          // Only closing this preview returns to the list; keep any new route.
+          if (selectedKey === pubkey && location.hash === '#/nodes/' + encodeURIComponent(pubkey)) {
+            history.replaceState(null, '', '#/nodes');
+            if (window.setRouteTitle) window.setRouteTitle('nodes');
+          }
           selectedKey = null;
-          history.replaceState(null, '', '#/nodes');
-          if (window.setRouteTitle) window.setRouteTitle('nodes');
           renderRows();
         }
       });
@@ -1910,7 +1922,14 @@
             '<dt>Adverts</dt><dd>' + (n.advert_count != null ? n.advert_count : '—') + '</dd>' +
             renderHashPrefix(n) +
           '</dl>' +
-          '<p style="margin-top:14px"><a class="btn-primary" href="#/nodes/' + encodeURIComponent(pubkey) + '">Open full detail →</a></p>';
+          '<p class="node-quick-actions" style="margin:14px 0 6px"><a class="btn-primary node-detail-btn" href="#/nodes/' + encodeURIComponent(pubkey) + '">Open full detail →</a></p>' +
+          renderNodeQuickActions(n);
+        so.querySelector('.node-detail-btn').addEventListener('click', function (e) {
+          if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+          e.preventDefault();
+          window.SlideOver.close();
+          navigateToNode(pubkey);
+        });
       } catch (e) {
         so.innerHTML = '<div class="text-muted">Error: ' + (e && e.message ? e.message : String(e)) + '</div>';
       }
@@ -1968,6 +1987,7 @@
           <a href="#/nodes/${encodeURIComponent(n.public_key)}/reach" class="btn-primary" style="display:inline-block;margin-left:4px;text-decoration:none;font-size:11px;padding:2px 8px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Reach</a>
           <span class="node-notify-slot" id="nodeNotifySlot"></span>
         </div>
+        ${renderNodeQuickActions(n)}
         ${renderStatusExplanation(n)}
 
         ${hasLoc ? `<div class="node-map-qr-wrap">
@@ -2004,7 +2024,7 @@
             ${group.adverts.length ? group.adverts.map(a => {
               let decoded;
               try { decoded = JSON.parse(a.decoded_json); } catch {}
-              const pType = PAYLOAD_TYPES[a.payload_type] || 'Packet';
+              const pType = window.PayloadLabels.api.shortById(a.payload_type) || 'Packet';
               const icon = a.payload_type === 4 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg>' : a.payload_type === 5 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chat-circle"/></svg>' : a.payload_type === 2 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg>';
               const detail = decoded?.text ? ': ' + escapeHtml(truncate(decoded.text, 50)) : decoded?.name ? ' — ' + escapeHtml(decoded.name) : '';
               const obs = a.observer_name || a.observer_id;
