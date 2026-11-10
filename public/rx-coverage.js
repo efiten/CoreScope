@@ -202,11 +202,11 @@
     return 'Where roaming CoreDrive RX clients heard nodes. ' + colourText + ' ' + appLinkHtml(window.MC_CLIENT_RX_APP_URL);
   }
 
-  // appLinkHtml is the link at the end of the subtitle. With clientRxAppUrl set it
-  // opens the operator's own CoreDrive RX deployment, where the app runs straight
-  // away; without it, the project page.
+  // appLinkHtml is the link at the end of the subtitle. With clientRxAppUrl set the
+  // app panel right below already shows and links that deployment, so the subtitle
+  // carries no link; without it, the project page.
   function appLinkHtml(url) {
-    if (url) return '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener">Open CoreDrive RX →</a>';
+    if (url) return '';
     return '<a href="https://github.com/efiten/coredrive-rx" target="_blank" rel="noopener">Get the companion app →</a>';
   }
 
