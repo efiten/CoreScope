@@ -2710,7 +2710,8 @@ Client-side configuration values.
   "externalUrls":       object | null,
   "propagationBufferMs": number,         // default: 5000
   "clientRxCoverage":   boolean,         // fork-only opt-in flag; gates /api/rx-coverage and friends
-  "clientRfSamples":    boolean          // opt-in flag; gates /api/rf-noise
+  "clientRfSamples":    boolean,         // opt-in flag; gates /api/rf-noise
+  "clientRxAppUrl":     string           // omitted unless clientRxCoverage is on and clientRxCoverage.appUrl is an https URL
 }
 ```
 

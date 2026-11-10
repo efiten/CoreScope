@@ -564,6 +564,7 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		ClientRfSamples:                s.cfg.ClientRfSamplesEnabled(),
 		ClientUplink:                   s.cfg.ClientUplinkEnabled(),
 		ClientRxRequireLinkedCompanion: s.auth != nil && s.cfg.ClientRxRequireLinkedCompanionSet(),
+		ClientRxAppURL:                 s.cfg.ClientRxAppURL(),
 		PathTrust:                      &pathTrust,
 		UserManagement:                 s.clientUserManagement(),
 	})
