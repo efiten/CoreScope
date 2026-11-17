@@ -64,9 +64,12 @@ func (c *MeshmapOwnersConfig) resolve() (string, string, time.Duration, bool) {
 }
 
 // meshmapPerson is one owner or manager. Name is empty when the person hides
-// their name on meshmap; the UI then shows "claimed" without a name.
+// their name on meshmap; the UI then shows "claimed" without a name. Discord is
+// a link to the person's Discord profile, only for a named person and only a
+// https://discord.com/users/<id> address; otherwise empty.
 type meshmapPerson struct {
-	Name string `json:"name"`
+	Name    string `json:"name"`
+	Discord string `json:"discord"`
 }
 
 // meshmapNodeClaims is everyone who claimed one node: at most one owner, any
@@ -94,9 +97,19 @@ type meshmapClaim struct {
 	PublicKey   string  `json:"publicKey"`
 	Role        string  `json:"role"`
 	DisplayName *string `json:"displayName"`
+	DiscordURL  *string `json:"discordUrl"`
 }
 
 var meshmapPubkeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var meshmapDiscordRe = regexp.MustCompile(`^https://discord\.com/users/[0-9]{15,21}$`)
+
+// cleanMeshmapDiscord keeps only a Discord profile address.
+func cleanMeshmapDiscord(p *string) string {
+	if p == nil || !meshmapDiscordRe.MatchString(*p) {
+		return ""
+	}
+	return *p
+}
 
 // cleanMeshmapName drops control characters, trims, and cuts at 64 runes.
 func cleanMeshmapName(p *string) string {
@@ -137,6 +150,9 @@ func parseMeshmapClaims(raw []byte) ([]meshmapNodeClaims, error) {
 			byKey[pk] = n
 		}
 		person := meshmapPerson{Name: cleanMeshmapName(c.DisplayName)}
+		if person.Name != "" {
+			person.Discord = cleanMeshmapDiscord(c.DiscordURL)
+		}
 		if c.Role == "owner" {
 			if n.Owner == nil {
 				n.Owner = &person

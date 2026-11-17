@@ -50,7 +50,7 @@ test('owner row: label, @name and a safe meshmap link', async () => {
   const h = l.M.rowHtml({ public_key: PK, lat: 51.1378, lon: 5.5902 });
   assert(h.includes('<dt>Owner</dt>'), h);
   assert(h.includes('@erwinfiten'), h);
-  assert(h.includes('view on meshmap'), h);
+  assert(h.includes('View on #BEmesh map'), h);
   assert(h.includes('target="_blank"') && h.includes('rel="noopener noreferrer"'), h);
   assert(!h.includes('Managers'), 'no managers row without managers: ' + h);
 });
@@ -61,7 +61,7 @@ test('hidden owner name shows "claimed" without a name', async () => {
   const h = l.M.rowHtml({ public_key: PK });
   assert(h.includes('<dt>Owner</dt>') && h.includes('claimed'), h);
   assert(!h.includes('@'), h);
-  assert(h.includes('view on meshmap'), h);
+  assert(h.includes('View on #BEmesh map'), h);
 });
 
 test('managers row lists named managers and counts hidden ones', async () => {
@@ -71,7 +71,7 @@ test('managers row lists named managers and counts hidden ones', async () => {
   assert(h.includes('<dt>Managers</dt>'), h);
   assert(h.includes('@amy, @zed'), h);
   assert(h.includes('1 with a hidden name'), h);
-  assert.strictEqual(h.split('view on meshmap').length - 1, 1, 'one meshmap link: ' + h);
+  assert.strictEqual(h.split('View on #BEmesh map').length - 1, 1, 'one meshmap link: ' + h);
 });
 
 test('only managers, no owner: managers row carries the link', async () => {
@@ -79,7 +79,7 @@ test('only managers, no owner: managers row carries the link', async () => {
   await l.M.ready();
   const h = l.M.rowHtml({ public_key: PK });
   assert(!h.includes('<dt>Owner</dt>'), h);
-  assert(h.includes('<dt>Managers</dt>') && h.includes('@amy') && h.includes('view on meshmap'), h);
+  assert(h.includes('<dt>Managers</dt>') && h.includes('@amy') && h.includes('View on #BEmesh map'), h);
 });
 
 test('names are escaped', async () => {
@@ -88,6 +88,28 @@ test('names are escaped', async () => {
   const h = l.M.rowHtml({ public_key: PK });
   assert(!h.includes('<img') && h.includes('&lt;img'), h);
   assert(!h.includes('<b>') && h.includes('&lt;b&gt;'), h);
+});
+
+const DISCORD = 'https://discord.com/users/123456789012345678';
+
+test('a named person with a Discord profile gets their name as a link to it', async () => {
+  const l = load(feed([{ pubkey: PK, owner: { name: 'erwinfiten', discord: DISCORD },
+    managers: [{ name: 'amy', discord: 'https://discord.com/users/223456789012345678' }, { name: 'zed', discord: '' }] }]));
+  await l.M.ready();
+  const h = l.M.rowHtml({ public_key: PK });
+  assert(h.includes('<a href="' + DISCORD + '" target="_blank" rel="noopener noreferrer" title="Message on Discord">@erwinfiten</a>'), h);
+  assert(h.includes('users/223456789012345678" target="_blank"') && h.includes('@amy</a>, @zed'), h);
+});
+
+test('only a discord.com/users address becomes a link', async () => {
+  const bad = ['javascript:alert(1)', 'https://evil.example/users/123456789012345678',
+    DISCORD + '"><img src=x>', 'http://discord.com/users/123456789012345678', 'https://discord.com/users/abc'];
+  for (const url of bad) {
+    const l = load(feed([{ pubkey: PK, owner: { name: 'erwinfiten', discord: url }, managers: [] }]));
+    await l.M.ready();
+    const h = l.M.rowHtml({ public_key: PK });
+    assert(h.includes('@erwinfiten') && !h.includes('Message on Discord') && !h.includes('<img'), url + ': ' + h);
+  }
 });
 
 test('unknown pubkey gives no row; an uppercase node key still matches', async () => {

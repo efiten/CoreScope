@@ -20,10 +20,10 @@ func TestParseMeshmapClaims(t *testing.T) {
 	long := strings.Repeat("é", 70)
 	upper := strings.ToUpper(strings.Repeat("ab", 32))
 	raw := `{"version":1,"generatedAt":"2026-11-17T10:00:00Z","claims":[
-	 {"publicKey":"` + mmPK + `","role":"owner","subject":"s1","displayName":"erwinfiten","since":null},
-	 {"publicKey":"` + mmPK + `","role":"manager","subject":"s2","displayName":"zed"},
-	 {"publicKey":"` + mmPK + `","role":"manager","subject":"s3","displayName":null},
-	 {"publicKey":"` + mmPK + `","role":"manager","subject":"s4","displayName":"amy"},
+	 {"publicKey":"` + mmPK + `","role":"owner","subject":"s1","displayName":"erwinfiten","discordUrl":"https://discord.com/users/123456789012345678","since":null},
+	 {"publicKey":"` + mmPK + `","role":"manager","subject":"s2","displayName":"zed","discordUrl":"https://evil.example/users/123456789012345678"},
+	 {"publicKey":"` + mmPK + `","role":"manager","subject":"s3","displayName":null,"discordUrl":"https://discord.com/users/223456789012345678"},
+	 {"publicKey":"` + mmPK + `","role":"manager","subject":"s4","displayName":"amy","discordUrl":"https://discord.com/users/323456789012345678\"><x"},
 	 {"publicKey":"` + strings.Repeat("22", 32) + `","role":"owner","subject":"s5","displayName":null},
 	 {"publicKey":"` + strings.Repeat("33", 32) + `","role":"owner","subject":"s6","displayName":"   "},
 	 {"publicKey":"` + upper + `","role":"owner","subject":"s7","displayName":"upper"},
@@ -43,13 +43,13 @@ func TestParseMeshmapClaims(t *testing.T) {
 	_ = enc.Encode(got)
 	b := bytes.TrimSpace(buf.Bytes())
 	want := `[` +
-		`{"pubkey":"` + strings.Repeat("22", 32) + `","owner":{"name":""},"managers":[]},` +
-		`{"pubkey":"` + strings.Repeat("33", 32) + `","owner":{"name":""},"managers":[]},` +
-		`{"pubkey":"` + strings.Repeat("55", 32) + `","owner":{"name":"ab<i>"},"managers":[]},` +
-		`{"pubkey":"` + strings.Repeat("66", 32) + `","owner":{"name":"` + strings.Repeat("é", 64) + `"},"managers":[]},` +
-		`{"pubkey":"` + strings.Repeat("88", 32) + `","owner":null,"managers":[{"name":"onlymgr"}]},` +
-		`{"pubkey":"` + strings.Repeat("ab", 32) + `","owner":{"name":"upper"},"managers":[]},` +
-		`{"pubkey":"` + mmPK + `","owner":{"name":"erwinfiten"},"managers":[{"name":"amy"},{"name":"zed"},{"name":""}]}` +
+		`{"pubkey":"` + strings.Repeat("22", 32) + `","owner":{"name":"","discord":""},"managers":[]},` +
+		`{"pubkey":"` + strings.Repeat("33", 32) + `","owner":{"name":"","discord":""},"managers":[]},` +
+		`{"pubkey":"` + strings.Repeat("55", 32) + `","owner":{"name":"ab<i>","discord":""},"managers":[]},` +
+		`{"pubkey":"` + strings.Repeat("66", 32) + `","owner":{"name":"` + strings.Repeat("é", 64) + `","discord":""},"managers":[]},` +
+		`{"pubkey":"` + strings.Repeat("88", 32) + `","owner":null,"managers":[{"name":"onlymgr","discord":""}]},` +
+		`{"pubkey":"` + strings.Repeat("ab", 32) + `","owner":{"name":"upper","discord":""},"managers":[]},` +
+		`{"pubkey":"` + mmPK + `","owner":{"name":"erwinfiten","discord":"https://discord.com/users/123456789012345678"},"managers":[{"name":"amy","discord":""},{"name":"zed","discord":""},{"name":"","discord":""}]}` +
 		`]`
 	if string(b) != want {
 		t.Fatalf("got  %s\nwant %s", b, want)

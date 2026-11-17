@@ -3,8 +3,9 @@
  * of /api/meshmap/owners per page load (the server caches the map's partner
  * claims feed); a failed fetch is retried on the next mount. rowHtml returns
  * '' when nobody claimed the repeater or the feature is off. A person who
- * hides their name shows as "claimed". Every dynamic value goes through
- * escapeHtml. */
+ * hides their name shows as "claimed". A named person whose Discord profile
+ * meshmap shares gets their name as a link to it, where people can message
+ * them. Every dynamic value goes through escapeHtml. */
 (function () {
   'use strict';
   var byKey = {};
@@ -44,11 +45,21 @@
     return '<div class="repeater-info-row"><dt>' + label + '</dt><dd>' + value + '</dd></div>';
   }
 
+  var DISCORD_RE = /^https:\/\/discord\.com\/users\/[0-9]{15,21}$/;
+
+  // "@name", a link to the person's Discord profile when there is one.
+  function personHtml(p) {
+    var text = '@' + escapeHtml(String(p.name));
+    var url = p.discord ? String(p.discord) : '';
+    if (!DISCORD_RE.test(url)) return text;
+    return '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer"' +
+      ' title="Message on Discord">' + text + '</a>';
+  }
+
   function managersText(managers) {
     var named = [], hidden = 0;
     managers.forEach(function (m) {
-      var name = m && m.name ? String(m.name) : '';
-      if (name) named.push('@' + escapeHtml(name)); else hidden++;
+      if (m && m.name) named.push(personHtml(m)); else hidden++;
     });
     if (hidden) named.push(hidden + ' with a hidden name');
     return named.join(', ');
@@ -60,10 +71,10 @@
     var managers = Array.isArray(c.managers) ? c.managers : [];
     if (!c.owner && !managers.length) return '';
     var link = ' · <a href="' + escapeHtml(linkFor(source, node)) +
-      '" target="_blank" rel="noopener noreferrer">view on meshmap</a>';
+      '" target="_blank" rel="noopener noreferrer">View on #BEmesh map</a>';
     var html = '';
     if (c.owner) {
-      html += row('Owner', (c.owner.name ? '@' + escapeHtml(String(c.owner.name)) : 'claimed') + link);
+      html += row('Owner', (c.owner.name ? personHtml(c.owner) : 'claimed') + link);
     }
     if (managers.length) html += row('Managers', managersText(managers) + (c.owner ? '' : link));
     return html;
