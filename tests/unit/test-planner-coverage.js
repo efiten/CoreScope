@@ -172,12 +172,12 @@ function deferred() {
   const promise = new Promise((a, b) => { resolve = a; reject = b; });
   return { promise, resolve, reject };
 }
-function mountWith(params) {
-  const m = load();
+function mountWith(params, loaded) {
+  const m = loaded || load();
   const calls = [];
   const hash = [];
   const panel = fakePanel();
-  const map = { getPane: () => null, createPane: () => ({ style: {} }), fitBounds() {}, getContainer: () => fakeEl() };
+  const map = { getPane: () => null, createPane: () => ({ style: {} }), fitBounds() { m.log.fits = (m.log.fits || 0) + 1; }, getContainer: () => fakeEl() };
   const ctx = {
     map, layer: { layers: [], clearLayers() { this.layers = []; } }, panel, cfg: CFG,
     params: params || {}, setParams: (o) => hash.push(o),
@@ -240,6 +240,35 @@ test('paint: users layer colours each cell from its nibble; code 0 stays transpa
   assert.deepStrictEqual(px(1), RGB.lime);    // 0x24 users 4
   assert.deepStrictEqual(px(2), [0, 0, 0, 0]); // 0x31 users 1 (<10%) is not painted
   assert.deepStrictEqual(px(3), [0, 0, 0, 0]); // 0x00 transparent
+  t.inst.unmount();
+});
+
+test('mercatorRowMap: each canvas row takes the grid row under its Mercator centre', () => {
+  const merc = (lat) => Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
+  const S = 50.46, N = 51.54, rows = 300;   // about 60 km either side of 51° N
+  const map = Array.from(I.mercatorRowMap(S, N, rows));
+  assert.strictEqual(map.length, rows);
+  assert.strictEqual(map[0], 0);
+  assert.strictEqual(map[rows - 1], rows - 1);
+  for (let j = 0; j < rows; j++) {
+    const y = merc(N) + (j + 0.5) / rows * (merc(S) - merc(N));
+    const lat = Math.atan(Math.sinh(y)) * 180 / Math.PI;
+    assert.strictEqual(map[j], Math.floor((N - lat) / (N - S) * rows), 'row ' + j);
+    if (j) assert(map[j] >= map[j - 1], 'rows stay in order');
+  }
+  assert(map.some((r, j) => r !== j), 'at 60 km the mapping is not the identity');
+});
+
+test('paint: canvas rows follow Mercator, not equal latitude bands', async () => {
+  // 4 bands of 20° from 80° N to the equator. Spaced evenly in Mercator, the
+  // canvas row centres fall at about 76°, 65°, 46° and 17° N.
+  const t = mountWith({ site: '51,5' });
+  t.calls[0].d.resolve(result({ bbox: [0, 0, 80, 1], rows: 4, cols: 1, cells: Buffer.from([0x05, 0x04, 0x03, 0x02]).toString('base64') }));
+  await flush();
+  const img = t.m.log.images[0];
+  assert.strictEqual(img.height, 4);
+  const px = (i) => Array.from(img.data.slice(i * 4, i * 4 + 4));
+  assert.deepStrictEqual([px(0), px(1), px(2), px(3)], [RGB.green, RGB.green, RGB.lime, RGB.orange]);
   t.inst.unmount();
 });
 
@@ -415,6 +444,55 @@ test('button click starts exactly one job with the latest values; a newer click 
   assert.strictEqual(outdatedHtml(t), '');
   assert.strictEqual(t.m.log.overlays[n].opts.opacity, 0.5, 'fresh overlay at full opacity');
   t.inst.unmount();
+});
+
+const plain = (v) => JSON.parse(JSON.stringify(v));   // sandbox arrays → this realm
+test('site marker and link lines start at the site the server computed for', async () => {
+  const t = mountWith({ site: '51.00037,5.00041', layer: 'repeaters' });
+  t.calls[0].d.resolve(result({ params: { site: { lat: 51, lon: 5 } } }));
+  await flush();
+  const site = t.m.log.shapes.filter((s) => s.kind === 'circle' && /mc-pl-cov-site/.test(s.opts.className)).pop();
+  assert.deepStrictEqual(plain(site.a), [51, 5], 'marker on the rounded site');
+  const line = t.m.log.shapes.filter((s) => s.kind === 'line').pop();
+  assert.deepStrictEqual(plain(line.a[0]), [51, 5], 'line from the rounded site');
+  t.inst.setSite({ lat: 51.3, lon: 5.3, node: null });
+  const moved = t.m.log.shapes.filter((s) => s.kind === 'circle' && /mc-pl-cov-site/.test(s.opts.className)).pop();
+  assert.deepStrictEqual(plain(moved.a), [51.3, 5.3], 'a new site shows where it was placed');
+  t.inst.unmount();
+});
+
+test('an outdated result dims the links list as well', async () => {
+  const t = mountWith({ site: '51,5', layer: 'repeaters' });
+  t.calls[0].d.resolve(result());
+  await flush();
+  const list = t.panel._els['[data-f="results"]'];
+  assert(!/is-outdated/.test(list.className || ''), 'fresh result: list not dimmed');
+  fireInput(t.panel, 'h', '12');
+  assert(/is-outdated/.test(list.className), 'outdated: list dimmed');
+  clickRun(t.panel);
+  t.calls[1].d.resolve(result());
+  await flush();
+  assert(!/is-outdated/.test(list.className), 'recomputed: list back to normal');
+  t.inst.unmount();
+});
+
+test('the map fits a result once; coming back to the tab keeps the view', async () => {
+  const m = load();
+  const a = mountWith({ site: '51,5' }, m);
+  a.calls[0].d.resolve(result());
+  await flush();
+  assert.strictEqual(m.log.fits, 1, 'first open fits the result');
+  a.inst.unmount();
+  const b = mountWith({ site: '51,5' }, m);
+  b.calls[0].d.resolve(result());
+  await flush();
+  assert.strictEqual(m.log.fits, 1, 'same site again: pan and zoom kept');
+  b.inst.unmount();
+  const c = mountWith({ site: '50,4' }, m);
+  c.calls[0].d.resolve(result());
+  await flush();
+  assert.strictEqual(m.log.fits, 2, 'a deep link to another site fits again');
+  c.inst.unmount();
 });
 
 test('unmount aborts the running request and clears the layer', () => {

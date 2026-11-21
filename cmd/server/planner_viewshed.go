@@ -8,6 +8,9 @@ package main
 import (
 	"context"
 	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -87,11 +90,38 @@ func repeaterClass(c float64) byte {
 	return 1
 }
 
+// viewshedWorkers is how many goroutines computeViewshed spreads rows over.
+// The planner runs one Coverage/Viewshed job at a time (plannerCovSlots), so
+// this is also the most CPUs a viewshed takes from the live app.
+func viewshedWorkers() int { return max(1, min(4, runtime.GOMAXPROCS(0)/2)) }
+
+// clearancePair is two e.clearance walks of the same path a→b in one pass:
+// the worst first-Fresnel clearance with the receiver hbR above ground
+// (floor −Inf, every sample: crOK=false means no terrain on the path, or ctx
+// cancelled with e.err set), and whether the worst clearance with the
+// receiver hbU is below shadowFloor. Each result equals that of its own
+// e.clearance call.
+func (e *planLinkEval) clearancePair(a, b geoPoint, distKm, ha, hbR, hbU, shadowFloor float64) (cr float64, crOK, shadow bool) {
+	cr, cu, ok := e.clearanceWalk(a, b, distKm, ha, hbR, math.Inf(-1), hbU, true)
+	if !ok {
+		return 0, false, false
+	}
+	return cr, true, cu < shadowFloor
+}
+
 // computeViewshed profiles site→cell for every cell in range: two
 // clearance walks per cell (receiver at RxM for Repeaters, at
 // viewshedUserRxM for the Users shadow test). progress gets the fraction of
 // rows done. Errors: ctx.Err() only.
 func computeViewshed(ctx context.Context, v terrainView, p viewshedParams, progress func(float64)) (viewshedGrid, error) {
+	return computeViewshedN(ctx, v, p, viewshedWorkers(), progress)
+}
+
+// computeViewshedN is computeViewshed over up to workers goroutines. Cells are
+// independent and each row's bytes are written by one worker only, so the
+// grid is identical for any workers. progress is called serially with a
+// non-decreasing fraction that ends at exactly 1.
+func computeViewshedN(ctx context.Context, v terrainView, p viewshedParams, workers int, progress func(float64)) (viewshedGrid, error) {
 	cellKm := viewshedCellKm(p.RangeKm)
 	bb := viewshedBBox(p.Site, p.RangeKm)
 	cosLat := math.Cos(p.Site.Lat * math.Pi / 180)
@@ -104,10 +134,10 @@ func computeViewshed(ctx context.Context, v terrainView, p viewshedParams, progr
 	if _, ok := v.ElevationAt(p.Site.Lat, p.Site.Lon); !ok {
 		return g, nil // no terrain at the site: every cell is no data
 	}
-	e := newPlanLinkEval(ctx, v, p.FreqMHz, p.KFactor)
 	dLat := (bb.N - bb.S) / float64(rows)
 	dLon := (bb.E - bb.W) / float64(cols)
-	for r := 0; r < rows; r++ {
+	// row fills row r with e; it reports e.err (ctx cancelled).
+	row := func(e *planLinkEval, r int) error {
 		lat := bb.N - (float64(r)+0.5)*dLat
 		for c := 0; c < cols; c++ {
 			cell := geoPoint{Lat: lat, Lon: bb.W + (float64(c)+0.5)*dLon}
@@ -115,14 +145,12 @@ func computeViewshed(ctx context.Context, v terrainView, p viewshedParams, progr
 			if d > p.RangeKm {
 				continue
 			}
-			cr, ok := e.clearance(p.Site, cell, d, p.SiteM, p.RxM, math.Inf(-1))
+			cr, ok, shadow := e.clearancePair(p.Site, cell, d, p.SiteM, p.RxM, viewshedUserRxM, viewshedShadowClearance)
 			if !ok {
 				continue // no terrain on the path (or ctx cancelled: checked below)
 			}
 			users := userReachClass(userReachP(d, p.Reach))
-			// Same path as above, so terrain is present; the walk stops at
-			// the first sample below the shadow threshold.
-			if cu, ok := e.clearance(p.Site, cell, d, p.SiteM, viewshedUserRxM, viewshedShadowClearance); !ok && cu < viewshedShadowClearance {
+			if shadow {
 				if users > viewshedShadowDrop {
 					users -= viewshedShadowDrop
 				} else {
@@ -131,11 +159,77 @@ func computeViewshed(ctx context.Context, v terrainView, p viewshedParams, progr
 			}
 			g.Cells[r*cols+c] = users | repeaterClass(cr)<<4
 		}
-		if e.err != nil {
-			return viewshedGrid{}, e.err
+		return e.err
+	}
+	workers = max(1, min(workers, rows))
+	if workers == 1 {
+		e := newPlanLinkEval(ctx, v, p.FreqMHz, p.KFactor)
+		for r := 0; r < rows; r++ {
+			if err := row(e, r); err != nil {
+				return viewshedGrid{}, err
+			}
+			if progress != nil {
+				progress(float64(r+1) / float64(rows))
+			}
 		}
-		if progress != nil {
-			progress(float64(r+1) / float64(rows))
+	} else {
+		// Rows are handed out one at a time (they differ in length), each
+		// worker with its own planLinkEval, which is not safe to share.
+		var (
+			next, stop atomic.Int64
+			mu         sync.Mutex // serialises progress and the first error
+			done       int
+			firstErr   error
+			panicked   any
+			wg         sync.WaitGroup
+		)
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					// Re-raised below on the caller's goroutine, where the
+					// job runner recovers it; here it would kill the process.
+					if r := recover(); r != nil {
+						mu.Lock()
+						if panicked == nil {
+							panicked = r
+						}
+						mu.Unlock()
+						stop.Store(1)
+					}
+				}()
+				e := newPlanLinkEval(ctx, v, p.FreqMHz, p.KFactor)
+				for stop.Load() == 0 {
+					r := int(next.Add(1) - 1)
+					if r >= rows {
+						return
+					}
+					err := row(e, r)
+					mu.Lock()
+					if err != nil && firstErr == nil {
+						firstErr = err
+					}
+					if err == nil {
+						done++
+						if progress != nil {
+							progress(float64(done) / float64(rows))
+						}
+					}
+					mu.Unlock()
+					if err != nil {
+						stop.Store(1)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		if panicked != nil {
+			panic(panicked)
+		}
+		if firstErr != nil {
+			return viewshedGrid{}, firstErr
 		}
 	}
 	if err := ctx.Err(); err != nil {

@@ -48,3 +48,4 @@ deploy-staging.sh
 # Runtime prune-request queue: the server writes request-<id>.json here and
 # the ingestor consumes it (cmd/ingestor/prune_geofilter.go). Never commit it.
 cmd/server/prune-requests/
+test-results/map-perf/

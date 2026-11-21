@@ -5,6 +5,8 @@
 
 .mc-pl-cov-legend, .mc-pl-cov-links { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 .mc-pl-cov-legend li, .mc-pl-cov-links li { display: flex; align-items: center; gap: 8px; }
+/* An outdated result: the list belongs to the previous inputs, like the dimmed overlay. */
+.mc-pl-cov [data-f="results"].is-outdated { opacity: 0.5; }
 .mc-pl-cov-sw { flex: none; width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--border); }
 .mc-pl-cov-sw-user-2 { background: var(--pl-cov-user-2); }
 .mc-pl-cov-sw-user-3 { background: var(--pl-cov-user-3); }
@@ -25,3 +27,10 @@
 .leaflet-overlay-pane path.mc-pl-cov-node-1 { fill: var(--pl-cov-rep-1); }
 .leaflet-overlay-pane path.mc-pl-cov-node-2 { fill: var(--pl-cov-rep-2); }
 .leaflet-overlay-pane path.mc-pl-cov-node-3 { fill: var(--pl-cov-rep-3); }
+
+.mc-pl-cov-actions { display: flex; flex-direction: column; gap: 12px; }
+/* The phone bottom sheet shows about 300 px of the panel: keep Compute and
+   the outdated note in view while the inputs above it are edited. */
+@media (max-width: 767px) {
+  .mc-pl-cov-actions { position: sticky; bottom: 0; z-index: 1; padding: 8px 0; background: var(--surface-1); }
+}

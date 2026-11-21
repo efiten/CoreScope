@@ -2796,6 +2796,20 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .leaflet-control-layers-separator {
   border-top-color: var(--border) !important;
 }
+/* Tile picker category groups (map-tile-providers.js _decorateControl) */
+.leaflet-control-layers .mc-tile-group {
+  border: 0;
+  margin: 8px 0 0;
+  padding: 0;
+  min-width: 0;
+}
+.leaflet-control-layers .mc-tile-group-heading {
+  padding: 0;
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
 [data-theme="dark"] .leaflet-control-layers-toggle {
   filter: invert(1);
 }
@@ -6047,6 +6061,8 @@ body.embed #app.app-fixed {
   display: block; width: 100%; box-sizing: border-box; margin-top: 2px;
   background: var(--input-bg, var(--card-bg)); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px;
 }
+.repeater-info-theirs { border-left: 3px solid var(--border); padding: 2px 0 2px 8px; margin: 0 0 8px; }
+.repeater-info-theirs p { margin: 0 0 4px; color: var(--text-muted); }
 .repeater-info-notice, .repeater-info-msg { color: var(--text-muted); font-size: 12px; }
 .repeater-info-actions { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
 /* Global .btn-primary is white on --accent (2.75:1); same fix as .account-btn-primary. */

@@ -588,7 +588,7 @@ func (s *Server) clientUserManagement() *ClientUserManagement {
 	if s.auth == nil {
 		return nil
 	}
-	return &ClientUserManagement{Enabled: true, ChannelProposals: s.auth.set.proposals.enabled, Notifications: s.auth.notify != nil, CompanionLinking: true, ObserverLogins: s.auth.set.observerLogins.enabled}
+	return &ClientUserManagement{Enabled: true, ChannelProposals: s.auth.set.proposals.enabled, Notifications: s.auth.notify != nil, CompanionLinking: true, ObserverLogins: s.auth.set.observerLogins.enabled, RepeaterTokens: true}
 }
 
 func (s *Server) handleConfigAreas(w http.ResponseWriter, r *http.Request) {
@@ -981,7 +981,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 				Sensors:    counts["sensors"],
 			},
 			SignatureDrops:        s.db.GetSignatureDropCount(),
-			HashMigrationComplete: s.store != nil && s.store.hashMigrationComplete.Load(),
+			HashMigrationComplete: s.db.hashMigrationComplete(),
 
 			TrackedMB:     mem.StoreDataMB, // deprecated alias
 			StoreDataMB:   mem.StoreDataMB,

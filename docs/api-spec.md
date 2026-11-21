@@ -163,7 +163,7 @@ Error codes you can get on the routes above:
 | `502` | `"mail provider unavailable"` (mail refresh) |
 | `503` | `"mail could not be sent, try again later"` |
 
-With user management on, every endpoint that needs `X-API-Key` also accepts an admin session (plus the CSRF header for unsafe methods). A request that sends `X-API-Key` is judged on the key alone. `GET /api/config/client` gains `"userManagement": {"enabled": true}` only when the feature is on; that block also carries `"companionLinking": true` on servers with the device-token and companion routes, which CoreDrive RX checks before it shows its login (an older server answers those paths with the SPA page).
+With user management on, every endpoint that needs `X-API-Key` also accepts an admin session (plus the CSRF header for unsafe methods). A request that sends `X-API-Key` is judged on the key alone. `GET /api/config/client` gains `"userManagement": {"enabled": true}` only when the feature is on; that block also carries `"companionLinking": true` on servers with the device-token and companion routes, which CoreDrive RX checks before it shows its login (an older server answers those paths with the SPA page), and `"repeaterTokens": true` on servers whose device tokens can ask for the `repeater:claim` and `repeater:edit` scopes and whose repeater edits take a `baseRevision` (a mobile client offers native repeater claims and edits only then).
 
 ---
 
@@ -1953,7 +1953,7 @@ Theoretical reach of one candidate repeater site, for the planner's Coverage tab
     "range_km": 30,
     "frequency_mhz": 910.525,
     "k_factor": 1.333,
-    "user_reach": {"d50Km": 2.7, "slope": 0.3}
+    "user_reach": {"d50_km": 2.7, "slope": 0.3}
   },
   "bbox": [29.8402, -97.4027, 30.3798, -96.7773],
   "rows": 301,
