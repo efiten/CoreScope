@@ -471,6 +471,8 @@ func TestBuildDirectHeardIndex_HoursAndRecent(t *testing.T) {
 	agg = buildDirectHeardIndex(packets, pm)[dhUnique]["obs1"]
 	if len(agg.Recent) != heardRecentMax || agg.Recent[0].T != uint32(h.Add(100*time.Second).Unix()) || agg.Recent[len(agg.Recent)-1].T != uint32(h.Add(599*time.Second).Unix()) {
 		t.Fatalf("ring holds %d entries from %d to %d, want the newest 500", len(agg.Recent), agg.Recent[0].T, agg.Recent[len(agg.Recent)-1].T)
+	}
+}
 
 // directAvgSNR is the node-level SNR the health endpoints report: the mean
 // over every direct reception that carried an SNR, across all observers.
