@@ -153,10 +153,13 @@
     // baseRevision so a save made meanwhile (another tab, the app) answers
     // 409 instead of being overwritten. undefined: unconditional save.
     var editRev;
+    // editTheirs is the record saved meanwhile that the open form shows
+    // under it after a 409, or null; a restored draft shows it again.
+    var editTheirs = null;
 
     function keep() {
       var form = el.querySelector('[data-ri-form]');
-      if (form) drafts[slot] = { pk: pk, values: rawForm(form), rev: editRev };
+      if (form) drafts[slot] = { pk: pk, values: rawForm(form), rev: editRev, theirs: editTheirs };
     }
     // shown is the mode on screen, or '' while nothing is (the view before
     // the GET answered).
@@ -166,6 +169,7 @@
       if (mode !== 'edit') delete drafts[slot];
       if (mode === 'view' && !info) { shown = ''; el.innerHTML = ''; el.hidden = true; return; }
       shown = mode;
+      editTheirs = mode === 'edit' && theirs ? theirs : null;
       el.innerHTML = '<h4>Repeater info</h4>' +
         (mode === 'edit' ? formHtml(values || info, theirs) : mode === 'confirm' ? confirmHtml() : viewHtml(info, user, mm ? mm.rowHtml(node) : ''));
       if (mode === 'edit' && !values) {
@@ -241,7 +245,7 @@
       // An open draft comes back at once, in the same task as the re-render:
       // waiting for the GET would empty the section for a round trip.
       var d = drafts[slot];
-      if (d && d.pk === pk) { editRev = d.rev; show('edit', d.values); el.hidden = false; }
+      if (d && d.pk === pk) { editRev = d.rev; show('edit', d.values, d.theirs); el.hidden = false; }
       // Fork-local (meshmap owner): wait for the owner list alongside the GET.
       return Promise.all([auth.request('GET', base + '/info'), mm ? mm.ready() : null]).then(function (res) {
         var r = res[0];
